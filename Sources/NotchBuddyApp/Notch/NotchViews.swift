@@ -1,0 +1,383 @@
+import SwiftUI
+import AgentKit
+import AutomationKit
+
+/// Hardware-notch silhouette: flat top that flares outward, rounded bottom corners.
+struct NotchShape: Shape {
+    var topRadius: CGFloat = 6
+    var bottomRadius: CGFloat = 14
+
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { .init(topRadius, bottomRadius) }
+        set { topRadius = newValue.first; bottomRadius = newValue.second }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        let t = topRadius, b = min(bottomRadius, rect.height / 2)
+        p.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        p.addQuadCurve(to: CGPoint(x: rect.minX + t, y: rect.minY + t), control: CGPoint(x: rect.minX + t, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.minX + t, y: rect.maxY - b))
+        p.addQuadCurve(to: CGPoint(x: rect.minX + t + b, y: rect.maxY), control: CGPoint(x: rect.minX + t, y: rect.maxY))
+        p.addLine(to: CGPoint(x: rect.maxX - t - b, y: rect.maxY))
+        p.addQuadCurve(to: CGPoint(x: rect.maxX - t, y: rect.maxY - b), control: CGPoint(x: rect.maxX - t, y: rect.maxY))
+        p.addLine(to: CGPoint(x: rect.maxX - t, y: rect.minY + t))
+        p.addQuadCurve(to: CGPoint(x: rect.maxX, y: rect.minY), control: CGPoint(x: rect.maxX - t, y: rect.minY))
+        p.closeSubpath()
+        return p
+    }
+}
+
+struct NotchRootView: View {
+    @Bindable var model: NotchModel
+
+    var body: some View {
+        let size = model.size
+        let expanded = model.presentation != .idle && model.presentation != .hover
+        VStack(spacing: 0) {
+            ZStack(alignment: .top) {
+                NotchShape(topRadius: expanded ? 10 : 6, bottomRadius: expanded ? 22 : 10)
+                    .fill(BK.Notch.surface)
+                    .shadow(color: .black.opacity(expanded ? 0.45 : 0), radius: 12, y: 6)
+                content
+                    .padding(.horizontal, expanded ? 22 : 10)
+                    .frame(width: size.width, height: size.height, alignment: .top)
+                    .clipShape(NotchShape(topRadius: expanded ? 10 : 6, bottomRadius: expanded ? 22 : 10))
+            }
+            .frame(width: size.width, height: size.height)
+            .contentShape(NotchShape())
+            .onHover { h in
+                model.hovering = h
+                model.recompute()
+            }
+            .onTapGesture {
+                if model.presentation == .idle || model.presentation == .hover { model.open() }
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .animation(.spring(response: 0.38, dampingFraction: 0.82), value: model.presentation)
+        .preferredColorScheme(.dark)
+    }
+
+    @ViewBuilder var content: some View {
+        VStack(spacing: 0) {
+            topWings.frame(height: model.geometry.notchRect.height)
+            switch model.presentation {
+            case .idle, .hover: EmptyView()
+            case .input: NotchInputView(model: model).transition(.opacity.combined(with: .move(edge: .top)))
+            case .running: NotchRunningView(model: model).transition(.opacity)
+            case .detail: NotchDetailView(model: model).transition(.opacity)
+            case .approval: NotchApprovalView(model: model).transition(.opacity)
+            case .result: NotchResultView(model: model).transition(.opacity)
+            }
+        }
+    }
+
+    /// Content on either side of the physical notch (never under it).
+    @ViewBuilder var topWings: some View {
+        let c = model.controller
+        HStack {
+            if model.presentation != .idle {
+                HStack(spacing: 6) {
+                    BKAgentOrb(mode: orbMode, size: 14)
+                    if model.presentation == .hover && !c.isRunning {
+                        Text("NotchBuddy").font(.system(size: 11, weight: .semibold)).foregroundStyle(BK.Notch.secondary)
+                    }
+                }
+            } else if c.isRunning {
+                BKAgentOrb(mode: orbMode, size: 12)
+            }
+            Spacer()
+            if c.isRunning, let plan = c.plan, model.presentation != .idle {
+                Text("\(min(c.currentStepIndex + 1, plan.steps.count))/\(plan.steps.count)")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundStyle(BK.Notch.secondary)
+            } else if model.presentation == .hover {
+                BKKeyCap(text: model.settings.settings.hotkeys.open.display, onDark: true)
+            }
+        }
+        .padding(.horizontal, model.geometry.hasNotch ? 0 : 6)
+    }
+
+    var orbMode: BKAgentOrb.Mode {
+        switch model.controller.phase {
+        case .planning: return .thinking
+        case .executing: return .acting
+        case .awaitingApproval, .paused: return .paused
+        case .completed: return .success
+        case .failed, .needsInput: return .error
+        default: return .idle
+        }
+    }
+}
+
+// MARK: - Input (State B)
+
+struct NotchInputView: View {
+    @Bindable var model: NotchModel
+    @FocusState private var focused: Bool
+    @State private var voice = VoiceInput.shared
+    @State private var recents: [TaskRecord] = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !model.controller.isConfigured {
+                HStack(spacing: 8) {
+                    Image(systemName: "key.fill").foregroundStyle(BK.Tone.warning.color)
+                    Text("Add an OpenAI or Anthropic key to get started.").font(.system(size: 12)).foregroundStyle(BK.Notch.secondary)
+                    Spacer()
+                    Button("Open Settings") { model.openSettings("providers") }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 10).fill(BK.Tone.warning.color.opacity(0.1)))
+            }
+            HStack(spacing: 10) {
+                TextField("", text: $model.inputText, prompt: Text("What should I do?").foregroundStyle(BK.Notch.tertiary), axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 15))
+                    .foregroundStyle(BK.Notch.text)
+                    .lineLimit(1...3)
+                    .focused($focused)
+                    .onSubmit { model.submit() }
+                    .onKeyPress(.escape) { model.close(); return .handled }
+                    .accessibilityLabel("Task")
+                if model.settings.settings.enableVoiceInput {
+                    BKIconButton(systemName: voice.isListening ? "waveform" : "mic.fill", help: voice.isListening ? "Stop dictation" : "Dictate",
+                                 tone: voice.isListening ? .danger : nil, size: 30) {
+                        voice.toggle { model.inputText = $0 }
+                    }
+                }
+                Button { model.submit() } label: {
+                    HStack(spacing: 5) { Image(systemName: "play.fill"); Text("Start") }
+                }
+                .buttonStyle(BKButtonStyle(kind: .primary, compact: false))
+                .disabled(model.inputText.trimmingCharacters(in: .whitespaces).isEmpty)
+                .keyboardShortcut(.return, modifiers: [])
+            }
+            .padding(.horizontal, 12).padding(.vertical, 9)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(BK.Notch.field))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(BK.Notch.border))
+
+            HStack(spacing: 6) {
+                ForEach(recents.prefix(3)) { r in
+                    Button { model.inputText = r.instruction } label: {
+                        Text(r.instruction).lineLimit(1).font(.system(size: 11))
+                    }
+                    .buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
+                    .frame(maxWidth: 150)
+                }
+                Spacer()
+                BKIconButton(systemName: "clock.arrow.circlepath", help: "Recent tasks") {
+                    model.historyOpen = true
+                    model.recompute()
+                }
+                BKIconButton(systemName: "gearshape.fill", help: "Settings") { model.openSettings(nil) }
+            }
+        }
+        .padding(.top, 8)
+        .onAppear {
+            recents = LocalStore.shared.recentTasks(limit: 6).filter { $0.status == "completed" }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { focused = true }
+        }
+        .onChange(of: model.focusToken) { _, _ in focused = true }
+    }
+}
+
+// MARK: - Running (States C/D)
+
+struct NotchRunningView: View {
+    @Bindable var model: NotchModel
+
+    var body: some View {
+        let c = model.controller
+        HStack(spacing: 10) {
+            if c.phase == .planning {
+                BKShimmerText(text: c.status.isEmpty ? "Understanding your task…" : c.status)
+            } else {
+                Text(c.status).font(.system(size: 13, weight: .medium)).foregroundStyle(BK.Notch.text).lineLimit(1)
+                    .contentTransition(.opacity)
+                    .animation(.easeInOut(duration: 0.2), value: c.status)
+            }
+            Spacer(minLength: 6)
+            if c.phase == .planning {
+                Button("Cancel") { c.stop() }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
+            } else {
+                BKIconButton(systemName: c.phase == .paused ? "play.fill" : "pause.fill", help: c.phase == .paused ? "Resume" : "Pause") { c.togglePause() }
+                BKIconButton(systemName: "stop.fill", help: "Stop now", tone: .danger) { c.stop() }
+            }
+            BKIconButton(systemName: "chevron.down", help: "Show details") {
+                model.detailOpen = true
+                model.recompute()
+            }
+        }
+        .padding(.top, 8)
+    }
+}
+
+// MARK: - Detail / history
+
+struct NotchDetailView: View {
+    @Bindable var model: NotchModel
+    @State private var selectedTask: TaskRecord?
+    @State private var tasks: [TaskRecord] = []
+    @State private var events: [ActivityEntry] = []
+
+    var body: some View {
+        let c = model.controller
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(model.historyOpen ? "Recent tasks" : (c.instruction.isEmpty ? "Activity" : c.instruction))
+                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(BK.Notch.text).lineLimit(2)
+                Spacer()
+                if c.isRunning {
+                    BKIconButton(systemName: c.phase == .paused ? "play.fill" : "pause.fill", help: c.phase == .paused ? "Resume" : "Pause") { c.togglePause() }
+                    BKIconButton(systemName: "stop.fill", help: "Stop now", tone: .danger) { c.stop() }
+                }
+                BKIconButton(systemName: "chevron.up", help: "Collapse") {
+                    model.detailOpen = false
+                    model.historyOpen = false
+                    if !c.isRunning && !model.resultVisible { model.inputOpen = false }
+                    model.recompute()
+                }
+            }
+            if model.historyOpen {
+                historyList
+            } else {
+                HStack(alignment: .top, spacing: 16) {
+                    if let plan = c.plan {
+                        BKPlanProgress(plan: plan, currentIndex: c.currentStepIndex, finished: c.phase == .completed)
+                            .frame(width: 190, alignment: .leading)
+                    }
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            BKTimeline(entries: c.activity).padding(.trailing, 6)
+                            Color.clear.frame(height: 1).id("end")
+                        }
+                        .onChange(of: c.activity.count) { _, _ in withAnimation { proxy.scrollTo("end") } }
+                    }
+                }
+            }
+        }
+        .padding(.top, 8).padding(.bottom, 14)
+    }
+
+    @ViewBuilder var historyList: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(tasks) { t in
+                        Button { selectedTask = t; events = LocalStore.shared.events(taskID: t.id) } label: {
+                            HStack(spacing: 6) {
+                                BKStatusDot(tone: t.status == "completed" ? .success : (t.status == "running" ? .info : .danger))
+                                Text(t.instruction).font(.system(size: 12)).foregroundStyle(BK.Notch.text).lineLimit(1)
+                                Spacer()
+                            }
+                            .padding(6)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(selectedTask?.id == t.id ? Color.white.opacity(0.1) : .clear))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    if tasks.isEmpty { Text("No tasks yet.").font(.system(size: 12)).foregroundStyle(BK.Notch.tertiary) }
+                }
+            }
+            .frame(width: 230)
+            ScrollView {
+                if let t = selectedTask {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text(t.summary ?? t.error ?? t.status).font(.system(size: 12)).foregroundStyle(BK.Notch.secondary).lineLimit(3)
+                            Spacer()
+                            Button("Run again") { model.inputText = t.instruction; model.historyOpen = false; model.recompute() }
+                                .buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
+                        }
+                        BKTimeline(entries: events)
+                    }
+                } else {
+                    Text("Select a task to see what NotchBuddy did.").font(.system(size: 12)).foregroundStyle(BK.Notch.tertiary)
+                }
+            }
+        }
+        .onAppear { tasks = LocalStore.shared.recentTasks(limit: 40) }
+    }
+}
+
+// MARK: - Approval (State E)
+
+struct NotchApprovalView: View {
+    @Bindable var model: NotchModel
+
+    var body: some View {
+        let c = model.controller
+        if let req = c.pendingApproval {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: req.kind == .screenshot ? "eye.trianglebadge.exclamationmark.fill" : "hand.raised.fill")
+                        .foregroundStyle(BK.Tone.warning.color)
+                    Text(req.kind == .screenshot ? "Allow a screenshot?" : "Approve this action?")
+                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(BK.Notch.text)
+                    Spacer()
+                    BKBadge(text: "\(req.risk.rawValue) risk", tone: req.risk == .high ? .danger : .warning)
+                }
+                Text(req.title).font(.system(size: 14, weight: .medium)).foregroundStyle(BK.Notch.text).lineLimit(2)
+                HStack(spacing: 6) {
+                    if let app = req.appName { BKBadge(text: app, tone: .info) }
+                    ForEach(req.reasons.prefix(3), id: \.self) { BKBadge(text: $0, tone: .warning) }
+                }
+                Text(req.detail).font(.system(size: 11.5)).foregroundStyle(BK.Notch.secondary).lineLimit(3)
+                HStack {
+                    Button("Stop task") { c.respondToApproval(.stop) }.buttonStyle(BKButtonStyle(kind: .ghost, compact: true, onDark: true))
+                    Spacer()
+                    Button("Reject") { c.respondToApproval(.reject) }.buttonStyle(BKButtonStyle(kind: .secondary, compact: false, onDark: true))
+                    Button("Approve") { c.respondToApproval(.approve) }.buttonStyle(BKButtonStyle(kind: .primary))
+                }
+            }
+            .padding(.top, 8)
+        }
+    }
+}
+
+// MARK: - Result (States F/G)
+
+struct NotchResultView: View {
+    @Bindable var model: NotchModel
+
+    var body: some View {
+        let c = model.controller
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                BKAgentOrb(mode: c.phase == .completed ? .success : (c.phase == .stopped ? .paused : .error), size: 20)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).font(.system(size: 13, weight: .semibold)).foregroundStyle(BK.Notch.text)
+                    Text(c.status).font(.system(size: 12)).foregroundStyle(BK.Notch.secondary).lineLimit(3).textSelection(.enabled)
+                }
+                Spacer()
+            }
+            HStack {
+                Button("View details") { model.detailOpen = true; model.recompute() }
+                    .buttonStyle(BKButtonStyle(kind: .ghost, compact: true, onDark: true))
+                Spacer()
+                if c.phase == .failed || c.phase == .stopped {
+                    Button("Retry") { model.resultVisible = false; c.retry(); model.recompute() }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
+                    Button("Replan") { model.resultVisible = false; c.replan(); model.recompute() }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
+                }
+                if c.phase == .needsInput {
+                    Button("Reply") { model.inputText = c.instruction + " — "; model.open() }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
+                }
+                if c.phase == .failed && !c.isConfigured {
+                    Button("Open Settings") { model.openSettings("providers") }.buttonStyle(BKButtonStyle(kind: .primary, compact: true))
+                }
+                Button("Close") { model.close() }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
+            }
+        }
+        .padding(.top, 8)
+    }
+
+    var title: String {
+        switch model.controller.phase {
+        case .completed: return "Done"
+        case .stopped: return "Stopped"
+        case .needsInput: return "Needs your input"
+        default: return "Something went wrong"
+        }
+    }
+}
