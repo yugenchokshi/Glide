@@ -4,7 +4,7 @@ import AgentKit
 import AutomationKit
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let store = SettingsStore.shared
     let controller = TaskController.shared
     lazy var notchModel = NotchModel(controller: controller, settings: store)
@@ -73,11 +73,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.isReleasedWhenClosed = false
             window.center()
             window.setFrameAutosaveName("NotchBuddySettings")
+            window.delegate = self
             settingsWindow = window
         }
         notchModel.close()
         NSApp.activate()
         settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Closed windows are torn down so their SwiftUI views (and animations) stop costing CPU.
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        DispatchQueue.main.async { [weak self] in
+            window.contentView = nil
+            if window === self?.settingsWindow { self?.settingsWindow = nil }
+            if window === self?.onboardingWindow { self?.onboardingWindow = nil }
+        }
     }
 
     func showOnboarding() {
@@ -98,6 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.contentView = NSHostingView(rootView: view)
             window.isReleasedWhenClosed = false
             window.center()
+            window.delegate = self
             onboardingWindow = window
         }
         NSApp.activate()
