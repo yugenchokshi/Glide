@@ -1,4 +1,4 @@
-// Renders the NotchBuddy app icon (iridescent orb under a notch) into an .iconset.
+// Renders the Glide app icon (iridescent orb under a notch) into an .iconset.
 import AppKit
 let out = CommandLine.arguments[1]
 try? FileManager.default.createDirectory(atPath: out, withIntermediateDirectories: true)

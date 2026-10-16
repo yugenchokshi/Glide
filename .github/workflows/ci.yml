@@ -22,5 +22,5 @@ jobs:
         run: NB_SIGN_IDENTITY=- ./scripts/build_app.sh release
       - uses: actions/upload-artifact@v4
         with:
-          name: NotchBuddy.app
-          path: build/NotchBuddy.app
+          name: Glide.app
+          path: build/Glide.app

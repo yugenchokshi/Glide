@@ -1,9 +1,9 @@
 # Architecture
 
-NotchBuddy is a Swift package with three layers. The UI never touches automation code directly.
+Glide is a Swift package with three layers. The UI never touches automation code directly.
 
 ```
-NotchBuddyApp (SwiftUI + AppKit)      nbctl (CLI)
+GlideApp (SwiftUI + AppKit)      glidectl (CLI)
         │                                │
         ▼                                ▼
      AgentKit  ── providers, planner, orchestrator, safety, history, integrations
@@ -16,8 +16,8 @@ NotchBuddyApp (SwiftUI + AppKit)      nbctl (CLI)
 
 | PRD module | Where |
 |---|---|
-| NotchUI | `Sources/NotchBuddyApp/Notch/` (`NotchWindow.swift`, `NotchViews.swift`), design system in `BoardKit/` |
-| SettingsUI | `Sources/NotchBuddyApp/Settings/`, `Onboarding/` |
+| NotchUI | `Sources/GlideApp/Notch/` (`NotchWindow.swift`, `NotchViews.swift`), design system in `BoardKit/` |
+| SettingsUI | `Sources/GlideApp/Settings/`, `Onboarding/` |
 | TaskController | `Sources/AgentKit/Controller/TaskController.swift` |
 | AgentPlanner | `Sources/AgentKit/Agent/AgentPlanner.swift` (`AgentPlanner`, `ActionSelector`) |
 | ExecutionOrchestrator | `Sources/AgentKit/Agent/ExecutionOrchestrator.swift` |
@@ -99,9 +99,10 @@ Manual mode lets you pick provider, model and effort per role. Jev (optional) is
 
 ## Persistence
 
-- Settings: JSON in `UserDefaults` (domain `dev.notchbuddy.app`, shared with `nbctl`). Contains no secrets.
+- Settings: JSON in `UserDefaults` (domain `dev.notchbuddy.app`, shared with `glidectl`). Contains no secrets.
 - Secrets: Keychain generic passwords under the `dev.notchbuddy.credentials` service.
-- History and skills: SQLite at `~/Library/Application Support/NotchBuddy/notchbuddy.sqlite`. Text is scrubbed of anything that looks like a key before it's written.
+- These identifiers (and the bundle ID `dev.notchbuddy.app`) date from the app's earlier name, NotchBuddy. They're kept so existing installs keep their settings, keys and permissions. Task history moved from `Application Support/NotchBuddy` to `Application Support/Glide` and is migrated on first launch.
+- History and skills: SQLite at `~/Library/Application Support/Glide/glide.sqlite`. Text is scrubbed of anything that looks like a key before it's written.
 
 ## Concurrency
 

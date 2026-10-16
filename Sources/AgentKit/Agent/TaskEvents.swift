@@ -64,7 +64,7 @@ public struct TaskResult: Sendable {
     public var durationMs: Double
 }
 
-/// Callbacks from the orchestrator to whoever runs it (the notch UI or nbctl).
+/// Callbacks from the orchestrator to whoever runs it (the notch UI or glidectl).
 public struct AgentCallbacks: Sendable {
     public var phase: @Sendable (AgentPhase, String) -> Void
     public var log: @Sendable (ActivityEntry) -> Void

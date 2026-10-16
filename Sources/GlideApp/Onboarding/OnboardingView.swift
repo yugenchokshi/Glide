@@ -22,7 +22,7 @@ struct OnboardingView: View {
         _step = State(initialValue: initialStep)
     }
 
-    static let introTask = "Open TextEdit, create a new document, and type “Hello from NotchBuddy!”"
+    static let introTask = "Open TextEdit, create a new document, and type “Hello from Glide!”"
 
     var body: some View {
         BKThemeReader { t in
@@ -96,7 +96,7 @@ struct OnboardingView: View {
             BKAgentOrb(mode: .thinking, size: 56)
                 .shadow(color: Color(hex: 0x8B6BFF).opacity(0.35), radius: 16, y: 4)
             BKBadge(text: "Computer-use agent for macOS", tone: .info, icon: "sparkles")
-            Text("Meet NotchBuddy").font(.system(size: 30, weight: .semibold))
+            Text("Meet Glide").font(.system(size: 30, weight: .semibold))
             Text("Tell it what you want done. It plans the steps and operates your Mac for you — moving the real cursor, clicking, typing and switching apps — while you watch from the notch.")
                 .font(.system(size: 15)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 8) {
@@ -117,7 +117,7 @@ struct OnboardingView: View {
                 feature("eye.fill", 0x0EA5E9, "Looks only when it has to", "Screenshots only for controls accessibility can't see, after you allow it, with passwords blacked out.")
                 feature("hand.raised.fill", 0xF59E0B, "You stay in control", "Sending, deleting and purchases wait for approval. Stop with \(store.settings.hotkeys.stop.display) or by moving the mouse.")
             }
-            BKCallout(tone: .success, icon: "key.fill", title: "Your keys, your Mac", message: "Bring your own OpenAI or Anthropic key. It stays in your Keychain. No account, no NotchBuddy server.")
+            BKCallout(tone: .success, icon: "key.fill", title: "Your keys, your Mac", message: "Bring your own OpenAI or Anthropic key. It stays in your Keychain. No account, no Glide server.")
         }
     }
 
@@ -136,7 +136,7 @@ struct OnboardingView: View {
     var permissions: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Permissions").font(BK.Font.title1)
-            Text("macOS will show you where to switch these on. NotchBuddy asks only for what it uses.").font(.system(size: 13)).foregroundStyle(.secondary)
+            Text("macOS will show you where to switch these on. Glide asks only for what it uses.").font(.system(size: 13)).foregroundStyle(.secondary)
             BKGroup {
                 PermissionRow(kind: .accessibility, status: axGranted ? .granted : .denied) { Task { _ = await PermissionManager.request(.accessibility) } }
                 PermissionRow(kind: .screenRecording, status: screenGranted ? .granted : .notDetermined) { Task { _ = await PermissionManager.request(.screenRecording) } }
@@ -235,7 +235,7 @@ struct OnboardingView: View {
                 onFinish(Self.introTask)
             } label: { Label("Run it now", systemImage: "play.fill") }
                 .buttonStyle(BKButtonStyle(kind: .primary))
-            Text("Afterwards, press \(store.settings.hotkeys.open.display) anytime to give NotchBuddy a task.").font(.system(size: 12)).foregroundStyle(.secondary)
+            Text("Afterwards, press \(store.settings.hotkeys.open.display) anytime to give Glide a task.").font(.system(size: 12)).foregroundStyle(.secondary)
         }
     }
 }

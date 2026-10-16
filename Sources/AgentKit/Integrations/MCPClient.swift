@@ -62,7 +62,7 @@ public actor MCPClient {
         let result = try await t.request("initialize", params: [
             "protocolVersion": .string(Self.protocolVersion),
             "capabilities": [:],
-            "clientInfo": ["name": "NotchBuddy", "version": "1.0.0"],
+            "clientInfo": ["name": "Glide", "version": "1.0.0"],
         ], timeout: 30)
         serverName = result["serverInfo"]?["name"]?.stringValue
         try await t.notify("notifications/initialized", params: nil)

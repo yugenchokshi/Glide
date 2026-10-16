@@ -3,16 +3,16 @@ import AppKit
 import AutomationKit
 import AgentKit
 
-// nbctl — headless companion to NotchBuddy.
-//   nbctl inspect [app] [--ocr]     print the indexed UI skeleton of an app's focused window
-//   nbctl click "<label>" [--app X] click an element by label (real cursor)
-//   nbctl type "<text>"             type into the focused element
-//   nbctl key cmd+n                 press a key combination
-//   nbctl menu "File > New"         choose a menu item in the frontmost app
-//   nbctl workflow                  Finder + Notes deterministic workflow (Phase 2 acceptance)
-//   nbctl bench [--only 1,2] [--json out.json]   run the 12-scenario benchmark
-//   nbctl run "<task>" [--mock-url URL] [--yes]  run the full agent with configured providers
-//   nbctl permissions               show permission status
+// glidectl — headless companion to Glide.
+//   glidectl inspect [app] [--ocr]     print the indexed UI skeleton of an app's focused window
+//   glidectl click "<label>" [--app X] click an element by label (real cursor)
+//   glidectl type "<text>"             type into the focused element
+//   glidectl key cmd+n                 press a key combination
+//   glidectl menu "File > New"         choose a menu item in the frontmost app
+//   glidectl workflow                  Finder + Notes deterministic workflow (Phase 2 acceptance)
+//   glidectl bench [--only 1,2] [--json out.json]   run the 12-scenario benchmark
+//   glidectl run "<task>" [--mock-url URL] [--yes]  run the full agent with configured providers
+//   glidectl permissions               show permission status
 
 setvbuf(stdout, nil, _IOLBF, 0)
 let args = Array(CommandLine.arguments.dropFirst())
@@ -39,7 +39,7 @@ let fixtureURL = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPath
 @MainActor
 func main() async -> Int32 {
     guard let command = args.first else {
-        print("usage: nbctl inspect|click|type|key|menu|workflow|bench|run|permissions …")
+        print("usage: glidectl inspect|click|type|key|menu|workflow|bench|run|permissions …")
         return 2
     }
     if command != "permissions" && !AccessibilityEngine.isTrusted {
@@ -76,7 +76,7 @@ func main() async -> Int32 {
             print("— cached lookup \(String(format: "%.2f", Date().timeIntervalSince(t2) * 1000))ms")
 
         case "click":
-            guard let label = positional.first else { print("nbctl click \"<label>\""); return 2 }
+            guard let label = positional.first else { print("glidectl click \"<label>\""); return 2 }
             if let name = option("--app") { _ = try await runtime.executor.apps.activate(name) }
             try await runner.act(.click(.description(label)))
 
@@ -110,7 +110,7 @@ func main() async -> Int32 {
             return results.allSatisfy(\.success) ? 0 : 1
 
         case "run":
-            guard let task = positional.first else { print("nbctl run \"<task>\""); return 2 }
+            guard let task = positional.first else { print("glidectl run \"<task>\""); return 2 }
             var settings = SettingsStore.loadSnapshot()
             if let mock = option("--mock-url") {
                 var p = ProviderConfig(id: "mock", kind: .openaiCompatible, name: "Mock", baseURL: mock, requiresKey: false, models: [option("--model") ?? "mock"])
@@ -161,7 +161,7 @@ func main() async -> Int32 {
 @MainActor
 func finderNotesWorkflow(_ r: ScriptRunner) async throws {
     let start = Date()
-    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("notchbuddy-workflow")
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("glide-workflow")
     try? FileManager.default.removeItem(at: dir)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     let file = dir.appendingPathComponent("quarterly-draft.txt")
@@ -180,10 +180,10 @@ func finderNotesWorkflow(_ r: ScriptRunner) async throws {
     try await r.act(.launchApp("Notes"), expect: .appFrontmost("Notes"), timeout: 8, requireVerified: true)
     try await r.act(.keyPress(try KeyCombination(parsing: "cmd+n")), expect: .uiChanged)
     try await Task.sleep(for: .milliseconds(400))
-    let body = "NotchBuddy bench workflow\nRenamed quarterly-draft.txt to \(newName)"
+    let body = "Glide bench workflow\nRenamed quarterly-draft.txt to \(newName)"
     try await r.act(.typeText(body, into: nil, clearFirst: false, submit: false), expect: .focusedValueContains(newName), timeout: 3, requireVerified: true)
     print("3. Cleanup")
-    try await BenchmarkSuite.deleteTestNote(r, title: "NotchBuddy bench workflow", log: { print($0) })
+    try await BenchmarkSuite.deleteTestNote(r, title: "Glide bench workflow", log: { print($0) })
     try? FileManager.default.removeItem(at: dir)
     print("✓ workflow verified in \(Int(Date().timeIntervalSince(start) * 1000))ms · \(r.stats.actions) actions · avg observation \(Int(r.stats.observationMs / Double(max(1, r.stats.observations))))ms")
 }

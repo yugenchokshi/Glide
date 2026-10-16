@@ -35,7 +35,7 @@ public final class AXEventMonitor: @unchecked Sendable {
             ready.signal()
             CFRunLoopRun()
         }
-        t.name = "dev.notchbuddy.ax-events"
+        t.name = "dev.glide.ax-events"
         t.qualityOfService = .userInitiated
         t.start()
         ready.wait()

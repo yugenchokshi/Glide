@@ -10,4 +10,4 @@ PORT=${PORT:-18734}
 "$BIN/NBFixtureApp" & FIX=$!
 trap 'kill $MOCK $FIX 2>/dev/null || true' EXIT
 sleep 1.5
-"$BIN/nbctl" run "Greet Ada in the NB Fixture app" --mock-url "http://127.0.0.1:$PORT/v1"
+"$BIN/glidectl" run "Greet Ada in the NB Fixture app" --mock-url "http://127.0.0.1:$PORT/v1"

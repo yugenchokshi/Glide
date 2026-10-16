@@ -39,7 +39,7 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
     let selector: ActionSelector
     let resolver: ActionResolver
     let grounding: VisionGrounding
-    let log = Logger(subsystem: "dev.notchbuddy", category: "orchestrator")
+    let log = Logger(subsystem: "dev.glide", category: "orchestrator")
 
     private var notes: [String] = []
     private var totalActions = 0
@@ -48,7 +48,7 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
     private var deadline = Date.distantFuture
     private var finalMessage: String?
     private var composio: (ComposioClient, String)?
-    /// Last app the agent acted in; used when the frontmost app is NotchBuddy or a terminal.
+    /// Last app the agent acted in; used when the frontmost app is Glide or a terminal.
     private var currentApp: AppInfo?
 
     enum StepOutcome {
@@ -239,7 +239,7 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
         return ctx
     }
 
-    /// The app to observe: the frontmost app unless it's a terminal/NotchBuddy that launched us.
+    /// The app to observe: the frontmost app unless it's a terminal/Glide that launched us.
     private func targetApp() -> AppInfo? {
         let ax = runtime.accessibility
         return ax.frontmostApp() ?? currentApp
@@ -247,7 +247,7 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
 
     private func observeCurrent(forceOCR: Bool = false) async throws -> ScreenObservation? {
         guard let app = targetApp() else { return nil }
-        if safety.isExcluded(app: app) { throw AutomationError.blockedBySafety("NotchBuddy is set not to read or operate \(app.name).") }
+        if safety.isExcluded(app: app) { throw AutomationError.blockedBySafety("Glide is set not to read or operate \(app.name).") }
         let t = Date()
         let obs = try await runtime.perception.observe(app, forceOCR: forceOCR)
         await metrics.recordObservation(ms: Date().timeIntervalSince(t) * 1000)

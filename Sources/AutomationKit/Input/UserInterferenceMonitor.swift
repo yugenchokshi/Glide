@@ -44,7 +44,7 @@ public final class UserInterferenceMonitor: @unchecked Sendable {
             ready.signal()
             CFRunLoopRun()
         }
-        thread.name = "dev.notchbuddy.interference"
+        thread.name = "dev.glide.interference"
         thread.start()
         ready.wait()
         lock.withLock {

@@ -1,19 +1,19 @@
 # Contributing
 
-Thanks for helping improve NotchBuddy.
+Thanks for helping improve Glide.
 
 ## Setup
 
 ```bash
-git clone https://github.com/<you>/NotchBuddy.git && cd NotchBuddy
+git clone https://github.com/<you>/Glide.git && cd Glide
 swift build            # all targets
 swift test             # unit + integration tests (safe: no UI control, no paid APIs)
-./scripts/build_app.sh debug && open build/NotchBuddy.app
+./scripts/build_app.sh debug && open build/Glide.app
 ```
 
 You need macOS 26 and a Swift 6.2+ toolchain (Xcode 26 or later). The package has no third-party dependencies, so please keep it that way unless there's a strong reason.
 
-To run the live benchmark (`nbctl bench`), give your terminal Accessibility permission. The benchmark moves your real cursor and uses disposable fixtures: the bundled `NBFixtureApp`, temporary files, a local HTML form, and one test note per run.
+To run the live benchmark (`glidectl bench`), give your terminal Accessibility permission. The benchmark moves your real cursor and uses disposable fixtures: the bundled `NBFixtureApp`, temporary files, a local HTML form, and one test note per run.
 
 ## Ground rules
 
@@ -27,8 +27,8 @@ To run the live benchmark (`nbctl bench`), give your terminal Accessibility perm
 ## Pull requests
 
 1. Add or update tests (`swift test` must pass).
-2. If you touched the engine, run `nbctl bench` and paste the table into the PR.
+2. If you touched the engine, run `glidectl bench` and paste the table into the PR.
 3. Update `ARCHITECTURE.md` or `docs/` when behavior changes.
-4. Keep the UI consistent with BoardKit tokens (`Sources/NotchBuddyApp/BoardKit`).
+4. Keep the UI consistent with BoardKit tokens (`Sources/GlideApp/BoardKit`).
 
 By contributing you agree your work is licensed under the MIT License.

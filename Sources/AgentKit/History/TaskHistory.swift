@@ -19,9 +19,26 @@ public struct TaskRecord: Sendable, Identifiable, Hashable, Codable {
 /// Local task history and saved skills in one SQLite file under Application Support.
 public final class LocalStore: @unchecked Sendable {
     public static let shared: LocalStore = {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NotchBuddy")
-        return (try? LocalStore(path: dir.appendingPathComponent("notchbuddy.sqlite").path)) ?? (try! LocalStore(path: NSTemporaryDirectory() + "notchbuddy.sqlite"))
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = support.appendingPathComponent("Glide")
+        migrateLegacyStore(from: support.appendingPathComponent("NotchBuddy"), to: dir)
+        return (try? LocalStore(path: dir.appendingPathComponent("glide.sqlite").path)) ?? (try! LocalStore(path: NSTemporaryDirectory() + "glide.sqlite"))
     }()
+
+    /// The app was called NotchBuddy before; move its history to the Glide folder once.
+    static func migrateLegacyStore(from legacy: URL, to dir: URL) {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: legacy.path), !fm.fileExists(atPath: dir.path) else { return }
+        do {
+            try fm.moveItem(at: legacy, to: dir)
+            for suffix in ["", "-wal", "-shm"] {
+                let old = dir.appendingPathComponent("notchbuddy.sqlite" + suffix)
+                if fm.fileExists(atPath: old.path) { try fm.moveItem(at: old, to: dir.appendingPathComponent("glide.sqlite" + suffix)) }
+            }
+        } catch {
+            // Leave the old files in place; a fresh history starts in the new folder.
+        }
+    }
 
     let db: SQLiteDatabase
     public var path: String { db.path }

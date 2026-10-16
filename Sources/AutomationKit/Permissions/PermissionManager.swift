@@ -3,7 +3,7 @@ import AppKit
 import ApplicationServices
 import AVFoundation
 
-/// Status and request flow for the macOS permissions NotchBuddy uses. Requests happen only
+/// Status and request flow for the macOS permissions Glide uses. Requests happen only
 /// when a feature needs them; the app can't grant itself anything.
 public enum PermissionKind: String, CaseIterable, Sendable, Identifiable {
     case accessibility, screenRecording, automation, microphone

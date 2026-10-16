@@ -208,7 +208,7 @@ public struct ComposioSettings: Codable, Sendable, Hashable {
     public var enabled = false
     public var baseURL = "https://backend.composio.dev/api/v3.1"
     /// Stable local user identifier sent to Composio (not personal data).
-    public var userID = "notchbuddy-" + UUID().uuidString.prefix(8).lowercased()
+    public var userID = "glide-" + UUID().uuidString.prefix(8).lowercased()
     public var sessionID: String?
     public var callbackURL: String?
     public init() {}
@@ -258,6 +258,8 @@ public struct AppSettings: Codable, Sendable, Hashable {
 @Observable
 public final class SettingsStore {
     public static let shared = SettingsStore()
+    // Identifiers from the app's earlier name (NotchBuddy), kept so existing settings,
+    // Keychain entries and macOS permissions carry over to Glide unchanged.
     nonisolated static let defaultsKey = "dev.notchbuddy.settings.v1"
     private let defaults: UserDefaults
 
@@ -265,7 +267,7 @@ public final class SettingsStore {
         didSet { save() }
     }
 
-    /// The app and nbctl share one settings domain.
+    /// The app and glidectl share one settings domain.
     nonisolated public static func sharedDefaults() -> UserDefaults {
         if Bundle.main.bundleIdentifier == "dev.notchbuddy.app" { return .standard }
         return UserDefaults(suiteName: "dev.notchbuddy.app") ?? .standard

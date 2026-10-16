@@ -3,12 +3,13 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDevelopmentRegion</key><string>en</string>
-	<key>CFBundleDisplayName</key><string>NotchBuddy</string>
-	<key>CFBundleExecutable</key><string>NotchBuddy</string>
+	<key>CFBundleDisplayName</key><string>Glide</string>
+	<key>CFBundleExecutable</key><string>Glide</string>
 	<key>CFBundleIconFile</key><string>AppIcon</string>
+	<!-- Kept from the app's earlier name so settings, Keychain items and the Accessibility grant carry over. -->
 	<key>CFBundleIdentifier</key><string>dev.notchbuddy.app</string>
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-	<key>CFBundleName</key><string>NotchBuddy</string>
+	<key>CFBundleName</key><string>Glide</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>1.0.0</string>
 	<key>CFBundleVersion</key><string>1</string>
@@ -16,9 +17,9 @@
 	<key>LSMinimumSystemVersion</key><string>26.0</string>
 	<key>LSUIElement</key><true/>
 	<key>NSHighResolutionCapable</key><true/>
-	<key>NSHumanReadableCopyright</key><string>MIT License. Copyright © 2026 NotchBuddy contributors.</string>
-	<key>NSAppleEventsUsageDescription</key><string>NotchBuddy reads the current page's address and text from your browser when a task needs it.</string>
-	<key>NSMicrophoneUsageDescription</key><string>NotchBuddy uses the microphone only while you dictate a task.</string>
-	<key>NSSpeechRecognitionUsageDescription</key><string>NotchBuddy transcribes your dictated task on device.</string>
+	<key>NSHumanReadableCopyright</key><string>MIT License. Copyright © 2026 Glide contributors.</string>
+	<key>NSAppleEventsUsageDescription</key><string>Glide reads the current page's address and text from your browser when a task needs it.</string>
+	<key>NSMicrophoneUsageDescription</key><string>Glide uses the microphone only while you dictate a task.</string>
+	<key>NSSpeechRecognitionUsageDescription</key><string>Glide transcribes your dictated task on device.</string>
 </dict>
 </plist>

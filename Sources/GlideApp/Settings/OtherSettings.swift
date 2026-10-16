@@ -10,7 +10,7 @@ struct PermissionsSettingsView: View {
     let timer = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        BKSectionHeader(title: "Permissions", subtitle: "macOS asks you to grant these. NotchBuddy can't grant them to itself.")
+        BKSectionHeader(title: "Permissions", subtitle: "macOS asks you to grant these. Glide can't grant them to itself.")
         BKGroup {
             ForEach(PermissionKind.allCases) { kind in
                 PermissionRow(kind: kind, status: statuses[kind] ?? .unknown) {
@@ -18,7 +18,7 @@ struct PermissionsSettingsView: View {
                 }
             }
         }
-        Text("After granting Accessibility or Screen Recording, macOS may require relaunching NotchBuddy.")
+        Text("After granting Accessibility or Screen Recording, macOS may require relaunching Glide.")
             .font(BK.Font.caption).foregroundStyle(.secondary).padding(.horizontal, 4)
             .onAppear(perform: refresh)
             .onReceive(timer) { _ in refresh() }
@@ -94,7 +94,7 @@ struct SafetySettingsView: View {
                 BKSwitch(isOn: $store.settings.safety.pauseOnUserInput, label: "Pause when I move the mouse")
             }
         }
-        BKGroupHeader(title: "Excluded apps", subtitle: "NotchBuddy will never read or operate these apps (names or bundle IDs).")
+        BKGroupHeader(title: "Excluded apps", subtitle: "Glide will never read or operate these apps (names or bundle IDs).")
         BKGroup {
             ForEach(store.settings.safety.excludedApps, id: \.self) { app in
                 HStack(spacing: 10) {
@@ -157,9 +157,9 @@ struct ShortcutsSettingsView: View {
     @State private var conflictText: [HotkeyManager.Action: String] = [:]
 
     var body: some View {
-        BKSectionHeader(title: "Shortcuts", subtitle: "Global shortcuts work from any app. The emergency stop works even when NotchBuddy's UI is hidden.")
+        BKSectionHeader(title: "Shortcuts", subtitle: "Global shortcuts work from any app. The emergency stop works even when Glide's UI is hidden.")
         BKGroup {
-            row(.open, "Open NotchBuddy", \.open)
+            row(.open, "Open Glide", \.open)
             row(.pauseResume, "Pause / resume", \.pauseResume)
             row(.stop, "Emergency stop", \.stop)
         }
@@ -319,7 +319,7 @@ struct HistorySettingsView: View {
     @State private var confirmClear = false
 
     var body: some View {
-        BKSectionHeader(title: "History", subtitle: "What NotchBuddy did, step by step. Stored only on this Mac. Screenshots are never kept.")
+        BKSectionHeader(title: "History", subtitle: "What Glide did, step by step. Stored only on this Mac. Screenshots are never kept.")
         BKGroup {
             BKFormRow(title: "Keep task history") { BKSwitch(isOn: $store.settings.keepHistory, label: "Keep task history") }
             BKFormRow(title: "Clear history", detail: "Deletes every task record and log from this Mac.") {

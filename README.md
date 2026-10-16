@@ -1,13 +1,13 @@
-# NotchBuddy
+# Glide
 
 A native macOS computer-use agent that lives in the MacBook notch.
 
-Describe what you want done, press **Start**, and watch the real cursor open apps, click, type, scroll, switch windows and finish the task. NotchBuddy reads each app's **accessibility tree** to find controls (fast, precise, no screenshots). It falls back to local OCR, and then to a vision model, only for controls accessibility can't see.
+Describe what you want done, press **Start**, and watch the real cursor open apps, click, type, scroll, switch windows and finish the task. Glide reads each app's **accessibility tree** to find controls (fast, precise, no screenshots). It falls back to local OCR, and then to a vision model, only for controls accessibility can't see.
 
 - **Native**: Swift 6, SwiftUI and AppKit, with no Electron or web runtime. Idle CPU is near zero.
 - **Bring your own keys**: OpenAI, Anthropic or any OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter…). Keys are stored in the macOS Keychain.
 - **You stay in control**: sending, deleting, publishing and purchasing wait for your approval. A global emergency stop works even when the UI is hidden, and moving the mouse pauses the agent.
-- **Local-first**: there's no account and no NotchBuddy server. Task history stays on your Mac.
+- **Local-first**: there's no account and no Glide server. Task history stays on your Mac.
 - **Optional Jev**: TypeSafe's decision model breaks ties between similar on-screen controls. You can call it directly or through Vercel AI Gateway.
 - **Optional integrations**: [Composio](https://composio.dev) (Gmail, Calendar, Slack, Notion, GitHub…) and any MCP server.
 
@@ -30,10 +30,10 @@ Describe what you want done, press **Start**, and watch the real cursor open app
 ## Install from source
 
 ```bash
-git clone https://github.com/<you>/NotchBuddy.git
-cd NotchBuddy
-./scripts/build_app.sh          # builds and signs build/NotchBuddy.app
-open build/NotchBuddy.app
+git clone https://github.com/yugenchokshi/Glide.git
+cd Glide
+./scripts/build_app.sh          # builds and signs build/Glide.app
+open build/Glide.app
 ```
 
 `build_app.sh` signs with `$NB_SIGN_IDENTITY`. If that's unset, it uses your first *Developer ID Application* or *Apple Development* identity, and falls back to ad-hoc signing. A stable identity matters because macOS ties the Accessibility grant to the code signature. With ad-hoc signing you'll have to re-grant Accessibility after every rebuild. `scripts/notarize.sh` notarizes a Developer ID build for distribution.
@@ -77,26 +77,26 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the module map.
 
 ## Command-line companion
 
-`nbctl` drives the same engine without the UI. It's useful for development and benchmarks:
+`glidectl` drives the same engine without the UI. It's useful for development and benchmarks:
 
 ```bash
 swift build
-.build/debug/nbctl inspect Notes          # print the indexed UI skeleton of Notes
-.build/debug/nbctl click "New Note" --app Notes
-.build/debug/nbctl workflow               # Finder + Notes deterministic workflow
-.build/debug/nbctl bench --json bench.json  # 12-scenario live benchmark
-.build/debug/nbctl run "Open TextEdit and type hello"   # full agent with your configured provider
+.build/debug/glidectl inspect Notes          # print the indexed UI skeleton of Notes
+.build/debug/glidectl click "New Note" --app Notes
+.build/debug/glidectl workflow               # Finder + Notes deterministic workflow
+.build/debug/glidectl bench --json bench.json  # 12-scenario live benchmark
+.build/debug/glidectl run "Open TextEdit and type hello"   # full agent with your configured provider
 ```
 
-`nbctl` shares settings and Keychain entries with the app. It needs Accessibility permission for the terminal that runs it.
+`glidectl` shares settings and Keychain entries with the app. It needs Accessibility permission for the terminal that runs it.
 
-Regenerate these images with `.build/debug/NotchBuddy --snapshot docs/images` (notch) and `.build/debug/NotchBuddy --snapshot-settings <dir>` (settings and onboarding).
+Regenerate these images with `.build/debug/Glide --snapshot docs/images` (notch) and `.build/debug/Glide --snapshot-settings <dir>` (settings and onboarding).
 
 ## Tests
 
 ```bash
 swift build && swift test        # unit + integration tests (no UI control, no paid APIs)
-.build/debug/nbctl bench         # live benchmark: moves your real cursor on disposable fixtures
+.build/debug/glidectl bench         # live benchmark: moves your real cursor on disposable fixtures
 ```
 
 See [docs/TESTING.md](docs/TESTING.md).
@@ -111,8 +111,8 @@ Details are in [SECURITY.md](SECURITY.md).
 
 ## Design
 
-The interface follows [BoardUI](https://www.boardui.com)'s visual language: its neutral surfaces and blue accent, grouped settings rows, pastel chips, and its agent-progress, thinking and composer-loader patterns. BoardUI is a React/Tailwind library, so it is re-created natively in SwiftUI as "BoardKit" (`Sources/NotchBuddyApp/BoardKit`). No BoardUI source or assets are included. See [docs/DESIGN.md](docs/DESIGN.md).
+The interface follows [BoardUI](https://www.boardui.com)'s visual language: its neutral surfaces and blue accent, grouped settings rows, pastel chips, and its agent-progress, thinking and composer-loader patterns. BoardUI is a React/Tailwind library, so it is re-created natively in SwiftUI as "BoardKit" (`Sources/GlideApp/BoardKit`). No BoardUI source or assets are included. See [docs/DESIGN.md](docs/DESIGN.md).
 
 ## License
 
-MIT. See [LICENSE](LICENSE). NotchBuddy has no third-party package dependencies and links only Apple system frameworks and the system SQLite.
+MIT. See [LICENSE](LICENSE). Glide has no third-party package dependencies and links only Apple system frameworks and the system SQLite.

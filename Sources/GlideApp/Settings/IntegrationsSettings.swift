@@ -4,7 +4,7 @@ import AgentKit
 
 // MARK: - Catalogs
 
-/// Popular apps reachable through Composio. Always shown, so you can see what NotchBuddy can
+/// Popular apps reachable through Composio. Always shown, so you can see what Glide can
 /// connect to before adding a key. Tiles use initials on brand colors; real logos appear once
 /// Composio is connected (nothing is fetched before you configure it).
 struct AppIntegration: Identifiable, Hashable {
@@ -114,7 +114,7 @@ struct IntegrationsSettingsView: View {
     }
 
     var body: some View {
-        BKSectionHeader(title: "Integrations", subtitle: "Optional. When a connected integration can do a step directly, NotchBuddy uses it instead of driving the app's UI. Everything works without them.")
+        BKSectionHeader(title: "Integrations", subtitle: "Optional. When a connected integration can do a step directly, Glide uses it instead of driving the app's UI. Everything works without them.")
         BKSegmented(options: [(Tab.apps, "Apps"), (.mcp, "MCP servers")], selection: $tab)
             .padding(.bottom, 2)
         switch tab {
@@ -421,7 +421,7 @@ struct ComposioKeySheet: View {
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Connect \(app.name)").font(BK.Font.title2)
-                    Text("NotchBuddy connects to \(app.name) through Composio using your own Composio project key. After you save it, \(app.name)'s sign-in opens in your browser on Composio's hosted page.")
+                    Text("Glide connects to \(app.name) through Composio using your own Composio project key. After you save it, \(app.name)'s sign-in opens in your browser on Composio's hosted page.")
                         .font(BK.Font.body).foregroundStyle(t.secondary).fixedSize(horizontal: false, vertical: true)
                 }
                 BKGroup {

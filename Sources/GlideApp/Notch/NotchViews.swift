@@ -84,7 +84,7 @@ struct NotchRootView: View {
                 HStack(spacing: 6) {
                     BKAgentOrb(mode: orbMode, size: 14)
                     if model.presentation == .hover && !c.isRunning {
-                        Text("NotchBuddy").font(.system(size: 11, weight: .semibold)).foregroundStyle(BK.Notch.secondary)
+                        Text("Glide").font(.system(size: 11, weight: .semibold)).foregroundStyle(BK.Notch.secondary)
                     }
                 }
             } else if c.isRunning {
@@ -318,7 +318,7 @@ struct NotchDetailView: View {
                         BKTimeline(entries: events)
                     }
                 } else {
-                    Text("Select a task to see what NotchBuddy did.").font(.system(size: 12)).foregroundStyle(BK.Notch.tertiary)
+                    Text("Select a task to see what Glide did.").font(.system(size: 12)).foregroundStyle(BK.Notch.tertiary)
                 }
             }
         }

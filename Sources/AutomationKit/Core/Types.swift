@@ -213,7 +213,7 @@ public enum AutomationError: Error, LocalizedError, Sendable, Equatable {
     public var errorDescription: String? {
         switch self {
         case .accessibilityNotTrusted:
-            return "NotchBuddy needs Accessibility permission (System Settings › Privacy & Security › Accessibility)."
+            return "Glide needs Accessibility permission (System Settings › Privacy & Security › Accessibility)."
         case .screenRecordingNotGranted:
             return "Screen Recording permission is needed to see this window."
         case .appNotFound(let n): return "Couldn't find an app named “\(n)”."

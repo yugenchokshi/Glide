@@ -26,9 +26,9 @@ passed 12/12
 wrote docs/benchmarks/latest.json
 ```
 
-The Finder → Notes workflow (`nbctl workflow`, the Phase 2 acceptance test) passed in 3.4 s with 8 actions, and its test note was deleted afterwards.
+The Finder → Notes workflow (`glidectl workflow`, the Phase 2 acceptance test) passed in 3.4 s with 8 actions, and its test note was deleted afterwards.
 
-Earlier: produced by `nbctl bench --json …` on a MacBook (macOS 26.6, Apple silicon). Deterministic: there are no model calls, so cost is $0.
+Earlier: produced by `glidectl bench --json …` on a MacBook (macOS 26.6, Apple silicon). Deterministic: there are no model calls, so cost is $0.
 
 ## 2026-10-15: first run, 8/12 passed
 

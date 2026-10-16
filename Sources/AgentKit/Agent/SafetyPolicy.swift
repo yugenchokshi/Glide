@@ -37,10 +37,10 @@ public struct SafetyPolicy: Sendable {
         var risk = max(modelRisk, .low)
         var reasons: [String] = []
         if isExcluded(app: app) {
-            return Verdict(risk: .high, reasons: ["\(app?.name ?? "This app") is on your excluded list"], blocked: "NotchBuddy is set not to operate \(app?.name ?? "this app").")
+            return Verdict(risk: .high, reasons: ["\(app?.name ?? "This app") is on your excluded list"], blocked: "Glide is set not to operate \(app?.name ?? "this app").")
         }
         if let target, target.isSecure {
-            return Verdict(risk: .high, reasons: ["password field"], blocked: "NotchBuddy never types into password fields. Please enter it yourself.")
+            return Verdict(risk: .high, reasons: ["password field"], blocked: "Glide never types into password fields. Please enter it yourself.")
         }
         let label = ElementMatcher.normalize(target?.label ?? "")
         switch action {
@@ -65,7 +65,7 @@ public struct SafetyPolicy: Sendable {
                 }
             }
             if Self.looksLikePaymentCard(text) {
-                return Verdict(risk: .high, reasons: ["payment card number"], blocked: "NotchBuddy won't enter payment card numbers. Please enter it yourself.")
+                return Verdict(risk: .high, reasons: ["payment card number"], blocked: "Glide won't enter payment card numbers. Please enter it yourself.")
             }
         case .menu(let path):
             let joined = ElementMatcher.normalize(path.joined(separator: " "))

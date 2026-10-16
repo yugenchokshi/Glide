@@ -20,9 +20,9 @@ public final class AccessibilityEngine: @unchecked Sendable {
     private let lock = NSLock()
     private var cache: (pid: pid_t, generation: UInt64, observation: ScreenObservation)?
     private var enhancedPIDs: Set<pid_t> = []
-    private let log = Logger(subsystem: "dev.notchbuddy", category: "accessibility")
+    private let log = Logger(subsystem: "dev.glide", category: "accessibility")
 
-    /// Apps that should never be observed or acted on (e.g. NotchBuddy itself).
+    /// Apps that should never be observed or acted on (e.g. Glide itself).
     public var excludedPIDs: Set<pid_t> = [ProcessInfo.processInfo.processIdentifier]
 
     public init() {}
@@ -35,7 +35,7 @@ public final class AccessibilityEngine: @unchecked Sendable {
         return el
     }
 
-    /// The frontmost regular app other than NotchBuddy.
+    /// The frontmost regular app other than Glide.
     public func frontmostApp() -> AppInfo? {
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
         if excludedPIDs.contains(app.processIdentifier) { return nil }
@@ -77,7 +77,7 @@ public final class AccessibilityEngine: @unchecked Sendable {
     /// when no AX notification has arrived since it was taken.
     public func observe(_ app: AppInfo, useCache: Bool = true) throws -> ScreenObservation {
         guard Self.isTrusted else { throw AutomationError.accessibilityNotTrusted }
-        guard !excludedPIDs.contains(app.pid) else { throw AutomationError.blockedBySafety("NotchBuddy doesn't operate on its own windows.") }
+        guard !excludedPIDs.contains(app.pid) else { throw AutomationError.blockedBySafety("Glide doesn't operate on its own windows.") }
         monitor.watch(pid: app.pid)
         let generation = monitor.generation(for: app.pid)
         if useCache, let c = lock.withLock({ cache }), c.pid == app.pid, c.generation == generation,

@@ -225,7 +225,7 @@ struct ProviderTests {
     @Test func routerAutomaticDefaults() {
         var s = AppSettings()
         s.providers = [.anthropicDefault]
-        let creds = CredentialStore(service: "dev.notchbuddy.tests.\(UUID().uuidString)")
+        let creds = CredentialStore(service: "dev.glide.tests.\(UUID().uuidString)")
         creds.set("sk-ant-test-123456789", for: .provider("anthropic"))
         defer { creds.remove(.provider("anthropic")) }
         let router = ModelRouter(settings: s, credentials: creds)
@@ -240,7 +240,7 @@ struct ProviderTests {
     @Test func openAIDefaultsToGpt6LunaForEveryRole() {
         var s = AppSettings()
         s.providers = [.openAIDefault]
-        let creds = CredentialStore(service: "dev.notchbuddy.tests.\(UUID().uuidString)")
+        let creds = CredentialStore(service: "dev.glide.tests.\(UUID().uuidString)")
         creds.set("sk-test-openai-123456789", for: .provider("openai"))
         defer { creds.remove(.provider("openai")) }
         let router = ModelRouter(settings: s, credentials: creds)
@@ -255,7 +255,7 @@ struct ProviderTests {
         s.routing.jevProvider = .vercelGateway
         #expect(s.routing.effectiveJevModel == "typesafe-ai/jev")
         #expect(JevProvider.vercelGateway.endpoint.absoluteString == "https://ai-gateway.vercel.sh/typesafe/v1/systemone")
-        let creds = CredentialStore(service: "dev.notchbuddy.tests.\(UUID().uuidString)")
+        let creds = CredentialStore(service: "dev.glide.tests.\(UUID().uuidString)")
         defer { creds.remove(.vercelGateway); creds.remove(.jev) }
         #expect(ModelRouter(settings: s, credentials: creds).jevClient() == nil) // no gateway key yet
         creds.set("tsk-direct-key-123456", for: .jev)
@@ -286,7 +286,7 @@ struct ProviderTests {
     @Test func routerWithoutKeysIsNotConfigured() {
         var s = AppSettings()
         s.providers = [.anthropicDefault]
-        let router = ModelRouter(settings: s, credentials: CredentialStore(service: "dev.notchbuddy.tests.empty.\(UUID().uuidString)"))
+        let router = ModelRouter(settings: s, credentials: CredentialStore(service: "dev.glide.tests.empty.\(UUID().uuidString)"))
         #expect(!router.isConfigured)
     }
 
@@ -300,7 +300,7 @@ struct ProviderTests {
 @Suite("Credentials")
 struct CredentialTests {
     @Test func keychainRoundTrip() {
-        let store = CredentialStore(service: "dev.notchbuddy.tests.\(UUID().uuidString)")
+        let store = CredentialStore(service: "dev.glide.tests.\(UUID().uuidString)")
         #expect(store.get(.composio) == nil)
         #expect(store.set("  ak_secret_value_123  ", for: .composio))
         #expect(store.get(.composio) == "ak_secret_value_123")
@@ -359,7 +359,7 @@ struct IntegrationTests {
         config.command = server.path
         config.arguments = ["mcp"]
         let client = MCPClient(config: config)
-        try await client.connect(credentials: CredentialStore(service: "dev.notchbuddy.tests.mcp"))
+        try await client.connect(credentials: CredentialStore(service: "dev.glide.tests.mcp"))
         let tools = await client.tools
         #expect(tools.map(\.name).sorted() == ["add", "echo"])
         #expect(tools.first?.qualifiedName.hasPrefix("mock_server__") == true)

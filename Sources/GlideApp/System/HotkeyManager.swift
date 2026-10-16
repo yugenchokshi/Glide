@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import AgentKit
 import AutomationKit
 
-/// System-wide shortcuts via Carbon RegisterEventHotKey. Works while NotchBuddy is in the
+/// System-wide shortcuts via Carbon RegisterEventHotKey. Works while Glide is in the
 /// background and its UI is hidden (needed for the emergency stop), and needs no permission.
 @MainActor
 final class HotkeyManager {
@@ -51,10 +51,10 @@ final class HotkeyManager {
         for (action, setting) in pairs where setting.enabled && Self.isSystemShortcut(keyCode: setting.keyCode, modifiers: setting.modifierSet) {
             conflicts[action] = "\(setting.display) is a macOS system shortcut (System Settings › Keyboard › Keyboard Shortcuts)."
         }
-        // Two NotchBuddy actions bound to the same keys is also a conflict.
+        // Two Glide actions bound to the same keys is also a conflict.
         let displays = pairs.map { $0.1.display }
         for (action, setting) in pairs where displays.filter({ $0 == setting.display }).count > 1 {
-            conflicts[action] = "\(setting.display) is assigned to more than one NotchBuddy action."
+            conflicts[action] = "\(setting.display) is assigned to more than one Glide action."
         }
     }
 }

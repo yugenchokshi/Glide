@@ -83,7 +83,7 @@ public final class ScreenCapture: @unchecked Sendable {
         return CapturedImage(image: image, screenRect: window.frame)
     }
 
-    /// Captures the whole display containing `point` (excluding NotchBuddy's own windows).
+    /// Captures the whole display containing `point` (excluding Glide's own windows).
     public func captureDisplay(containing point: CGPoint? = nil) async throws -> CapturedImage {
         guard Self.hasPermission else { throw AutomationError.screenRecordingNotGranted }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)

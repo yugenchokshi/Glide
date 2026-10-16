@@ -57,8 +57,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let main = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "Hide NotchBuddy", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-        appMenu.addItem(withTitle: "Quit NotchBuddy", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "Hide Glide", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "Quit Glide", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
         main.addItem(appItem)
         let editItem = NSMenuItem()
@@ -105,14 +105,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                         hotkeyConflicts: { [weak self] in self?.hotkeys.conflicts ?? [:] })
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 920, height: 640),
                                   styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
-            window.title = "NotchBuddy Settings"
+            window.title = "Glide Settings"
             // BoardUI-style chrome: no title bar strip; the traffic lights sit over the sidebar.
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden
             window.contentView = NSHostingView(rootView: view)
             window.isReleasedWhenClosed = false
             window.center()
-            window.setFrameAutosaveName("NotchBuddySettings")
+            window.setFrameAutosaveName("GlideSettings")
             window.delegate = self
             settingsWindow = window
         }
@@ -156,7 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 540), styleMask: [.titled, .closable, .fullSizeContentView],
                                   backing: .buffered, defer: false)
             window.titlebarAppearsTransparent = true
-            window.title = "Welcome to NotchBuddy"
+            window.title = "Welcome to Glide"
             window.titleVisibility = .hidden
             window.contentView = NSHostingView(rootView: view)
             window.isReleasedWhenClosed = false
@@ -186,7 +186,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         self.onHistory = onHistory
         super.init()
         if let button = item.button {
-            button.image = NSImage(systemSymbolName: "sparkles.rectangle.stack", accessibilityDescription: "NotchBuddy")
+            button.image = NSImage(systemSymbolName: "sparkles.rectangle.stack", accessibilityDescription: "Glide")
             button.image?.isTemplate = true
         }
         let menu = NSMenu()
@@ -196,11 +196,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let status = NSMenuItem(title: controller.isRunning ? "Working: \(controller.status)" : "NotchBuddy is ready", action: nil, keyEquivalent: "")
+        let status = NSMenuItem(title: controller.isRunning ? "Working: \(controller.status)" : "Glide is ready", action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
         menu.addItem(.separator())
-        menu.addItem(item("Open NotchBuddy", #selector(open)))
+        menu.addItem(item("Open Glide", #selector(open)))
         if controller.isRunning {
             menu.addItem(item(controller.phase == .paused ? "Resume" : "Pause", #selector(togglePause)))
             menu.addItem(item("Stop Task", #selector(stop)))
@@ -209,7 +209,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(item("Task History…", #selector(history)))
         menu.addItem(item("Settings…", #selector(settings), key: ","))
         menu.addItem(.separator())
-        menu.addItem(item("Quit NotchBuddy", #selector(quit), key: "q"))
+        menu.addItem(item("Quit Glide", #selector(quit), key: "q"))
     }
 
     private func item(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {

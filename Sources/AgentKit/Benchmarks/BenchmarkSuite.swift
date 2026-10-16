@@ -31,7 +31,7 @@ public final class BenchmarkSuite: @unchecked Sendable {
     public init(runtime: AutomationRuntime = .shared, fixtureURL: URL?) {
         self.runtime = runtime
         self.fixtureURL = fixtureURL
-        workDir = FileManager.default.temporaryDirectory.appendingPathComponent("notchbuddy-bench-\(Int(Date().timeIntervalSince1970))")
+        workDir = FileManager.default.temporaryDirectory.appendingPathComponent("glide-bench-\(Int(Date().timeIntervalSince1970))")
         try? FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
     }
 
@@ -98,7 +98,7 @@ public final class BenchmarkSuite: @unchecked Sendable {
     func writeHTML() throws -> URL {
         let form = """
         <!doctype html><html><head><meta charset="utf-8"><title>NB Form</title></head><body style="font:16px -apple-system;padding:24px">
-        <h1>NotchBuddy Form</h1>
+        <h1>Glide Form</h1>
         <form onsubmit="event.preventDefault();document.getElementById('result').textContent='Thanks, '+document.getElementById('name').value+'!';document.title='NB Submitted';">
         <p><label for="name">Full name</label> <input id="name" name="name"></p>
         <p><label for="email">Email address</label> <input id="email" name="email" type="email"></p>
@@ -137,9 +137,9 @@ public final class BenchmarkSuite: @unchecked Sendable {
             try await r.act(.launchApp("Notes"), expect: .appFrontmost("Notes"), timeout: 8, requireVerified: true)
             try await r.act(.keyPress(try KeyCombination(parsing: "cmd+n")), expect: .uiChanged)
             try await Task.sleep(for: .milliseconds(400))
-            let title = "NotchBuddy bench note \(Int(Date().timeIntervalSince1970))"
-            try await r.act(.typeText(title + "\nCreated by the NotchBuddy benchmark.", into: nil, clearFirst: false, submit: false),
-                            expect: .focusedValueContains("Created by the NotchBuddy benchmark"), timeout: 3, requireVerified: true)
+            let title = "Glide bench note \(Int(Date().timeIntervalSince1970))"
+            try await r.act(.typeText(title + "\nCreated by the Glide benchmark.", into: nil, clearFirst: false, submit: false),
+                            expect: .focusedValueContains("Created by the Glide benchmark"), timeout: 3, requireVerified: true)
             try await Self.deleteTestNote(r, title: title, log: log)
 
         case 3:
@@ -147,8 +147,8 @@ public final class BenchmarkSuite: @unchecked Sendable {
             try await dismissOpenPanel(r)
             try await r.act(.keyPress(try KeyCombination(parsing: "cmd+n")), expect: .uiChanged)
             try await Task.sleep(for: .milliseconds(300))
-            try await r.act(.typeText("Saved by the NotchBuddy benchmark.", into: nil, clearFirst: false, submit: false),
-                            expect: .focusedValueContains("Saved by the NotchBuddy benchmark"))
+            try await r.act(.typeText("Saved by the Glide benchmark.", into: nil, clearFirst: false, submit: false),
+                            expect: .focusedValueContains("Saved by the Glide benchmark"))
             try await r.act(.keyPress(try KeyCombination(parsing: "cmd+s")), expect: .uiChanged)
             do {
                 _ = try await r.waitFor("Save As", timeout: 4)
@@ -288,7 +288,7 @@ public final class BenchmarkSuite: @unchecked Sendable {
     public static func deleteTestNote(_ r: ScriptRunner, title: String, log: @Sendable (String) -> Void) async throws {
         let notes = try r.frontmost()
         let obs = try await r.observe(notes)
-        let rows = obs.elements.filter { ["cell", "row", "outline-row", "text"].contains($0.role) && $0.label.hasPrefix("NotchBuddy bench") }
+        let rows = obs.elements.filter { ["cell", "row", "outline-row", "text"].contains($0.role) && $0.label.hasPrefix("Glide bench") }
         guard let row = rows.first(where: { $0.label.contains(title) || title.contains($0.label) }) ?? rows.first else {
             log("  • couldn't find the test note in the list; leaving it")
             return

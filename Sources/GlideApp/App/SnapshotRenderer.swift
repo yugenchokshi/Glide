@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 import AgentKit
 
-/// `NotchBuddy --snapshot <dir>` renders every notch state to PNG (for docs and visual
+/// `Glide --snapshot <dir>` renders every notch state to PNG (for docs and visual
 /// regression checks) without running any automation.
 @MainActor
 enum SnapshotRenderer {
@@ -14,7 +14,7 @@ enum SnapshotRenderer {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         // Render as a configured install without touching the Keychain.
         CredentialStore.shared.useMemoryOnly([.provider("anthropic"): "sk-ant-demo-000000000000a1B2"])
-        let suite = "dev.notchbuddy.snapshot"
+        let suite = "dev.glide.snapshot"
         UserDefaults().removePersistentDomain(forName: suite)
         defer { UserDefaults().removePersistentDomain(forName: suite) }
         let store = SettingsStore(defaults: UserDefaults(suiteName: suite) ?? .standard)
@@ -70,7 +70,7 @@ enum SnapshotRenderer {
     }
 }
 
-/// `NotchBuddy --snapshot-settings <dir>` renders the settings window and onboarding to PNG in
+/// `Glide --snapshot-settings <dir>` renders the settings window and onboarding to PNG in
 /// light and dark mode, using demo settings in memory: no Keychain access, no network, no
 /// MCP servers launched, and the user's own settings are never read or written.
 @MainActor
@@ -78,7 +78,7 @@ enum SettingsSnapshotRenderer {
     static func run(into dir: String) {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         CredentialStore.shared.useMemoryOnly([.provider("anthropic"): "sk-ant-demo-000000000000a1B2"])
-        let suite = "dev.notchbuddy.snapshot"
+        let suite = "dev.glide.snapshot"
         UserDefaults().removePersistentDomain(forName: suite)
         let store = SettingsStore(defaults: UserDefaults(suiteName: suite) ?? .standard)
         store.settings.providers[0].lastTestOK = true

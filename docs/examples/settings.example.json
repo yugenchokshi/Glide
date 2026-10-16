@@ -1,5 +1,5 @@
 {
-  "_comment": "Example of the non-secret settings NotchBuddy stores in UserDefaults (domain dev.notchbuddy.app). You never need to edit this: everything is configurable in the app. API keys are NOT stored here; they live in the macOS Keychain.",
+  "_comment": "Example of the non-secret settings Glide stores in UserDefaults (domain dev.notchbuddy.app). You never need to edit this: everything is configurable in the app. API keys are NOT stored here; they live in the macOS Keychain.",
   "providers": [
     { "id": "anthropic", "kind": "anthropic", "name": "Anthropic", "baseURL": "https://api.anthropic.com", "enabled": true, "requiresKey": true, "models": [] },
     { "id": "openai", "kind": "openai", "name": "OpenAI", "baseURL": "https://api.openai.com/v1", "enabled": true, "requiresKey": true, "models": [] },

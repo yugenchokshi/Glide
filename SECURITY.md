@@ -1,6 +1,6 @@
 # Security
 
-NotchBuddy controls your real mouse and keyboard, so its safety model is part of the product. This document describes what it does to protect you and what it can't guarantee.
+Glide controls your real mouse and keyboard, so its safety model is part of the product. This document describes what it does to protect you and what it can't guarantee.
 
 ## Reporting a vulnerability
 
@@ -10,7 +10,7 @@ Please open a private security advisory on GitHub (Security › Report a vulnera
 
 - API keys for OpenAI, Anthropic, custom endpoints, Composio and TypeSafe, and secret MCP headers, are stored only in the macOS Keychain as generic passwords with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`.
 - Keys are never written to settings, SQLite or logs, never placed in model prompts, and never shown in full in the UI (they're masked by default). `SecretScrubber` removes key-shaped strings from anything stored in history.
-- Requests go straight from your Mac to the provider you configured. The repository contains no NotchBuddy server and no developer-owned keys.
+- Requests go straight from your Mac to the provider you configured. The repository contains no Glide server and no developer-owned keys.
 - Composio sign-ins for third-party apps use Composio's hosted connect flow in your browser. No OAuth client secret ships in the app.
 
 ## Actions
@@ -29,11 +29,11 @@ Please open a private security advisory on GitHub (Security › Report a vulnera
 
 ## Prompt injection
 
-Web pages and documents can contain text aimed at the agent. NotchBuddy treats on-screen text as data. The executor prompt tells the model never to enter passwords or payment details and to stop at logins and CAPTCHAs. The deterministic safety rules and the approval gate don't depend on the model's cooperation. Even so, a model can be misled into a harmful *low-risk-looking* action. Keep approvals enabled, exclude sensitive apps, and supervise tasks that touch untrusted content.
+Web pages and documents can contain text aimed at the agent. Glide treats on-screen text as data. The executor prompt tells the model never to enter passwords or payment details and to stop at logins and CAPTCHAs. The deterministic safety rules and the approval gate don't depend on the model's cooperation. Even so, a model can be misled into a harmful *low-risk-looking* action. Keep approvals enabled, exclude sensitive apps, and supervise tasks that touch untrusted content.
 
 ## Permissions
 
-NotchBuddy asks for:
+Glide asks for:
 
 - **Accessibility** (required): reading UI and injecting input.
 - **Screen Recording** (optional): OCR and vision fallback.

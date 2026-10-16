@@ -12,7 +12,7 @@ None of BoardUI's components can be used directly in a native SwiftUI app: they 
 
 ## What we did
 
-`Sources/NotchBuddyApp/BoardKit` re-creates BoardUI's *visual language and interaction patterns* natively. **No BoardUI source code, Figma assets or Pro components were copied.**
+`Sources/GlideApp/BoardKit` re-creates BoardUI's *visual language and interaction patterns* natively. **No BoardUI source code, Figma assets or Pro components were copied.**
 
 | BoardUI pattern | BoardKit native component |
 |---|---|
@@ -49,7 +49,7 @@ Values follow BoardUI's published design tokens (its Tailwind theme), re-created
 
 ## Snapshots
 
-`NotchBuddy --snapshot <dir>` renders every notch state, and `NotchBuddy --snapshot-settings <dir>` renders the settings window, onboarding and the Composio key sheet in light and dark mode. Both use demo data in memory: they don't read the Keychain, your settings or your task history, launch MCP servers, or use the network.
+`Glide --snapshot <dir>` renders every notch state, and `Glide --snapshot-settings <dir>` renders the settings window, onboarding and the Composio key sheet in light and dark mode. Both use demo data in memory: they don't read the Keychain, your settings or your task history, launch MCP servers, or use the network.
 
 ## Notch behavior
 

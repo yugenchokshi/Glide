@@ -1,5 +1,5 @@
 # Product Requirements Document
-# NotchBuddy — Native macOS Computer-Use Agent
+# Glide — Native macOS Computer-Use Agent
 
 **Version:** 1.0
 **Status:** Development-ready specification

@@ -11,6 +11,7 @@ public final class CredentialStore: @unchecked Sendable {
     private var memo: [String: String?] = [:]
     private var memoryOnly = false
 
+    /// The default service keeps the app's earlier name so saved keys keep working.
     public init(service: String = "dev.notchbuddy.credentials") {
         self.service = service
     }
@@ -78,7 +79,7 @@ public final class CredentialStore: @unchecked Sendable {
             var add = baseQuery(account)
             add[kSecValueData as String] = data
             add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            add[kSecAttrLabel as String] = "NotchBuddy (\(account))"
+            add[kSecAttrLabel as String] = "Glide (\(account))"
             status = SecItemAdd(add as CFDictionary, nil)
         }
         lock.withLock { memo[account] = status == errSecSuccess ? trimmed : nil }

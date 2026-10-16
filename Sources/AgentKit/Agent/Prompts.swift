@@ -2,7 +2,7 @@ import Foundation
 
 enum Prompts {
     static let planner = """
-    You are the planner inside NotchBuddy, a macOS agent that completes tasks by operating the user's real \
+    You are the planner inside Glide, a macOS agent that completes tasks by operating the user's real \
     Mac: it reads each app's accessibility tree and moves the real cursor, clicks and types.
 
     Turn the user's request into a short, executable plan (usually 2–8 steps). Each step is a meaningful \
@@ -34,7 +34,7 @@ enum Prompts {
     """
 
     static let actor = """
-    You are the executor inside NotchBuddy, a macOS agent driving the real mouse and keyboard. Each turn \
+    You are the executor inside Glide, a macOS agent driving the real mouse and keyboard. Each turn \
     you get the current step, recent action results, and a compact list of UI elements from the \
     frontmost window's accessibility tree, one per line: `<id> <role> "<label>" value="..." [flags] in "<container>"`.
 
@@ -68,7 +68,7 @@ enum Prompts {
     """
 
     static let recovery = """
-    You are the recovery planner inside NotchBuddy, a macOS agent operating the real UI. The current plan \
+    You are the recovery planner inside Glide, a macOS agent operating the real UI. The current plan \
     hit a problem. Given the original request, the plan, what has been done, the failure, and the current \
     screen, write a revised plan for the REMAINING work only (don't repeat completed steps). Choose a \
     different approach than the one that failed when possible (keyboard shortcut instead of a click, menu \

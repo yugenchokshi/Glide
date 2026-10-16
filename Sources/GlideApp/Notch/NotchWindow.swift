@@ -293,11 +293,11 @@ final class NotchWindowController {
             model.openRequestedAt = nil
             panel.displayIfNeeded()
             let ms = (CFAbsoluteTimeGetCurrent() - t) * 1000
-            Logger(subsystem: "dev.notchbuddy", category: "perf").notice("notch opened in \(ms, format: .fixed(precision: 1))ms")
+            Logger(subsystem: "dev.glide", category: "perf").notice("notch opened in \(ms, format: .fixed(precision: 1))ms")
             // Opt-in timing file for benchmarks: defaults write dev.notchbuddy.app NBPerfLog -bool YES
             if UserDefaults.standard.bool(forKey: "NBPerfLog") {
                 let line = String(format: "notch_open_ms %.1f\n", ms)
-                let url = FileManager.default.temporaryDirectory.appendingPathComponent("notchbuddy-perf.log")
+                let url = FileManager.default.temporaryDirectory.appendingPathComponent("glide-perf.log")
                 if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
                 else { try? line.write(to: url, atomically: true, encoding: .utf8) }
             }

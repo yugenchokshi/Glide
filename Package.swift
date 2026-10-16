@@ -2,11 +2,11 @@
 import PackageDescription
 
 let package = Package(
-    name: "NotchBuddy",
+    name: "Glide",
     platforms: [.macOS("26.0")],
     products: [
-        .executable(name: "NotchBuddy", targets: ["NotchBuddyApp"]),
-        .executable(name: "nbctl", targets: ["nbctl"]),
+        .executable(name: "Glide", targets: ["GlideApp"]),
+        .executable(name: "glidectl", targets: ["glidectl"]),
         .executable(name: "NBFixtureApp", targets: ["NBFixtureApp"]),
         .executable(name: "nb-mock-servers", targets: ["NBMockServers"]),
         .library(name: "AutomationKit", targets: ["AutomationKit"]),
@@ -31,12 +31,12 @@ let package = Package(
         ),
         // The notch app: SwiftUI + AppKit only, talks to AgentKit through TaskController.
         .executableTarget(
-            name: "NotchBuddyApp",
+            name: "GlideApp",
             dependencies: ["AgentKit", "AutomationKit"],
             linkerSettings: [.linkedFramework("Speech"), .linkedFramework("AVFoundation")]
         ),
         // Headless CLI: inspect accessibility trees, run tasks, run benchmarks.
-        .executableTarget(name: "nbctl", dependencies: ["AgentKit", "AutomationKit"]),
+        .executableTarget(name: "glidectl", dependencies: ["AgentKit", "AutomationKit"]),
         // Deterministic fixture app used by live tests (labeled + inaccessible controls).
         .executableTarget(name: "NBFixtureApp"),
         // Local mock MCP (stdio) and scripted OpenAI-compatible endpoint for tests.

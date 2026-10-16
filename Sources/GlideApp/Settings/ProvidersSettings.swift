@@ -263,7 +263,7 @@ struct ModelsSettingsView: View {
     var body: some View {
         BKSectionHeader(title: "Models", subtitle: "Automatic routing picks a capable model for planning and vision and a small, fast one for choosing each action.")
         BKGroup {
-            BKFormRow(title: "Routing", detail: store.settings.routing.mode == .automatic ? "NotchBuddy chooses a model for each role." : "You choose the provider, model and effort for each role.") {
+            BKFormRow(title: "Routing", detail: store.settings.routing.mode == .automatic ? "Glide chooses a model for each role." : "You choose the provider, model and effort for each role.") {
                 BKSegmented(options: [(RoutingSettings.Mode.automatic, "Automatic"), (.manual, "Manual")], selection: $store.settings.routing.mode)
             }
             if store.settings.routing.mode == .automatic {

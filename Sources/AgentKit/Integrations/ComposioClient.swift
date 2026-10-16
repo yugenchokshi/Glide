@@ -57,7 +57,7 @@ public struct ComposioClient: Sendable {
     }
 
     /// Creates a session for this user with connection management and the remote workbench
-    /// disabled: NotchBuddy's own planner decides what runs.
+    /// disabled: Glide's own planner decides what runs.
     public func createSession() async throws -> String {
         let body: JSONValue = [
             "user_id": .string(userID),

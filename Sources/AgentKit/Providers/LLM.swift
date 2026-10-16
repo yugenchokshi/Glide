@@ -126,7 +126,7 @@ enum HTTP {
         let c = URLSessionConfiguration.ephemeral
         c.timeoutIntervalForRequest = 120
         c.timeoutIntervalForResource = 300
-        c.httpAdditionalHeaders = ["User-Agent": "NotchBuddy/1.0 (macOS)"]
+        c.httpAdditionalHeaders = ["User-Agent": "Glide/1.0 (macOS)"]
         return URLSession(configuration: c)
     }()
 

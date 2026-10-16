@@ -16,7 +16,7 @@ These tests never move the cursor and never call paid APIs. They cover:
 
 ```bash
 swift build
-.build/debug/nbctl bench --json docs/benchmarks/latest.json
+.build/debug/glidectl bench --json docs/benchmarks/latest.json
 ```
 
 This drives your real cursor. It needs Accessibility (and Screen Recording for scenario 12) for the terminal running it. It only uses disposable data:
@@ -45,7 +45,7 @@ Each result records success, action count, duration, average observation time, r
 ```bash
 .build/debug/nb-mock-servers llm 18734 &
 .build/debug/NBFixtureApp &
-.build/debug/nbctl run "Greet Ada in the NB Fixture app" --mock-url http://127.0.0.1:18734/v1
+.build/debug/glidectl run "Greet Ada in the NB Fixture app" --mock-url http://127.0.0.1:18734/v1
 ```
 
 This exercises the whole loop (plan, observe, decide, act with the real cursor, verify, finish) with a deterministic "model".
@@ -55,5 +55,5 @@ This exercises the whole loop (plan, observe, decide, act with the real cursor, 
 Add a key in the app's Settings (or the shared Keychain entry), then:
 
 ```bash
-.build/debug/nbctl run "Open TextEdit, create a new document and type Hello from NotchBuddy"
+.build/debug/glidectl run "Open TextEdit, create a new document and type Hello from Glide"
 ```

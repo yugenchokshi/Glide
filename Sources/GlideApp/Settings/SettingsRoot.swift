@@ -111,7 +111,7 @@ struct SettingsSidebar: View {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 8) {
                     BKAgentOrb(mode: .idle, size: 18)
-                    Text("NotchBuddy").font(.system(size: 13.5, weight: .semibold)).foregroundStyle(t.text)
+                    Text("Glide").font(.system(size: 13.5, weight: .semibold)).foregroundStyle(t.text)
                 }
                 .padding(.horizontal, 10)
                 .padding(.top, 46).padding(.bottom, 14)
@@ -170,7 +170,7 @@ struct GeneralSettingsView: View {
     @State private var loginError: String?
 
     var body: some View {
-        BKSectionHeader(title: "General", subtitle: "How NotchBuddy looks and moves while it works.")
+        BKSectionHeader(title: "General", subtitle: "How Glide looks and moves while it works.")
         BKGroupHeader(title: "Appearance")
         BKGroup {
             BKFormRow(title: "Cursor movement", detail: "Fast jumps straight to targets. Visual animates the cursor so you can follow along.") {
@@ -185,7 +185,7 @@ struct GeneralSettingsView: View {
         }
         BKGroupHeader(title: "System")
         BKGroup {
-            BKFormRow(title: "Open at login", detail: loginError ?? "Start NotchBuddy when you log in to your Mac.") {
+            BKFormRow(title: "Open at login", detail: loginError ?? "Start Glide when you log in to your Mac.") {
                 BKSwitch(isOn: $launchAtLogin, label: "Open at login")
                     .onChange(of: launchAtLogin) { _, on in
                         do {
@@ -206,15 +206,15 @@ struct GeneralSettingsView: View {
 }
 
 extension Notification.Name {
-    static let nbShowOnboarding = Notification.Name("dev.notchbuddy.showOnboarding")
-    static let nbSettingsChanged = Notification.Name("dev.notchbuddy.settingsChanged")
+    static let nbShowOnboarding = Notification.Name("dev.glide.showOnboarding")
+    static let nbSettingsChanged = Notification.Name("dev.glide.settingsChanged")
 }
 
 // MARK: - About
 
 struct AboutView: View {
     var body: some View {
-        BKSectionHeader(title: "About NotchBuddy", subtitle: "An open-source macOS computer-use agent that lives in the notch.")
+        BKSectionHeader(title: "About Glide", subtitle: "An open-source macOS computer-use agent that lives in the notch.")
         BKGroup {
             BKFormRow(title: "Version") { Text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev").font(BK.Font.body).foregroundStyle(.secondary) }
             BKFormRow(title: "License") { BKBadge(text: "MIT") }

@@ -32,7 +32,7 @@ public final class NativeActionExecutor: @unchecked Sendable {
     public let input: InputSynthesizer
     public let apps: AppController
     public let gate: ExecutionGate
-    private let log = Logger(subsystem: "dev.notchbuddy", category: "executor")
+    private let log = Logger(subsystem: "dev.glide", category: "executor")
 
     /// Text longer than this is pasted (clipboard restored afterwards) instead of typed.
     public var pasteThreshold = 160
@@ -158,7 +158,7 @@ public final class NativeActionExecutor: @unchecked Sendable {
                 let r = try resolve(into, in: obs)
                 targetNode = r.node
                 if let ref = r.ref, accessibility.isSecureField(ref) {
-                    throw AutomationError.blockedBySafety("NotchBuddy never types into password fields. Please enter it yourself.")
+                    throw AutomationError.blockedBySafety("Glide never types into password fields. Please enter it yourself.")
                 }
                 if !(r.node?.focused ?? false) {
                     try clickPoint(r, button: .left, count: 1)
@@ -169,7 +169,7 @@ public final class NativeActionExecutor: @unchecked Sendable {
             if let pid = obs?.app.pid ?? accessibility.frontmostApp()?.pid,
                let focused = AX.element(accessibility.appElement(pid), kAXFocusedUIElementAttribute),
                AX.string(focused, kAXSubroleAttribute) == kAXSecureTextFieldSubrole {
-                throw AutomationError.blockedBySafety("The focused field is a password field. NotchBuddy won't type into it.")
+                throw AutomationError.blockedBySafety("The focused field is a password field. Glide won't type into it.")
             }
             if clearFirst {
                 try input.press(try KeyCombination(parsing: "cmd+a"))
@@ -214,7 +214,7 @@ public final class NativeActionExecutor: @unchecked Sendable {
         case .setValue(let target, let value):
             let r = try resolve(target, in: obs)
             if let ref = r.ref {
-                if accessibility.isSecureField(ref) { throw AutomationError.blockedBySafety("NotchBuddy never fills password fields.") }
+                if accessibility.isSecureField(ref) { throw AutomationError.blockedBySafety("Glide never fills password fields.") }
                 try input.move(to: r.point)
                 if accessibility.setValue(ref, value) {
                     return ActionOutcome(method: "ax-set-value", detail: "set value", target: r.node, point: r.point, app: obs?.app,
@@ -277,7 +277,7 @@ public final class NativeActionExecutor: @unchecked Sendable {
         }
         let hit = accessibility.element(at: r.point)
         let ownUI = hit.flatMap { accessibility.pid(of: $0) } == ProcessInfo.processInfo.processIdentifier
-        // NotchBuddy's own panel turns click-through before pointer input, so a hit on it means
+        // Glide's own panel turns click-through before pointer input, so a hit on it means
         // the click will reach whatever is underneath.
         let onTarget = hit.map { accessibility.hitTestMatches($0, target: ref) } ?? false || (ownUI && input.willUsePointer != nil)
         if onTarget {
