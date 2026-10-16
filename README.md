@@ -8,6 +8,7 @@ Describe what you want done, press **Start**, and watch the real cursor open app
 - **Bring your own keys**: OpenAI, Anthropic or any OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter…). Keys are stored in the macOS Keychain.
 - **You stay in control**: sending, deleting, publishing and purchasing wait for your approval. A global emergency stop works even when the UI is hidden, and moving the mouse pauses the agent.
 - **Local-first**: there's no account and no NotchBuddy server. Task history stays on your Mac.
+- **Optional Jev**: TypeSafe's decision model breaks ties between similar on-screen controls. You can call it directly or through Vercel AI Gateway.
 - **Optional integrations**: [Composio](https://composio.dev) (Gmail, Calendar, Slack, Notion, GitHub…) and any MCP server.
 
 | Task input | Running | Approval |
@@ -38,7 +39,7 @@ open build/NotchBuddy.app
 The setup assistant walks you through:
 
 1. Granting **Accessibility** (required) and **Screen Recording** (optional; used for the OCR and vision fallbacks).
-2. Choosing a provider and pasting an API key (⌘V or the clipboard button). OpenAI uses `gpt-luna-6` by default. The key is tested on the spot and stored in your Keychain.
+2. Choosing a provider and pasting an API key (⌘V or the clipboard button). OpenAI uses `gpt-6-luna` by default. The key is tested on the spot and stored in your Keychain.
 3. Reviewing the automatically chosen models.
 4. Running a safe first task, which types one line into a new TextEdit document.
 

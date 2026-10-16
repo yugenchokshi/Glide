@@ -18,6 +18,7 @@ public final class CredentialStore: @unchecked Sendable {
         case provider(String)
         case composio
         case jev
+        case vercelGateway
         case mcpHeader(server: String, header: String)
         case custom(String)
 
@@ -26,6 +27,7 @@ public final class CredentialStore: @unchecked Sendable {
             case .provider(let id): return "provider.\(id)"
             case .composio: return "composio.api-key"
             case .jev: return "typesafe.jev"
+            case .vercelGateway: return "vercel.ai-gateway"
             case .mcpHeader(let s, let h): return "mcp.\(s).\(h)"
             case .custom(let s): return s
             }

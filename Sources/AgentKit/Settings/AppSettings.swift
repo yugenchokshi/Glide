@@ -42,7 +42,7 @@ public struct ProviderConfig: Codable, Sendable, Identifiable, Hashable {
         id: "anthropic", kind: .anthropic, name: "Anthropic", baseURL: "https://api.anthropic.com",
         models: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"])
     /// Default OpenAI model for all roles.
-    public static let openAIDefaultModel = "gpt-luna-6"
+    public static let openAIDefaultModel = "gpt-6-luna"
 
     public static let openAIDefault = ProviderConfig(
         id: "openai", kind: .openai, name: "OpenAI", baseURL: "https://api.openai.com/v1", models: [openAIDefaultModel])
@@ -90,7 +90,55 @@ public struct RoutingSettings: Codable, Sendable, Hashable {
     /// Use TypeSafe Jev Choice questions to pick between ambiguous candidate elements.
     public var useJevForSelection = false
     public var jevModel = "jev-latest"
+    /// Where Jev is called. Optional so settings saved before this option still decode.
+    public var jevProvider: JevProvider?
     public init() {}
+
+    public var effectiveJevProvider: JevProvider { jevProvider ?? .typesafe }
+
+    /// The model id for the selected provider (the gateway names Jev `typesafe-ai/jev`).
+    public var effectiveJevModel: String {
+        let m = jevModel.trimmingCharacters(in: .whitespaces)
+        switch effectiveJevProvider {
+        case .typesafe: return m.isEmpty || m.hasPrefix("typesafe-ai/") ? "jev-latest" : m
+        case .vercelGateway: return m.isEmpty || !m.hasPrefix("typesafe-ai/") ? "typesafe-ai/jev" : m
+        }
+    }
+}
+
+/// Jev can be reached directly at TypeSafe or through Vercel AI Gateway, which exposes a
+/// TypeSafe-compatible endpoint billed to your Vercel account.
+public enum JevProvider: String, Codable, Sendable, CaseIterable {
+    case typesafe
+    case vercelGateway
+
+    public var title: String {
+        switch self {
+        case .typesafe: return "TypeSafe (direct)"
+        case .vercelGateway: return "Vercel AI Gateway"
+        }
+    }
+
+    public var endpoint: URL {
+        switch self {
+        case .typesafe: return URL(string: "https://api.typesafe.ai/v1/systemone")!
+        case .vercelGateway: return URL(string: "https://ai-gateway.vercel.sh/typesafe/v1/systemone")!
+        }
+    }
+
+    public var defaultModel: String {
+        switch self {
+        case .typesafe: return "jev-latest"
+        case .vercelGateway: return "typesafe-ai/jev"
+        }
+    }
+
+    public var keyPlaceholder: String {
+        switch self {
+        case .typesafe: return "TypeSafe API key"
+        case .vercelGateway: return "AI Gateway API key"
+        }
+    }
 }
 
 public enum ApprovalLevel: String, Codable, Sendable, CaseIterable {
@@ -225,8 +273,15 @@ public final class SettingsStore {
 
     public init(defaults: UserDefaults = SettingsStore.sharedDefaults()) {
         self.defaults = defaults
-        if let data = defaults.data(forKey: Self.defaultsKey), let decoded = try? JSONDecoder().decode(AppSettings.self, from: data) {
+        if let data = defaults.data(forKey: Self.defaultsKey), var decoded = try? JSONDecoder().decode(AppSettings.self, from: data) {
+            // An earlier build listed a non-existent "gpt-luna-6" model; drop it.
+            var migrated = false
+            for i in decoded.providers.indices where decoded.providers[i].models.contains("gpt-luna-6") {
+                decoded.providers[i].models.removeAll { $0 == "gpt-luna-6" }
+                migrated = true
+            }
             settings = decoded
+            if migrated { save() }
         } else {
             settings = AppSettings()
         }

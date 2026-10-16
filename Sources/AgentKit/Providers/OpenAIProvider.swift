@@ -119,11 +119,12 @@ public struct OpenAIProvider: LLMProvider {
 public struct JevClient: Sendable {
     let apiKey: String
     let model: String
-    let endpoint = URL(string: "https://api.typesafe.ai/v1/systemone")!
+    let endpoint: URL
 
-    public init(apiKey: String, model: String = "jev-latest") {
+    public init(apiKey: String, model: String = "jev-latest", provider: JevProvider = .typesafe) {
         self.apiKey = apiKey
         self.model = model
+        self.endpoint = provider.endpoint
     }
 
     public struct ChoiceAnswer: Sendable {

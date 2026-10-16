@@ -120,7 +120,14 @@ public struct ModelRouter: Sendable {
     }
 
     public func jevClient() -> JevClient? {
-        guard settings.routing.useJevForSelection, let key = credentials.get(.jev), !key.isEmpty else { return nil }
-        return JevClient(apiKey: key, model: settings.routing.jevModel)
+        let r = settings.routing
+        guard r.useJevForSelection else { return nil }
+        let provider = r.effectiveJevProvider
+        guard let key = credentials.get(Self.jevKey(provider)), !key.isEmpty else { return nil }
+        return JevClient(apiKey: key, model: r.effectiveJevModel, provider: provider)
+    }
+
+    public static func jevKey(_ provider: JevProvider) -> CredentialStore.Key {
+        provider == .typesafe ? .jev : .vercelGateway
     }
 }

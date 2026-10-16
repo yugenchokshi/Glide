@@ -90,12 +90,12 @@ Integration steps (`composio`, `mcp`) use the same selector with a tool list. Co
 
 | Role | Anthropic | OpenAI |
 |---|---|---|
-| Planner | `claude-opus-5-5` (effort low) | `gpt-luna-6` |
-| Action selection | `claude-haiku-5-5` (effort low) | `gpt-luna-6` |
-| Vision | `claude-opus-5-5` | `gpt-luna-6` |
-| Recovery | `claude-opus-5-5` (effort medium) | `gpt-luna-6` |
+| Planner | `claude-opus-5-5` (effort low) | `gpt-6-luna` |
+| Action selection | `claude-haiku-5-5` (effort low) | `gpt-6-luna` |
+| Vision | `claude-opus-5-5` | `gpt-6-luna` |
+| Recovery | `claude-opus-5-5` (effort medium) | `gpt-6-luna` |
 
-Manual mode lets you pick provider, model and effort per role. Structured replies use Anthropic `output_config.format` and OpenAI `response_format: json_schema`. Both degrade automatically to JSON-in-prompt for endpoints that don't support those formats.
+Manual mode lets you pick provider, model and effort per role. Jev (optional) is called either directly at TypeSafe (`api.typesafe.ai/v1/systemone`, model `jev-latest`) or through Vercel AI Gateway's TypeSafe-compatible endpoint (`ai-gateway.vercel.sh/typesafe/v1/systemone`, model `typesafe-ai/jev`, AI Gateway key). Structured replies use Anthropic `output_config.format` and OpenAI `response_format: json_schema`. Both degrade automatically to JSON-in-prompt for endpoints that don't support those formats.
 
 ## Persistence
 

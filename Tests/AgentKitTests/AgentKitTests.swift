@@ -237,7 +237,7 @@ struct ProviderTests {
         #expect((try? ModelRouter(settings: manual, credentials: creds).route(.actor))?.model == "claude-sonnet-5-5")
     }
 
-    @Test func openAIDefaultsToGptLuna6ForEveryRole() {
+    @Test func openAIDefaultsToGpt6LunaForEveryRole() {
         var s = AppSettings()
         s.providers = [.openAIDefault]
         let creds = CredentialStore(service: "dev.notchbuddy.tests.\(UUID().uuidString)")
@@ -245,8 +245,42 @@ struct ProviderTests {
         defer { creds.remove(.provider("openai")) }
         let router = ModelRouter(settings: s, credentials: creds)
         for role in ModelRole.allCases {
-            #expect((try? router.route(role))?.model == "gpt-luna-6")
+            #expect((try? router.route(role))?.model == "gpt-6-luna")
         }
+    }
+
+    @Test func jevThroughVercelGateway() {
+        var s = AppSettings()
+        s.routing.useJevForSelection = true
+        s.routing.jevProvider = .vercelGateway
+        #expect(s.routing.effectiveJevModel == "typesafe-ai/jev")
+        #expect(JevProvider.vercelGateway.endpoint.absoluteString == "https://ai-gateway.vercel.sh/typesafe/v1/systemone")
+        let creds = CredentialStore(service: "dev.notchbuddy.tests.\(UUID().uuidString)")
+        defer { creds.remove(.vercelGateway); creds.remove(.jev) }
+        #expect(ModelRouter(settings: s, credentials: creds).jevClient() == nil) // no gateway key yet
+        creds.set("tsk-direct-key-123456", for: .jev)
+        #expect(ModelRouter(settings: s, credentials: creds).jevClient() == nil) // direct key isn't used for the gateway
+        creds.set("vck-gateway-key-123456", for: .vercelGateway)
+        let client = ModelRouter(settings: s, credentials: creds).jevClient()
+        #expect(client?.endpoint == JevProvider.vercelGateway.endpoint)
+        #expect(client?.model == "typesafe-ai/jev")
+        s.routing.jevProvider = .typesafe
+        s.routing.jevModel = "typesafe-ai/jev"
+        #expect(s.routing.effectiveJevModel == "jev-latest")
+        #expect(ModelRouter(settings: s, credentials: creds).jevClient()?.endpoint.host == "api.typesafe.ai")
+    }
+
+    @Test func oldSettingsWithoutJevProviderStillDecode() throws {
+        var s = AppSettings()
+        s.routing.jevModel = "jev-latest"
+        var json = try JSONValue.parse(JSONEncoder().encode(s))
+        if case .object(var root) = json, case .object(var routing)? = root["routing"] {
+            routing["jevProvider"] = nil
+            root["routing"] = .object(routing)
+            json = .object(root)
+        }
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: json.data())
+        #expect(decoded.routing.effectiveJevProvider == .typesafe)
     }
 
     @Test func routerWithoutKeysIsNotConfigured() {

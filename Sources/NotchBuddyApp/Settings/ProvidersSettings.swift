@@ -18,6 +18,7 @@ struct ProvidersSettingsView: View {
                 store.settings.providers.append(ProviderConfig(id: id, kind: .openaiCompatible, name: "Custom endpoint", baseURL: "http://localhost:11434/v1", requiresKey: false))
             } label: { Label("Add OpenAI-compatible endpoint", systemImage: "plus") }
                 .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
+                    .fixedSize()
             Spacer()
         }
         JevCard(store: store)
@@ -61,7 +62,7 @@ struct ProviderCard: View {
             }
             BKFormRow(title: "API key", detail: hasKey ? "Saved in Keychain: \(CredentialStore.mask(CredentialStore.shared.get(.provider(provider.id)) ?? ""))" : "Not set") {
                 HStack(spacing: 6) {
-                    BKSecretField(placeholder: hasKey ? "Replace key…" : keyPlaceholder, text: $keyInput).frame(width: 250)
+                    BKSecretField(placeholder: hasKey ? "Replace key…" : keyPlaceholder, text: $keyInput).frame(minWidth: 180, maxWidth: 250)
                     Button("Save") {
                         CredentialStore.shared.set(keyInput, for: .provider(provider.id))
                         keyInput = ""
@@ -69,6 +70,7 @@ struct ProviderCard: View {
                         Task { await test() }
                     }
                     .buttonStyle(BKButtonStyle(kind: .primary, compact: true))
+                    .fixedSize()
                     .disabled(keyInput.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
@@ -80,6 +82,7 @@ struct ProviderCard: View {
                     }
                 }
                 .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
+                    .fixedSize()
                 .disabled(testing || (provider.requiresKey && !hasKey))
                 if hasKey {
                     Button("Remove key") {
@@ -88,9 +91,11 @@ struct ProviderCard: View {
                         refresh()
                     }
                     .buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
+                    .fixedSize()
                 }
                 if let onRemove {
                     Button("Remove endpoint", role: .destructive, action: onRemove).buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
+                    .fixedSize()
                 }
                 Spacer()
                 if !provider.models.isEmpty {
@@ -163,8 +168,11 @@ struct ProviderCard: View {
 struct JevCard: View {
     @Bindable var store: SettingsStore
     @State private var keyInput = ""
-    @State private var hasKey = CredentialStore.shared.has(.jev)
+    @State private var hasKey = false
     @State private var message: String?
+    @State private var testing = false
+
+    var provider: JevProvider { store.settings.routing.effectiveJevProvider }
 
     var body: some View {
         BKCard {
@@ -177,32 +185,66 @@ struct JevCard: View {
                 Spacer()
                 Toggle("", isOn: $store.settings.routing.useJevForSelection).labelsHidden().toggleStyle(.switch).disabled(!hasKey)
             }
-            BKFormRow(title: "API key", detail: hasKey ? "Saved in Keychain" : "Not set") {
+            BKFormRow(title: "Connect through", detail: provider == .vercelGateway
+                      ? "Uses Vercel's TypeSafe-compatible endpoint, billed to your Vercel account (AI_GATEWAY_API_KEY)."
+                      : "Calls api.typesafe.ai with your TypeSafe key.") {
+                Picker("", selection: Binding(get: { provider }, set: { new in
+                    store.settings.routing.jevProvider = new
+                    store.settings.routing.jevModel = new.defaultModel
+                    message = nil
+                    refresh()
+                })) {
+                    ForEach(JevProvider.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented).labelsHidden().frame(width: 300)
+            }
+            BKFormRow(title: provider == .vercelGateway ? "AI Gateway key" : "API key",
+                      detail: hasKey ? "Saved in Keychain: \(CredentialStore.mask(CredentialStore.shared.get(ModelRouter.jevKey(provider)) ?? ""))" : "Not set") {
                 HStack(spacing: 6) {
-                    BKSecretField(placeholder: "TypeSafe key", text: $keyInput).frame(width: 220)
+                    BKSecretField(placeholder: provider.keyPlaceholder, text: $keyInput).frame(minWidth: 180, maxWidth: 240)
                     Button("Save") {
-                        CredentialStore.shared.set(keyInput, for: .jev)
+                        CredentialStore.shared.set(keyInput, for: ModelRouter.jevKey(provider))
                         keyInput = ""
-                        hasKey = CredentialStore.shared.has(.jev)
+                        refresh()
+                        Task { await test() }
                     }
-                    .buttonStyle(BKButtonStyle(kind: .primary, compact: true)).disabled(keyInput.isEmpty)
+                    .buttonStyle(BKButtonStyle(kind: .primary, compact: true))
+                    .fixedSize().disabled(keyInput.isEmpty)
                     if hasKey {
-                        Button("Test") {
-                            Task {
-                                do { try await JevClient(apiKey: CredentialStore.shared.get(.jev) ?? "", model: store.settings.routing.jevModel).test(); message = "Connected." }
-                                catch { message = error.localizedDescription }
-                            }
-                        }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
+                        Button { Task { await test() } } label: {
+                            HStack(spacing: 4) { if testing { ProgressView().controlSize(.small) }; Text("Test") }
+                        }
+                        .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
+                    .fixedSize().disabled(testing)
                         Button("Remove") {
-                            CredentialStore.shared.remove(.jev)
-                            hasKey = false
+                            CredentialStore.shared.remove(ModelRouter.jevKey(provider))
+                            refresh()
                             store.settings.routing.useJevForSelection = false
                         }.buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
+                    .fixedSize()
                     }
                 }
             }
-            BKFormRow(title: "Model") { BKTextField(placeholder: "jev-latest", text: $store.settings.routing.jevModel, monospaced: true).frame(width: 160) }
-            if let message { Text(message).font(.system(size: 11.5)).foregroundStyle(.secondary) }
+            BKFormRow(title: "Model", detail: "Default: \(provider.defaultModel)") {
+                BKTextField(placeholder: provider.defaultModel, text: $store.settings.routing.jevModel, monospaced: true).frame(width: 200)
+            }
+            if let message { Text(message).font(.system(size: 11.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+        }
+        .onAppear(perform: refresh)
+    }
+
+    func refresh() { hasKey = CredentialStore.shared.has(ModelRouter.jevKey(provider)) }
+
+    func test() async {
+        testing = true
+        defer { testing = false }
+        let routing = store.settings.routing
+        let client = JevClient(apiKey: CredentialStore.shared.get(ModelRouter.jevKey(provider)) ?? "", model: routing.effectiveJevModel, provider: provider)
+        do {
+            try await client.test()
+            message = "Connected to Jev via \(provider.title) (\(routing.effectiveJevModel))."
+        } catch {
+            message = error.localizedDescription
         }
     }
 }

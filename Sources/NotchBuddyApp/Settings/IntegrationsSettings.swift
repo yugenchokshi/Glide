@@ -43,7 +43,8 @@ struct ComposioSection: View {
                         store.settings.composio.sessionID = nil
                         store.settings.composio.enabled = hasKey
                         Task { await load() }
-                    }.buttonStyle(BKButtonStyle(kind: .primary, compact: true)).disabled(keyInput.isEmpty)
+                    }.buttonStyle(BKButtonStyle(kind: .primary, compact: true))
+                    .fixedSize().disabled(keyInput.isEmpty)
                     if hasKey {
                         Button("Remove") {
                             CredentialStore.shared.remove(.composio)
@@ -52,6 +53,7 @@ struct ComposioSection: View {
                             store.settings.composio.sessionID = nil
                             toolkits = []
                         }.buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
+                    .fixedSize()
                     }
                 }
             }
@@ -60,6 +62,7 @@ struct ComposioSection: View {
                     BKTextField(placeholder: "Search apps (gmail, slack, notion…)", text: $search).onSubmit { Task { await load() } }
                     Button { Task { await load() } } label: { if loading { ProgressView().controlSize(.small) } else { Text("Refresh") } }
                         .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
+                    .fixedSize()
                 }
                 if let error { Text(error).font(.system(size: 11.5)).foregroundStyle(BK.Tone.danger.color) }
                 let connected = toolkits.filter { $0.connectedAccountID != nil }
@@ -88,9 +91,11 @@ struct ComposioSection: View {
             } else if let account = kit.connectedAccountID {
                 BKBadge(text: kit.connectionStatus?.capitalized ?? "Connected", tone: kit.connectionStatus == nil || kit.connectionStatus == "ACTIVE" ? .success : .warning)
                 Button("Disconnect") { Task { await disconnect(account) } }.buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
+                    .fixedSize()
             } else {
                 Button(connecting == kit.slug ? "Waiting…" : "Connect") { Task { await connect(kit) } }
-                    .buttonStyle(BKButtonStyle(kind: .secondary, compact: true)).disabled(connecting != nil)
+                    .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
+                    .fixedSize().disabled(connecting != nil)
             }
         }
     }
@@ -153,6 +158,7 @@ struct MCPSection: View {
                 Spacer()
                 Button { editing = MCPServerConfig(name: "New server", transport: .stdio) } label: { Label("Add", systemImage: "plus") }
                     .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
+                    .fixedSize()
             }
             if store.settings.mcpServers.isEmpty {
                 Text("No servers yet.").font(.system(size: 12)).foregroundStyle(.secondary)
@@ -170,11 +176,13 @@ struct MCPSection: View {
                     Spacer()
                     if let s, s.0 { BKBadge(text: "\(s.1) tools", tone: .success) }
                     Button("Edit") { editing = server }.buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
+                    .fixedSize()
                 }
             }
             HStack {
                 Spacer()
                 Button("Reconnect all") { Task { await sync() } }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
+                    .fixedSize()
             }
         }
         .task { await sync() }
