@@ -10,6 +10,10 @@ Describe what you want done, press **Start**, and watch the real cursor open app
 - **Local-first**: there's no account and no NotchBuddy server. Task history stays on your Mac.
 - **Optional integrations**: [Composio](https://composio.dev) (Gmail, Calendar, Slack, Notion, GitHub…) and any MCP server.
 
+| Task input | Running | Approval |
+|---|---|---|
+| ![input](docs/images/notch-input.png) | ![running](docs/images/notch-executing.png) | ![approval](docs/images/notch-approval.png) |
+
 > Status: v1.0. See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for what it can't do yet.
 
 ## Requirements
@@ -80,6 +84,8 @@ swift build
 ```
 
 `nbctl` shares settings and Keychain entries with the app. It needs Accessibility permission for the terminal that runs it.
+
+Regenerate these images with `.build/debug/NotchBuddy --snapshot docs/images`.
 
 ## Tests
 

@@ -29,12 +29,29 @@ public struct PlanStep: Codable, Sendable, Hashable, Identifiable {
     public var doneWhen: String
     /// Optional deterministic hint (e.g. click "New Note") tried before asking a model.
     public var hint: ActionHint?
+
+    public init(id: Int, title: String, instruction: String, route: ExecutionRoute, app: String?, risk: RiskLevel, doneWhen: String, hint: ActionHint?) {
+        self.id = id
+        self.title = title
+        self.instruction = instruction
+        self.route = route
+        self.app = app
+        self.risk = risk
+        self.doneWhen = doneWhen
+        self.hint = hint
+    }
 }
 
 public struct ActionHint: Codable, Sendable, Hashable {
     public var action: String
     public var target: String?
     public var text: String?
+
+    public init(action: String, target: String?, text: String?) {
+        self.action = action
+        self.target = target
+        self.text = text
+    }
 }
 
 public struct Plan: Codable, Sendable, Hashable {
@@ -42,6 +59,12 @@ public struct Plan: Codable, Sendable, Hashable {
     public var steps: [PlanStep]
     /// Set when the request can't be planned without more information.
     public var clarification: String?
+
+    public init(goal: String, steps: [PlanStep], clarification: String?) {
+        self.goal = goal
+        self.steps = steps
+        self.clarification = clarification
+    }
 }
 
 enum PlanSchema {

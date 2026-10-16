@@ -198,6 +198,18 @@ public final class TaskController {
         start(previous.isEmpty ? base : base + "\n\n(Previous attempt failed: \(previous). Try a different approach.)")
     }
 
+    /// Sets display state directly. Used only by the UI snapshot renderer (`--snapshot`).
+    public func previewState(phase: AgentPhase, status: String, instruction: String = "", plan: Plan? = nil, stepIndex: Int = 0,
+                             activity: [ActivityEntry] = [], approval: ApprovalRequest? = nil) {
+        self.phase = phase
+        self.status = status
+        self.instruction = instruction
+        self.plan = plan
+        self.currentStepIndex = stepIndex
+        self.activity = activity
+        self.pendingApproval = approval
+    }
+
     public func reset() {
         guard !isRunning else { return }
         phase = .idle

@@ -39,6 +39,15 @@ public struct ApprovalRequest: Sendable, Identifiable, Hashable {
     public var appName: String?
     public var risk: RiskLevel
     public var reasons: [String]
+
+    public init(kind: Kind, title: String, detail: String, appName: String?, risk: RiskLevel, reasons: [String]) {
+        self.kind = kind
+        self.title = title
+        self.detail = detail
+        self.appName = appName
+        self.risk = risk
+        self.reasons = reasons
+    }
 }
 
 public enum ApprovalDecision: Sendable {
