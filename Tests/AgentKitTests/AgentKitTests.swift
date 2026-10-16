@@ -308,7 +308,7 @@ final class BundleToken {}
 @Suite("Integrations")
 struct IntegrationTests {
     @Test func mcpStdioClient() async throws {
-        guard let server = productURL("nb-mock-servers") else { return } // built by `swift build`
+        let server = try #require(productURL("nb-mock-servers"), "run `swift build` first so the mock servers exist")
         var config = MCPServerConfig(name: "Mock Server", transport: .stdio)
         config.command = server.path
         config.arguments = ["mcp"]
@@ -323,7 +323,7 @@ struct IntegrationTests {
     }
 
     @Test func openAICompatibleAgainstMockServer() async throws {
-        guard let server = productURL("nb-mock-servers") else { return }
+        let server = try #require(productURL("nb-mock-servers"), "run `swift build` first so the mock servers exist")
         let port = Int.random(in: 20000...40000)
         let p = Process()
         p.executableURL = server

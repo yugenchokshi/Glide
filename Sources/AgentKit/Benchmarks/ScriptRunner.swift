@@ -17,7 +17,7 @@ public final class ScriptRunner: @unchecked Sendable {
 
     public let runtime: AutomationRuntime
     public private(set) var stats = Stats()
-    public var log: (String) -> Void = { print($0) }
+    public var log: @Sendable (String) -> Void = { print($0) }
 
     public init(runtime: AutomationRuntime = .shared) {
         self.runtime = runtime

@@ -47,11 +47,35 @@ final class HotkeyManager {
                 conflicts[action] = "\(setting.display) is already used by another app or the system."
             }
         }
+        // macOS system shortcuts (Spotlight, input sources, screenshots…) win over ours.
+        for (action, setting) in pairs where setting.enabled && Self.isSystemShortcut(keyCode: setting.keyCode, modifiers: setting.modifierSet) {
+            conflicts[action] = "\(setting.display) is a macOS system shortcut (System Settings › Keyboard › Keyboard Shortcuts)."
+        }
         // Two NotchBuddy actions bound to the same keys is also a conflict.
         let displays = pairs.map { $0.1.display }
         for (action, setting) in pairs where displays.filter({ $0 == setting.display }).count > 1 {
             conflicts[action] = "\(setting.display) is assigned to more than one NotchBuddy action."
         }
+    }
+}
+
+extension HotkeyManager {
+    /// Checks the enabled entries in com.apple.symbolichotkeys. Shortcuts registered by other
+    /// third-party apps can't be detected (Carbon accepts duplicate registrations silently).
+    static func isSystemShortcut(keyCode: UInt32, modifiers: KeyCombination.Modifiers) -> Bool {
+        guard let all = UserDefaults(suiteName: "com.apple.symbolichotkeys")?.dictionary(forKey: "AppleSymbolicHotKeys") else { return false }
+        var mask = 0
+        if modifiers.contains(.shift) { mask |= 1 << 17 }
+        if modifiers.contains(.control) { mask |= 1 << 18 }
+        if modifiers.contains(.option) { mask |= 1 << 19 }
+        if modifiers.contains(.command) { mask |= 1 << 20 }
+        for case let entry as [String: Any] in all.values {
+            guard (entry["enabled"] as? Bool) == true || (entry["enabled"] as? Int) == 1,
+                  let value = entry["value"] as? [String: Any], let params = value["parameters"] as? [Int], params.count >= 3 else { continue }
+            let relevant = params[2] & ((1 << 17) | (1 << 18) | (1 << 19) | (1 << 20))
+            if params[1] == Int(keyCode) && relevant == mask { return true }
+        }
+        return false
     }
 }
 

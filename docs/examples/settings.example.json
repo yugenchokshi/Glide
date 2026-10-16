@@ -1,0 +1,14 @@
+{
+  "_comment": "Example of the non-secret settings NotchBuddy stores in UserDefaults (domain dev.notchbuddy.app). You never need to edit this: everything is configurable in the app. API keys are NOT stored here; they live in the macOS Keychain.",
+  "providers": [
+    { "id": "anthropic", "kind": "anthropic", "name": "Anthropic", "baseURL": "https://api.anthropic.com", "enabled": true, "requiresKey": true, "models": [] },
+    { "id": "openai", "kind": "openai", "name": "OpenAI", "baseURL": "https://api.openai.com/v1", "enabled": true, "requiresKey": true, "models": [] },
+    { "id": "custom-ollama", "kind": "openaiCompatible", "name": "Ollama", "baseURL": "http://localhost:11434/v1", "enabled": false, "requiresKey": false, "models": ["qwen3:32b"] }
+  ],
+  "routing": { "mode": "automatic", "useJevForSelection": false, "jevModel": "jev-latest" },
+  "safety": { "approvalLevel": "highRiskOnly", "screenshotConsent": "ask", "pauseOnUserInput": true, "excludedApps": ["1Password", "Keychain Access"] },
+  "cursorMode": "fast",
+  "mcpServers": [
+    { "name": "filesystem", "transport": "stdio", "command": "npx", "arguments": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/you/Documents"], "enabled": true }
+  ]
+}

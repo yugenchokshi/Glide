@@ -84,6 +84,8 @@ struct OnboardingView: View {
                 BKKeyCap(text: store.settings.hotkeys.open.display)
                 Text("opens it from anywhere.").font(.system(size: 13)).foregroundStyle(.secondary)
             }
+            Text("If another app (for example ChatGPT) already uses this shortcut, change it in Settings › Shortcuts. You can always click the notch or the menu-bar icon.")
+                .font(.system(size: 11.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
 

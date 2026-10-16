@@ -190,7 +190,7 @@ public struct AppSettings: Codable, Sendable, Hashable {
     public var hotkeys = HotkeySettings()
     public var composio = ComposioSettings()
     public var mcpServers: [MCPServerConfig] = []
-    public var cursorMode: CursorMode = .visual
+    public var cursorMode: CursorMode = .fast
     public var completedDismissSeconds: Double = 6
     public var keepHistory = true
     public var debugScreenshots = false

@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          swift --version
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test
+      - name: Build app bundle (ad-hoc signed)
+        run: NB_SIGN_IDENTITY=- ./scripts/build_app.sh release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NotchBuddy.app
+          path: build/NotchBuddy.app

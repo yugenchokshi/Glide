@@ -182,6 +182,7 @@ func finderNotesWorkflow(_ r: ScriptRunner) async throws {
     let body = "NotchBuddy bench workflow\nRenamed quarterly-draft.txt to \(newName)"
     try await r.act(.typeText(body, into: nil, clearFirst: false, submit: false), expect: .focusedValueContains(newName), timeout: 3, requireVerified: true)
     print("3. Cleanup")
+    try await BenchmarkSuite.deleteTestNote(r, title: "NotchBuddy bench workflow", log: { print($0) })
     try? FileManager.default.removeItem(at: dir)
     print("✓ workflow verified in \(Int(Date().timeIntervalSince(start) * 1000))ms · \(r.stats.actions) actions · avg observation \(Int(r.stats.observationMs / Double(max(1, r.stats.observations))))ms")
 }

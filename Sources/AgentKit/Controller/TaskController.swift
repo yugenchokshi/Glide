@@ -30,6 +30,7 @@ public final class TaskController {
     let runtime: AutomationRuntime
     let settingsStore: SettingsStore
     private var task: Task<Void, Never>?
+    private var runTask: Task<TaskResult, Never>?
     private var orchestrator: ExecutionOrchestrator?
     private var approvalContinuation: CheckedContinuation<ApprovalDecision, Never>?
 
@@ -77,7 +78,10 @@ public final class TaskController {
                                                      callbacks: callbacks, composio: composio)
             self?.orchestrator = orchestrator
             self?.lastTaskID = orchestrator.taskID
-            let result = await Task.detached(priority: .userInitiated) { await orchestrator.run() }.value
+            let run = Task.detached(priority: .userInitiated) { await orchestrator.run() }
+            self?.runTask = run
+            let result = await run.value
+            self?.runTask = nil
             self?.finish(result)
         }
     }
@@ -148,6 +152,7 @@ public final class TaskController {
     public func stop() {
         runtime.gate.stop()
         orchestrator?.stop()
+        runTask?.cancel()
         task?.cancel()
         approvalContinuation?.resume(returning: .stop)
         approvalContinuation = nil

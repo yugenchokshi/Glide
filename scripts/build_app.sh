@@ -27,7 +27,7 @@ IDENTITY="${NB_SIGN_IDENTITY:-}"
 if [ -z "$IDENTITY" ]; then
   IDENTITY="$(security find-identity -v -p codesigning | grep -Eo '"(Developer ID Application|Apple Development)[^"]*"' | head -1 | tr -d '"' || true)"
 fi
-if [ -n "$IDENTITY" ]; then
+if [ -n "$IDENTITY" ] && [ "$IDENTITY" != "-" ]; then
   echo "Signing with: $IDENTITY"
   codesign --force --options runtime --timestamp --entitlements Resources/NotchBuddy.entitlements --sign "$IDENTITY" "$APP"
 else

@@ -24,7 +24,7 @@ public final class BenchmarkSuite: @unchecked Sendable {
 
     public let runtime: AutomationRuntime
     public let fixtureURL: URL?
-    public var log: (String) -> Void = { print($0) }
+    public var log: @Sendable (String) -> Void = { print($0) }
     let workDir: URL
     var fixture: NSRunningApplication?
 
@@ -140,6 +140,7 @@ public final class BenchmarkSuite: @unchecked Sendable {
             let title = "NotchBuddy bench note \(Int(Date().timeIntervalSince1970))"
             try await r.act(.typeText(title + "\nCreated by the NotchBuddy benchmark.", into: nil, clearFirst: false, submit: false),
                             expect: .focusedValueContains("Created by the NotchBuddy benchmark"), timeout: 3, requireVerified: true)
+            try await Self.deleteTestNote(r, title: title, log: log)
 
         case 3:
             try await r.act(.launchApp("TextEdit"), expect: .appFrontmost("TextEdit"), timeout: 8)
@@ -182,7 +183,7 @@ public final class BenchmarkSuite: @unchecked Sendable {
             let url = try writeHTML()
             try await apps.open(url: url, withApp: "Safari")
             let safari = try await apps.activate("Safari", timeout: 8)
-            try await Task.sleep(for: .milliseconds(800))
+            _ = try await r.waitFor("Go to page two", in: safari, timeout: 6)
             try await r.click("Go to page two", in: safari, expect: .windowTitleContains("NB Page Two"))
 
         case 6:
@@ -274,6 +275,21 @@ public final class BenchmarkSuite: @unchecked Sendable {
             break
         }
         return 0
+    }
+
+    /// Removes a note this benchmark created: select its row in the notes list, then
+    /// Edit › Delete (moves it to Recently Deleted). Only ever targets our own test note.
+    public static func deleteTestNote(_ r: ScriptRunner, title: String, log: @Sendable (String) -> Void) async throws {
+        let notes = try r.frontmost()
+        let obs = try await r.observe(notes)
+        let rows = obs.elements.filter { ["cell", "row", "outline-row", "text"].contains($0.role) && $0.label.hasPrefix("NotchBuddy bench") }
+        guard let row = rows.first(where: { $0.label.contains(title) || title.contains($0.label) }) ?? rows.first else {
+            log("  • couldn't find the test note in the list; leaving it")
+            return
+        }
+        try await r.act(.click(.element(row.id)), in: notes)
+        try await r.act(.menu(["Edit", "Delete"]), in: notes)
+        log("  • deleted test note “\(title)”")
     }
 
     /// TextEdit opens an Open panel on launch when iCloud Drive is enabled; dismiss it.
