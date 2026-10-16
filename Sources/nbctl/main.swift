@@ -135,6 +135,7 @@ func main() async -> Int32 {
                     let answer = await Task.detached { readLine() ?? "" }.value.lowercased()
                     return answer == "y" ? .approve : (answer == "s" ? .stop : .reject)
                 })
+            runtime.gate.reset()
             let orchestrator = ExecutionOrchestrator(instruction: task, settings: settings, runtime: runtime, callbacks: callbacks)
             signal(SIGINT, SIG_IGN)
             let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)

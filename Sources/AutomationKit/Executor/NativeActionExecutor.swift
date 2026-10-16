@@ -75,29 +75,35 @@ public final class NativeActionExecutor: @unchecked Sendable {
             return Resolved(node: node, ref: nil, point: node.center)
         }
         var live = accessibility.refresh(ref)
+        // A reused cell/row (after scrolling) is alive but shows different content: treat as stale.
+        if live != nil, !accessibility.matchesIdentity(ref, node: node) { live = nil }
         if live == nil {
             // Element was destroyed: find the same identity in a fresh observation.
             accessibility.invalidateCache()
             if let fresh = try? accessibility.observe(obs.app, useCache: false),
                let same = fresh.elements.first(where: { $0.fingerprint == node.fingerprint }), let r = fresh.refs[same.id] {
                 live = accessibility.refresh(r)
-                if let live { return try finish(same, ref: r, frame: live.frame, enabled: live.enabled) }
+                if let live { return try finish(same, ref: r, frame: live.frame, enabled: live.enabled, focused: live.focused) }
             }
             throw AutomationError.elementStale("“\(node.label.isEmpty ? node.role : node.label)”")
         }
-        return try finish(node, ref: ref, frame: live!.frame, enabled: live!.enabled)
+        return try finish(node, ref: ref, frame: live!.frame, enabled: live!.enabled, focused: live!.focused)
     }
 
-    private func finish(_ node: UIElementNode, ref: AXRef, frame: CGRect, enabled: Bool) throws -> Resolved {
+    private func finish(_ node: UIElementNode, ref: AXRef, frame: CGRect, enabled: Bool, focused: Bool) throws -> Resolved {
         guard enabled else { throw AutomationError.elementDisabled("“\(node.label.isEmpty ? node.role : node.label)”") }
         var updated = node
         updated.frame = frame
+        updated.focused = focused
         var point = CGPoint(x: frame.midX, y: frame.midY)
         if !Self.isOnScreen(point) {
             accessibility.scrollToVisible(ref)
             if let again = accessibility.refresh(ref) {
                 updated.frame = again.frame
                 point = CGPoint(x: again.frame.midX, y: again.frame.midY)
+            }
+            if !Self.isOnScreen(point) {
+                throw AutomationError.targetOffscreen("“\(node.label.isEmpty ? node.role : node.label)”")
             }
         }
         return Resolved(node: updated, ref: ref, point: point)
@@ -115,8 +121,13 @@ public final class NativeActionExecutor: @unchecked Sendable {
 
     // MARK: - Execute
 
+    /// Set by the runtime so verification knows which app was in front when an action began.
+    public var onActionStart: (@Sendable () -> Void)?
+
     public func execute(_ action: ComputerAction, observation obs: ScreenObservation?) async throws -> ActionOutcome {
         try await gate.checkpoint()
+        try Task.checkCancellation()
+        onActionStart?()
         let start = Date()
         let app = obs?.app
         let genBefore = app.map { accessibility.monitor.generation(for: $0.pid) }
@@ -153,8 +164,11 @@ public final class NativeActionExecutor: @unchecked Sendable {
                     try clickPoint(r, button: .left, count: 1)
                     try await Task.sleep(for: .milliseconds(90))
                 }
-            } else if let app = obs?.app, let focused = AX.element(accessibility.appElement(app.pid), kAXFocusedUIElementAttribute),
-                      AX.string(focused, kAXSubroleAttribute) == kAXSecureTextFieldSubrole {
+            }
+            // Whatever ends up focused (including after a click on a visual point) must not be a password field.
+            if let pid = obs?.app.pid ?? accessibility.frontmostApp()?.pid,
+               let focused = AX.element(accessibility.appElement(pid), kAXFocusedUIElementAttribute),
+               AX.string(focused, kAXSubroleAttribute) == kAXSecureTextFieldSubrole {
                 throw AutomationError.blockedBySafety("The focused field is a password field. NotchBuddy won't type into it.")
             }
             if clearFirst {
@@ -262,7 +276,10 @@ public final class NativeActionExecutor: @unchecked Sendable {
             return "mouse"
         }
         let hit = accessibility.element(at: r.point)
-        let onTarget = hit.map { accessibility.hitTestMatches($0, target: ref) } ?? false
+        let ownUI = hit.flatMap { accessibility.pid(of: $0) } == ProcessInfo.processInfo.processIdentifier
+        // NotchBuddy's own panel turns click-through before pointer input, so a hit on it means
+        // the click will reach whatever is underneath.
+        let onTarget = hit.map { accessibility.hitTestMatches($0, target: ref) } ?? false || (ownUI && input.willUsePointer != nil)
         if onTarget {
             try input.click(at: r.point, button: button, count: count)
             return "mouse"

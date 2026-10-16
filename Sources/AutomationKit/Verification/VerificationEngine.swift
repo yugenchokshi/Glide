@@ -57,6 +57,17 @@ public final class VerificationEngine: @unchecked Sendable {
         self.accessibility = accessibility
     }
 
+    /// Frontmost app when the action began; set by the caller (see `noteActionStart`).
+    private let frontLock = NSLock()
+    private var frontmostAtStartStorage: pid_t?
+    var frontmostAtStart: pid_t? { frontLock.withLock { frontmostAtStartStorage } }
+
+    /// Records which app was frontmost right before an action runs.
+    public func noteActionStart() {
+        let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        frontLock.withLock { frontmostAtStartStorage = pid }
+    }
+
     public func verify(_ expectation: Expectation, app: AppInfo?, before: ScreenObservation?, sinceGeneration: UInt64?, timeout: TimeInterval = 2.0) async -> VerificationResult {
         let start = Date()
         func result(_ s: VerificationResult.Status, _ d: String) -> VerificationResult {
@@ -88,6 +99,7 @@ public final class VerificationEngine: @unchecked Sendable {
 
         case .uiChanged:
             guard let app = app else { return result(.unconfirmed, "no app to observe") }
+            let wasFrontmost = frontmostAtStart == app.pid
             let since = sinceGeneration ?? accessibility.monitor.generation(for: app.pid)
             let changed = await accessibility.monitor.waitForChange(pid: app.pid, since: since, timeout: timeout)
             if changed {
@@ -98,7 +110,8 @@ public final class VerificationEngine: @unchecked Sendable {
             if let before, let now = try? accessibility.observe(app, useCache: false), differs(before, now) {
                 return result(.passed, "window content changed")
             }
-            if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != app.pid {
+            // Focus leaving the target app counts only if the target was in front beforehand.
+            if before?.app.pid == app.pid, wasFrontmost, let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != app.pid {
                 return result(.passed, "focus moved to \(front.localizedName ?? "another app")")
             }
             return result(.unconfirmed, "no visible change detected")
@@ -116,7 +129,12 @@ public final class VerificationEngine: @unchecked Sendable {
                         if let v = f.value, Self.normalizeForCompare(v).contains(needle) { return result(.passed, "text entered") }
                     }
                     // Rich-text editors (Notes, web editors) often expose text on a child node.
-                    if obs.elements.contains(where: { ($0.value.map(Self.normalizeForCompare) ?? "").contains(needle) || ($0.role == "text" && Self.normalizeForCompare($0.name).contains(needle)) }) {
+                    // Only count text that wasn't already there before the action.
+                    func contains(_ n: UIElementNode) -> Bool {
+                        (n.value.map(Self.normalizeForCompare) ?? "").contains(needle) || (n.role == "text" && Self.normalizeForCompare(n.name).contains(needle))
+                    }
+                    let already = Set((before?.elements ?? []).filter(contains).map { $0.fingerprint + "|" + ($0.value ?? $0.name) })
+                    if obs.elements.contains(where: { contains($0) && !already.contains($0.fingerprint + "|" + ($0.value ?? $0.name)) }) {
                         return result(.passed, "text visible in window")
                     }
                 }

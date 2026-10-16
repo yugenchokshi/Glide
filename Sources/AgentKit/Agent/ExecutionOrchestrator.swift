@@ -10,8 +10,13 @@ public final class AutomationRuntime: @unchecked Sendable {
     public let gate = ExecutionGate()
     public let accessibility = AccessibilityEngine()
     public lazy var perception = PerceptionEngine(accessibility: accessibility)
-    public lazy var executor = NativeActionExecutor(accessibility: accessibility, gate: gate)
     public lazy var verification = VerificationEngine(accessibility: accessibility)
+    public lazy var executor: NativeActionExecutor = {
+        let e = NativeActionExecutor(accessibility: accessibility, gate: gate)
+        let v = verification
+        e.onActionStart = { v.noteActionStart() }
+        return e
+    }()
     public let interference = UserInterferenceMonitor()
 
     public init() {}
@@ -85,7 +90,7 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
     public func run(plan presetPlan: Plan? = nil) async -> TaskResult {
         start = Date()
         deadline = start.addingTimeInterval(settings.limits.taskTimeoutSeconds)
-        runtime.gate.reset()
+        // The caller resets the gate before starting (so a stop pressed early isn't undone here).
         runtime.executor.input.cursorMode = settings.cursorMode
         store?.startTask(id: taskID, instruction: instruction, at: start)
         if settings.safety.pauseOnUserInput {
@@ -100,6 +105,8 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
 
     private func userTookOver() {
         guard runtime.gate.current == .running else { return }
+        // Only a takeover while the agent is actively driving input counts.
+        guard Date().timeIntervalSince(runtime.executor.input.lastPost) < 2.5 else { return }
         runtime.gate.pause()
         Task { await metrics.recordIntervention() }
         phase(.paused, "Paused — you moved the mouse. Resume when ready.")
@@ -465,6 +472,7 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
             }
         }
         phase(.executing, action.humanDescription + label)
+        try checkLimits()
         do {
             let outcome = try await runtime.executor.execute(action, observation: obs)
             totalActions += 1
@@ -487,6 +495,8 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
             history.append("- \(action.humanDescription)\(label) via \(outcome.method) → \(result.status.rawValue): \(result.detail)")
             return .ok(verified: verified)
         } catch AutomationError.stopped {
+            throw AutomationError.stopped
+        } catch is CancellationError {
             throw AutomationError.stopped
         } catch AutomationError.blockedBySafety(let m) {
             return .blocked(m)

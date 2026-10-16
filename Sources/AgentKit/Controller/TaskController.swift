@@ -33,6 +33,7 @@ public final class TaskController {
     private var runTask: Task<TaskResult, Never>?
     private var orchestrator: ExecutionOrchestrator?
     private var approvalContinuation: CheckedContinuation<ApprovalDecision, Never>?
+    private var runID = 0
 
     public init(runtime: AutomationRuntime = .shared, settingsStore: SettingsStore = .shared) {
         self.runtime = runtime
@@ -41,9 +42,19 @@ public final class TaskController {
 
     public var isConfigured: Bool { ModelRouter(settings: settingsStore.settings).isConfigured }
 
+    /// True while a previous run is still unwinding after Stop.
+    public var isWindingDown: Bool { task != nil && !isRunning }
+
     public func start(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Refuse while a stopped run is still unwinding: it shares the input gate.
         guard !trimmed.isEmpty, !isRunning else { return }
+        if task != nil {
+            status = "Still stopping the previous task — try again in a moment."
+            return
+        }
+        runID &+= 1
+        let id = runID
         instruction = trimmed
         plan = nil
         currentStepIndex = 0
@@ -60,35 +71,43 @@ public final class TaskController {
             onAttentionNeeded?()
             return
         }
+        runtime.gate.reset()
+        // Every callback carries the run id; anything from an older run is dropped.
         let callbacks = AgentCallbacks(
-            phase: { [weak self] p, s in Task { @MainActor in self?.update(phase: p, status: s) } },
-            log: { [weak self] e in Task { @MainActor in self?.append(e) } },
-            plan: { [weak self] p, i in Task { @MainActor in self?.plan = p; self?.currentStepIndex = i } },
+            phase: { [weak self] p, s in Task { @MainActor in self?.update(phase: p, status: s, run: id) } },
+            log: { [weak self] e in Task { @MainActor in if self?.runID == id { self?.append(e) } } },
+            plan: { [weak self] p, i in Task { @MainActor in if self?.runID == id { self?.plan = p; self?.currentStepIndex = i } } },
             approve: { [weak self] req in
                 guard let self else { return .stop }
-                return await self.requestApproval(req)
+                return await self.requestApproval(req, run: id)
             })
         task = Task { [weak self] in
             var composio: (ComposioClient, String)?
             if settings.composio.enabled {
                 composio = try? await ComposioSessionStore.ensureSession()
             }
-            let current = SettingsStore.shared.settings
-            let orchestrator = ExecutionOrchestrator(instruction: trimmed, settings: current, runtime: AutomationRuntime.shared,
+            guard let self, !Task.isCancelled, self.runID == id, !self.runtime.gate.isStopped else {
+                self?.task = nil
+                return
+            }
+            let orchestrator = ExecutionOrchestrator(instruction: trimmed, settings: SettingsStore.shared.settings, runtime: self.runtime,
                                                      callbacks: callbacks, composio: composio)
-            self?.orchestrator = orchestrator
-            self?.lastTaskID = orchestrator.taskID
+            self.orchestrator = orchestrator
+            self.lastTaskID = orchestrator.taskID
             let run = Task.detached(priority: .userInitiated) { await orchestrator.run() }
-            self?.runTask = run
+            self.runTask = run
             let result = await run.value
-            self?.runTask = nil
-            self?.finish(result)
+            self.runTask = nil
+            self.task = nil
+            self.orchestrator = nil
+            self.finish(result, run: id)
         }
     }
 
-    private func update(phase p: AgentPhase, status s: String) {
-        // Late phase updates must not overwrite a terminal state.
-        if [.completed, .failed, .stopped, .needsInput].contains(phase), task == nil { return }
+    private func update(phase p: AgentPhase, status s: String, run: Int) {
+        guard run == runID, isRunning else { return }
+        // While paused, progress messages from in-flight work mustn't un-pause the UI.
+        if runtime.gate.isPaused && p != .paused && p != .awaitingApproval { return }
         phase = p
         status = s
     }
@@ -98,10 +117,12 @@ public final class TaskController {
         if activity.count > 400 { activity.removeFirst(activity.count - 400) }
     }
 
-    private func finish(_ result: TaskResult) {
+    private func finish(_ result: TaskResult, run: Int) {
+        // Release anything still waiting on this run's approval.
+        approvalContinuation?.resume(returning: .stop)
+        approvalContinuation = nil
+        guard run == runID else { return }
         lastResult = result
-        task = nil
-        orchestrator = nil
         switch result.status {
         case .completed: phase = .completed; status = result.summary
         case .failed: phase = .failed; status = result.error ?? result.summary
@@ -113,8 +134,9 @@ public final class TaskController {
         onAttentionNeeded?()
     }
 
-    private func requestApproval(_ req: ApprovalRequest) async -> ApprovalDecision {
-        await withCheckedContinuation { (c: CheckedContinuation<ApprovalDecision, Never>) in
+    private func requestApproval(_ req: ApprovalRequest, run: Int) async -> ApprovalDecision {
+        guard run == runID, !runtime.gate.isStopped else { return .stop }
+        return await withCheckedContinuation { (c: CheckedContinuation<ApprovalDecision, Never>) in
             approvalContinuation?.resume(returning: .reject)
             approvalContinuation = c
             pendingApproval = req
@@ -127,7 +149,7 @@ public final class TaskController {
         pendingApproval = nil
         approvalContinuation?.resume(returning: decision)
         approvalContinuation = nil
-        if decision == .stop { stop() } else { phase = .executing }
+        if decision == .stop { stop() } else if runtime.gate.isPaused { phase = .paused } else { phase = .executing }
     }
 
     public func pause() {

@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import AgentKit
+import AutomationKit
 
 /// Where the notch is on a given display. On displays without a notch, a small pill is
 /// placed in the empty center of the menu bar.
@@ -10,11 +11,15 @@ struct NotchGeometry: Equatable {
     /// Notch (or pill) rect in AppKit screen coordinates (bottom-left origin).
     var notchRect: CGRect
 
-    static func best() -> NotchGeometry {
+    /// Nil while macOS reports no screens (mid display reconfiguration).
+    static func best() -> NotchGeometry? {
         let screens = NSScreen.screens
-        let screen = screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main ?? screens.first!
+        guard let screen = screens.first(where: { $0.safeAreaInsets.top > 0 }) ?? NSScreen.main ?? screens.first else { return nil }
         return make(for: screen)
     }
+
+    static let fallback = NotchGeometry(screenFrame: CGRect(x: 0, y: 0, width: 1440, height: 900), hasNotch: false,
+                                        notchRect: CGRect(x: 630, y: 876, width: 180, height: 24))
 
     static func make(for screen: NSScreen) -> NotchGeometry {
         let frame = screen.frame
@@ -63,7 +68,7 @@ enum NotchPresentation: Equatable {
 @Observable
 final class NotchModel {
     var presentation: NotchPresentation = .idle
-    var geometry = NotchGeometry.best()
+    var geometry = NotchGeometry.best() ?? .fallback
     var inputText = ""
     var hovering = false
     var inputOpen = false
@@ -184,9 +189,33 @@ final class NotchWindowController {
         layout(animated: false)
         panel.orderFrontRegardless()
         observe()
+        NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: panel, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                // The user clicked into another app: don't grab focus back on the next relayout.
+                self?.panel.allowsKey = false
+                self?.previousApp = nil
+            }
+        }
+        // While the agent is moving the pointer, the panel is click-through so it can never
+        // intercept an agent click; it becomes interactive again ~1s after agent input stops.
+        let panelRef = panel
+        AutomationRuntime.shared.executor.input.willUsePointer = {
+            DispatchQueue.main.async { panelRef.ignoresMouseEvents = true }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.panel.ignoresMouseEvents else { return }
+                let idle = Date().timeIntervalSince(AutomationRuntime.shared.executor.input.lastPost) > 1.0
+                if idle || AutomationRuntime.shared.gate.isPaused || self.model.controller.pendingApproval != nil {
+                    self.panel.ignoresMouseEvents = false
+                }
+            }
+        }
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.model.geometry = NotchGeometry.best()
+                guard let g = NotchGeometry.best() else { return }
+                self?.model.geometry = g
                 self?.layout(animated: false)
             }
         }
@@ -238,9 +267,14 @@ final class NotchWindowController {
         updateKeyStatus()
     }
 
+    private var wantedKey = false
+
+    /// Takes keyboard focus only on the transition into a typing state, never on unrelated
+    /// relayouts, and hands it back to the user's app on the way out.
     private func updateKeyStatus() {
         let wants = model.wantsKey
-        if wants && !panel.isKeyWindow {
+        defer { wantedKey = wants }
+        if wants && !wantedKey {
             if let front = NSWorkspace.shared.frontmostApplication, front != NSRunningApplication.current { previousApp = front }
             panel.allowsKey = true
             panel.makeKey()

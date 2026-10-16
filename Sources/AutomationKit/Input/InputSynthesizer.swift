@@ -17,6 +17,12 @@ public final class InputSynthesizer: @unchecked Sendable {
     public var cursorMode: CursorMode = .fast
     public let gate: ExecutionGate
     private let source: CGEventSource?
+    private let lastPostLock = NSLock()
+    private var lastPostDate = Date.distantPast
+
+    /// When the agent last injected an event (used to tell "user took over" from "user idly
+    /// moved the mouse while the model was thinking").
+    public var lastPost: Date { lastPostLock.withLock { lastPostDate } }
 
     public init(gate: ExecutionGate) {
         self.gate = gate
@@ -27,11 +33,26 @@ public final class InputSynthesizer: @unchecked Sendable {
         CGEvent(source: nil)?.location ?? .zero
     }
 
+    /// Called before pointer input so the host UI can get out of the way (the notch panel
+    /// becomes click-through while the agent is clicking).
+    public var willUsePointer: (@Sendable () -> Void)?
+
+    /// Posts one event. Stop throws immediately; pause holds the action here until resumed,
+    /// so nothing more is injected while the user has control.
     private func post(_ event: CGEvent?) throws {
+        while gate.isPaused { Thread.sleep(forTimeInterval: 0.05) }
         try gate.checkStopped()
+        guard let event else { return }
+        send(event)
+    }
+
+    /// Sends without the gate: used only for the matching "up" of a "down" already sent, so a
+    /// stop never leaves a mouse button held.
+    private func send(_ event: CGEvent?) {
         guard let event else { return }
         event.setIntegerValueField(.eventSourceUserData, value: Self.eventTag)
         event.post(tap: .cghidEventTap)
+        lastPostLock.withLock { lastPostDate = Date() }
     }
 
     private func pause(_ seconds: Double) {
@@ -41,6 +62,7 @@ public final class InputSynthesizer: @unchecked Sendable {
     // MARK: Mouse
 
     public func move(to target: CGPoint) throws {
+        willUsePointer?()
         let start = cursorPosition
         let distance = hypot(target.x - start.x, target.y - start.y)
         let steps: Int
@@ -77,7 +99,7 @@ public final class InputSynthesizer: @unchecked Sendable {
             let u = CGEvent(mouseEventSource: source, mouseType: up, mouseCursorPosition: point, mouseButton: cgButton)
             u?.setIntegerValueField(.mouseEventClickState, value: Int64(n))
             u?.flags = []
-            try post(u)
+            send(u)
             if n < count { pause(0.05) }
         }
     }
@@ -86,6 +108,10 @@ public final class InputSynthesizer: @unchecked Sendable {
         try move(to: a)
         pause(0.05)
         try post(CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: a, mouseButton: .left))
+        var released = false
+        defer {
+            if !released { send(CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: cursorPosition, mouseButton: .left)) }
+        }
         pause(0.08)
         let steps = 24
         for i in 1...steps {
@@ -95,7 +121,8 @@ public final class InputSynthesizer: @unchecked Sendable {
             pause(0.012)
         }
         pause(0.08)
-        try post(CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: b, mouseButton: .left))
+        released = true
+        send(CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: b, mouseButton: .left))
     }
 
     /// Scrolls by "lines"; positive amount scrolls content in the given direction.
@@ -128,7 +155,7 @@ public final class InputSynthesizer: @unchecked Sendable {
         pause(0.012)
         let up = CGEvent(keyboardEventSource: source, virtualKey: combo.keyCode, keyDown: false)
         up?.flags = flags
-        try post(up)
+        send(up)
         pause(0.02)
     }
 
@@ -145,7 +172,7 @@ public final class InputSynthesizer: @unchecked Sendable {
             let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
             up?.flags = []
             up?.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
-            try post(up)
+            send(up)
             buffer.removeAll()
             pause(cursorMode == .visual ? 0.03 : 0.008)
         }

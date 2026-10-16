@@ -222,6 +222,16 @@ public final class AccessibilityEngine: @unchecked Sendable {
         return (CGRect(origin: p, size: s), a.enabled, a.subrole == kAXSecureTextFieldSubrole ? nil : a.value, a.focused)
     }
 
+    /// Whether a live element still has the role and label it had when observed.
+    public func matchesIdentity(_ ref: AXRef, node: UIElementNode) -> Bool {
+        guard node.source == .accessibility, let a = AX.attributes(of: ref.element) else { return true }
+        if !a.role.isEmpty, a.role != node.axRole { return false }
+        let live = [a.title, a.label, a.desc].compactMap { $0 }.first(where: { !$0.isEmpty }) ?? ""
+        // Labels derived from children or values (text nodes) aren't re-derived here; only compare direct labels.
+        if !live.isEmpty, !node.name.isEmpty, live != node.name, node.role != "text" { return false }
+        return true
+    }
+
     public func value(of ref: AXRef) -> String? { AX.string(ref.element, kAXValueAttribute) }
 
     public func actions(of ref: AXRef) -> [String] { AX.actions(ref.element) }
