@@ -112,18 +112,8 @@ public struct ModelRouter: Sendable {
             case .recovery: return ("claude-opus-5-5", "medium")
             }
         case .openai:
-            let models = provider.models
-            let capable = ["gpt-5.5", "gpt-5.6-sol", "gpt-5.6", "gpt-5.4", "gpt-5", "gpt-4.1", "gpt-4o"].first(where: models.contains)
-                ?? models.first(where: { $0.hasPrefix("gpt-") && !$0.contains("mini") && !$0.contains("nano") && !$0.contains("audio") && !$0.contains("realtime") })
-                ?? "gpt-5.5"
-            let small = models.first(where: { $0.hasPrefix("gpt-5") && ($0.contains("mini") || $0.contains("luna")) })
-                ?? models.first(where: { $0.hasPrefix("gpt-") && $0.contains("mini") })
-                ?? capable
-            switch role {
-            case .actor: return (small, "low")
-            case .recovery: return (capable, "medium")
-            default: return (capable, "low")
-            }
+            // OpenAI uses gpt-luna-6 for every role by default; pick others in Settings › Models.
+            return (ProviderConfig.openAIDefaultModel, nil)
         case .openaiCompatible:
             return (provider.models.first ?? "", nil)
         }

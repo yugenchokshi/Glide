@@ -59,6 +59,25 @@ final class NotchPanel: NSPanel {
 
     override var canBecomeKey: Bool { allowsKey }
     override var canBecomeMain: Bool { false }
+
+    /// Edit shortcuts for the task field. The panel never activates the app, so these can't
+    /// rely on the app's main menu being consulted.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return super.performKeyEquivalent(with: event) }
+        let mods = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        let key = event.charactersIgnoringModifiers?.lowercased()
+        let action: Selector? = switch (mods, key) {
+        case ([.command], "v"): #selector(NSText.paste(_:))
+        case ([.command], "c"): #selector(NSText.copy(_:))
+        case ([.command], "x"): #selector(NSText.cut(_:))
+        case ([.command], "a"): #selector(NSText.selectAll(_:))
+        case ([.command], "z"): Selector(("undo:"))
+        case ([.command, .shift], "z"): Selector(("redo:"))
+        default: nil
+        }
+        if let action, NSApp.sendAction(action, to: nil, from: self) { return true }
+        return super.performKeyEquivalent(with: event)
+    }
 }
 
 enum NotchPresentation: Equatable {

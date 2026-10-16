@@ -237,6 +237,18 @@ struct ProviderTests {
         #expect((try? ModelRouter(settings: manual, credentials: creds).route(.actor))?.model == "claude-sonnet-5-5")
     }
 
+    @Test func openAIDefaultsToGptLuna6ForEveryRole() {
+        var s = AppSettings()
+        s.providers = [.openAIDefault]
+        let creds = CredentialStore(service: "dev.notchbuddy.tests.\(UUID().uuidString)")
+        creds.set("sk-test-openai-123456789", for: .provider("openai"))
+        defer { creds.remove(.provider("openai")) }
+        let router = ModelRouter(settings: s, credentials: creds)
+        for role in ModelRole.allCases {
+            #expect((try? router.route(role))?.model == "gpt-luna-6")
+        }
+    }
+
     @Test func routerWithoutKeysIsNotConfigured() {
         var s = AppSettings()
         s.providers = [.anthropicDefault]

@@ -90,10 +90,10 @@ Integration steps (`composio`, `mcp`) use the same selector with a tool list. Co
 
 | Role | Anthropic | OpenAI |
 |---|---|---|
-| Planner | `claude-opus-5-5` (effort low) | best available GPT (e.g. `gpt-5.5`) |
-| Action selection | `claude-haiku-5-5` (effort low) | a `mini` model if available |
-| Vision | `claude-opus-5-5` | planner model |
-| Recovery | `claude-opus-5-5` (effort medium) | planner model |
+| Planner | `claude-opus-5-5` (effort low) | `gpt-luna-6` |
+| Action selection | `claude-haiku-5-5` (effort low) | `gpt-luna-6` |
+| Vision | `claude-opus-5-5` | `gpt-luna-6` |
+| Recovery | `claude-opus-5-5` (effort medium) | `gpt-luna-6` |
 
 Manual mode lets you pick provider, model and effort per role. Structured replies use Anthropic `output_config.format` and OpenAI `response_format: json_schema`. Both degrade automatically to JSON-in-prompt for endpoints that don't support those formats.
 

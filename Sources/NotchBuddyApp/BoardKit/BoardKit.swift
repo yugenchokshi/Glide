@@ -292,6 +292,16 @@ struct BKSecretField: View {
             }
             .textFieldStyle(.plain)
             .font(.system(size: 13, design: .monospaced))
+            Button {
+                if let clip = NSPasteboard.general.string(forType: .string) {
+                    text = clip.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            } label: {
+                Image(systemName: "doc.on.clipboard").foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Paste from clipboard")
+            .accessibilityLabel("Paste from clipboard")
             Button { revealed.toggle() } label: {
                 Image(systemName: revealed ? "eye.slash" : "eye").foregroundStyle(.secondary)
             }

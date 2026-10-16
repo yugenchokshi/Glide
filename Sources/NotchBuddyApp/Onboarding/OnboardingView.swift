@@ -161,11 +161,17 @@ struct OnboardingView: View {
         do {
             let models = try await client.listModels()
             if !models.isEmpty {
-                store.settings.providers[idx].models = providerID == "anthropic" ? Array(Set(models + ProviderConfig.anthropicDefault.models)).sorted() : models
+                store.settings.providers[idx].models = providerID == "anthropic"
+                    ? Array(Set(models + ProviderConfig.anthropicDefault.models)).sorted()
+                    : Array(Set(models + [ProviderConfig.openAIDefaultModel])).sorted()
             }
             store.settings.providers[idx].lastTestOK = true
             store.settings.routing.preferredProviderID = providerID
-            testState = (true, "Connected — \(models.count) models available.")
+            var note = "Connected — \(models.count) models available."
+            if providerID == "openai", !models.isEmpty, !models.contains(ProviderConfig.openAIDefaultModel) {
+                note += " \(ProviderConfig.openAIDefaultModel) isn't listed for this key; you can choose another model in Settings › Models."
+            }
+            testState = (true, note)
         } catch {
             store.settings.providers[idx].lastTestOK = false
             testState = (false, error.localizedDescription)

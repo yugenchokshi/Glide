@@ -41,8 +41,11 @@ public struct ProviderConfig: Codable, Sendable, Identifiable, Hashable {
     public static let anthropicDefault = ProviderConfig(
         id: "anthropic", kind: .anthropic, name: "Anthropic", baseURL: "https://api.anthropic.com",
         models: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"])
+    /// Default OpenAI model for all roles.
+    public static let openAIDefaultModel = "gpt-luna-6"
+
     public static let openAIDefault = ProviderConfig(
-        id: "openai", kind: .openai, name: "OpenAI", baseURL: "https://api.openai.com/v1", models: [])
+        id: "openai", kind: .openai, name: "OpenAI", baseURL: "https://api.openai.com/v1", models: [openAIDefaultModel])
 }
 
 public struct ModelChoice: Codable, Sendable, Hashable {

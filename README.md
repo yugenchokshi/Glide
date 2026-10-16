@@ -38,7 +38,7 @@ open build/NotchBuddy.app
 The setup assistant walks you through:
 
 1. Granting **Accessibility** (required) and **Screen Recording** (optional; used for the OCR and vision fallbacks).
-2. Choosing a provider and pasting an API key. The key is tested on the spot and stored in your Keychain.
+2. Choosing a provider and pasting an API key (⌘V or the clipboard button). OpenAI uses `gpt-luna-6` by default. The key is tested on the spot and stored in your Keychain.
 3. Reviewing the automatically chosen models.
 4. Running a safe first task, which types one line into a new TextEdit document.
 

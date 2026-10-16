@@ -139,12 +139,19 @@ struct ProviderCard: View {
             let models = try await client.listModels()
             if !models.isEmpty {
                 // Keep known-good defaults first for Anthropic; otherwise use the live list.
-                provider.models = provider.kind == .anthropic ? Array(Set(models + ProviderConfig.anthropicDefault.models)).sorted() : models
+                provider.models = switch provider.kind {
+                case .anthropic: Array(Set(models + ProviderConfig.anthropicDefault.models)).sorted()
+                case .openai: Array(Set(models + [ProviderConfig.openAIDefaultModel])).sorted()
+                case .openaiCompatible: models
+                }
             }
             provider.lastTestOK = true
             provider.lastError = nil
             provider.lastTestedAt = Date()
             message = "Connected. \(models.count) models available."
+            if provider.kind == .openai, !models.isEmpty, !models.contains(ProviderConfig.openAIDefaultModel) {
+                message! += " Note: \(ProviderConfig.openAIDefaultModel) isn't listed for this key — pick another model in Settings › Models if tasks fail."
+            }
         } catch {
             provider.lastTestOK = false
             provider.lastError = error.localizedDescription
