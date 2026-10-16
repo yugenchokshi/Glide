@@ -150,7 +150,13 @@ public final class BenchmarkSuite: @unchecked Sendable {
             try await r.act(.typeText("Saved by the NotchBuddy benchmark.", into: nil, clearFirst: false, submit: false),
                             expect: .focusedValueContains("Saved by the NotchBuddy benchmark"))
             try await r.act(.keyPress(try KeyCombination(parsing: "cmd+s")), expect: .uiChanged)
-            _ = try await r.waitFor("Save As", timeout: 4)
+            do {
+                _ = try await r.waitFor("Save As", timeout: 4)
+            } catch {
+                // The save sheet occasionally doesn't open on the first ⌘S; try once more.
+                try await r.act(.menu(["File", "Save…"]), expect: .uiChanged)
+                _ = try await r.waitFor("Save As", timeout: 6)
+            }
             try await r.act(.typeText("nb-bench-doc", into: nil, clearFirst: true, submit: false))
             try await r.act(.keyPress(try KeyCombination(parsing: "cmd+shift+g")), expect: .uiChanged)
             try await Task.sleep(for: .milliseconds(400))
@@ -287,7 +293,8 @@ public final class BenchmarkSuite: @unchecked Sendable {
             log("  • couldn't find the test note in the list; leaving it")
             return
         }
-        try await r.act(.click(.element(row.id)), in: notes)
+        // Target by label: the list may re-render (new ids) between observations.
+        try await r.act(.click(.description(row.label)), in: notes)
         try await r.act(.menu(["Edit", "Delete"]), in: notes)
         log("  • deleted test note “\(title)”")
     }

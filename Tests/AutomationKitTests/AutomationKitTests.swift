@@ -56,6 +56,13 @@ struct ElementMatcherTests {
         #expect(ElementMatcher.rank("search field", in: nodes).first?.node.role == "searchfield")
     }
 
+    @Test func labelsWithStopWordsMatchExactly() {
+        let links = [node("link", "Go to page two"), node("link", "Page one")]
+        let r = ElementMatcher.rank("Go to page two", in: links)
+        #expect(r.first?.node.name == "Go to page two")
+        #expect((r.first?.score ?? 0) >= 0.95)
+    }
+
     @Test func toleratesTypos() {
         #expect(ElementMatcher.rank("Shaer", in: nodes).first?.node.name == "Share")
     }

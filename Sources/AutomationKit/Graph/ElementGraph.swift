@@ -208,7 +208,9 @@ public enum ElementMatcher {
             for (field, weight) in [(node.name, 1.0), (node.placeholder ?? "", 0.9), (node.identifier ?? "", 0.7), (node.value ?? "", 0.6), (node.context ?? "", 0.3)] {
                 let f = normalize(field)
                 guard !f.isEmpty else { continue }
-                best = max(best, similarity(core, f) * weight)
+                // Compare both the role/stop-word-stripped query and the literal one, so
+                // "Go to page two" still matches its own label exactly.
+                best = max(best, max(similarity(core, f), similarity(q, f)) * weight)
             }
             guard best > 0.25 else { continue }
             var score = best
