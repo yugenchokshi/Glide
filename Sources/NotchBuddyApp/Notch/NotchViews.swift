@@ -176,7 +176,8 @@ struct NotchInputView: View {
         }
         .padding(.top, 8)
         .onAppear {
-            recents = LocalStore.shared.recentTasks(limit: 6).filter { $0.status == "completed" }
+            var seen = Set<String>()
+            recents = LocalStore.shared.recentTasks(limit: 20).filter { $0.status == "completed" && seen.insert($0.instruction).inserted }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { focused = true }
         }
         .onChange(of: model.focusToken) { _, _ in focused = true }

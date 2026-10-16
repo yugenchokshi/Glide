@@ -1,4 +1,5 @@
 import AppKit
+import os
 import SwiftUI
 import AgentKit
 import AutomationKit
@@ -121,7 +122,11 @@ final class NotchModel {
 
     var wantsKey: Bool { presentation == .input || (presentation == .detail && !controller.isRunning) }
 
+    /// Set when the user asks to open the notch; used to log open latency.
+    var openRequestedAt: CFAbsoluteTime?
+
     func open() {
+        openRequestedAt = CFAbsoluteTimeGetCurrent()
         guard !controller.isRunning else { detailOpen.toggle(); recompute(); return }
         inputOpen = true
         resultVisible = false
@@ -265,6 +270,19 @@ final class NotchWindowController {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.42, execute: work)
         }
         updateKeyStatus()
+        if let t = model.openRequestedAt, model.presentation == .input {
+            model.openRequestedAt = nil
+            panel.displayIfNeeded()
+            let ms = (CFAbsoluteTimeGetCurrent() - t) * 1000
+            Logger(subsystem: "dev.notchbuddy", category: "perf").notice("notch opened in \(ms, format: .fixed(precision: 1))ms")
+            // Opt-in timing file for benchmarks: defaults write dev.notchbuddy.app NBPerfLog -bool YES
+            if UserDefaults.standard.bool(forKey: "NBPerfLog") {
+                let line = String(format: "notch_open_ms %.1f\n", ms)
+                let url = FileManager.default.temporaryDirectory.appendingPathComponent("notchbuddy-perf.log")
+                if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
+                else { try? line.write(to: url, atomically: true, encoding: .utf8) }
+            }
+        }
     }
 
     private var wantedKey = false
