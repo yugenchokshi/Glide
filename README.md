@@ -15,6 +15,10 @@ Describe what you want done, press **Start**, and watch the real cursor open app
 |---|---|---|
 | ![input](docs/images/notch-input.png) | ![running](docs/images/notch-executing.png) | ![approval](docs/images/notch-approval.png) |
 
+| Integrations | MCP servers |
+|---|---|
+| ![integrations](docs/images/settings-integrations-apps.png) | ![mcp servers](docs/images/settings-integrations-mcp-dark.png) |
+
 > Status: v1.0. See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for what it can't do yet.
 
 ## Requirements
@@ -86,7 +90,7 @@ swift build
 
 `nbctl` shares settings and Keychain entries with the app. It needs Accessibility permission for the terminal that runs it.
 
-Regenerate these images with `.build/debug/NotchBuddy --snapshot docs/images`.
+Regenerate these images with `.build/debug/NotchBuddy --snapshot docs/images` (notch) and `.build/debug/NotchBuddy --snapshot-settings <dir>` (settings and onboarding).
 
 ## Tests
 
@@ -107,7 +111,7 @@ Details are in [SECURITY.md](SECURITY.md).
 
 ## Design
 
-The interface follows [BoardUI](https://www.boardui.com)'s visual language: neutral surfaces, hairline borders, pill badges, and agent-progress and thinking patterns. BoardUI is a React/Tailwind library, so it is re-created natively in SwiftUI as "BoardKit" (`Sources/NotchBuddyApp/BoardKit`). No BoardUI source or assets are included. See [docs/DESIGN.md](docs/DESIGN.md).
+The interface follows [BoardUI](https://www.boardui.com)'s visual language: its neutral surfaces and blue accent, grouped settings rows, pastel chips, and its agent-progress, thinking and composer-loader patterns. BoardUI is a React/Tailwind library, so it is re-created natively in SwiftUI as "BoardKit" (`Sources/NotchBuddyApp/BoardKit`). No BoardUI source or assets are included. See [docs/DESIGN.md](docs/DESIGN.md).
 
 ## License
 

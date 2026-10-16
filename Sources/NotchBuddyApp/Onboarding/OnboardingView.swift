@@ -7,7 +7,7 @@ import AutomationKit
 struct OnboardingView: View {
     @Bindable var store: SettingsStore
     var onFinish: (_ introTask: String?) -> Void
-    @State private var step = 0
+    @State private var step: Int
     @State private var providerID = "anthropic"
     @State private var key = ""
     @State private var testState: (ok: Bool, message: String)?
@@ -16,16 +16,29 @@ struct OnboardingView: View {
     @State private var screenGranted = ScreenCapture.hasPermission
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
+    init(store: SettingsStore, initialStep: Int = 0, onFinish: @escaping (_ introTask: String?) -> Void) {
+        self.store = store
+        self.onFinish = onFinish
+        _step = State(initialValue: initialStep)
+    }
+
     static let introTask = "Open TextEdit, create a new document, and type “Hello from NotchBuddy!”"
 
     var body: some View {
+        BKThemeReader { t in
         VStack(spacing: 0) {
-            HStack(spacing: 6) {
-                ForEach(0..<6) { i in
-                    Capsule().fill(i <= step ? AnyShapeStyle(BK.accentGradient) : AnyShapeStyle(Color.secondary.opacity(0.2))).frame(height: 4)
+            HStack(spacing: 10) {
+                HStack(spacing: 4) {
+                    ForEach(0..<6) { i in
+                        Capsule().fill(i <= step ? AnyShapeStyle(BK.accentGradient) : AnyShapeStyle(t.dark ? BK.Palette.n800 : BK.Palette.n200))
+                            .frame(width: i == step ? 22 : 8, height: 6)
+                    }
                 }
+                Spacer()
+                Text("Step \(step + 1) of 6").font(BK.Font.caption).foregroundStyle(t.secondary)
             }
-            .padding(.horizontal, 28).padding(.top, 22)
+            .animation(.spring(response: 0.35, dampingFraction: 0.8), value: step)
+            .padding(.horizontal, 28).padding(.top, 38)
             Group {
                 switch step {
                 case 0: welcome
@@ -48,9 +61,13 @@ struct OnboardingView: View {
                     .disabled(!canContinue)
                     .keyboardShortcut(.defaultAction)
             }
-            .padding(.horizontal, 28).padding(.bottom, 22)
+            .padding(.horizontal, 28).padding(.vertical, 16)
+            .background(t.muted)
+            .overlay(alignment: .top) { Rectangle().fill(t.border).frame(height: 1) }
         }
-        .frame(width: 640, height: 520)
+        .background(t.canvas)
+        }
+        .frame(width: 640, height: 540)
         .onReceive(timer) { _ in
             axGranted = AccessibilityEngine.isTrusted
             screenGranted = ScreenCapture.hasPermission
@@ -77,7 +94,9 @@ struct OnboardingView: View {
     var welcome: some View {
         VStack(alignment: .leading, spacing: 16) {
             BKAgentOrb(mode: .thinking, size: 56)
-            Text("Meet NotchBuddy").font(.system(size: 28, weight: .bold))
+                .shadow(color: Color(hex: 0x8B6BFF).opacity(0.35), radius: 16, y: 4)
+            BKBadge(text: "Computer-use agent for macOS", tone: .info, icon: "sparkles")
+            Text("Meet NotchBuddy").font(.system(size: 30, weight: .semibold))
             Text("Tell it what you want done. It plans the steps and operates your Mac for you — moving the real cursor, clicking, typing and switching apps — while you watch from the notch.")
                 .font(.system(size: 15)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 8) {
@@ -91,32 +110,35 @@ struct OnboardingView: View {
 
     var capabilities: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("How it works").font(.system(size: 22, weight: .semibold))
-            feature("accessibility", "Reads apps the structured way", "It uses macOS accessibility data to find buttons and fields — fast, precise, and without screenshots.")
-            feature("cursorarrow.click.2", "Drives the real cursor and keyboard", "Every click and keystroke happens on your Mac, in front of you.")
-            feature("eye", "Looks only when it has to", "Screens are captured only for controls that accessibility can't see, after you allow it, with password fields blacked out.")
-            feature("hand.raised", "You stay in control", "Sending, deleting, publishing and purchases wait for your approval. Stop anytime with \(store.settings.hotkeys.stop.display) or by moving the mouse.")
-            feature("key", "Your keys, your Mac", "Bring your own OpenAI or Anthropic key. It stays in your Keychain. No account, no NotchBuddy server.")
+            Text("How it works").font(BK.Font.title1)
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+                feature("accessibility", 0x2673FE, "Reads apps the structured way", "Uses macOS accessibility data to find buttons and fields, fast and without screenshots.")
+                feature("cursorarrow.click.2", 0x8B5CF6, "Drives the real cursor", "Every click and keystroke happens on your Mac, in front of you.")
+                feature("eye.fill", 0x0EA5E9, "Looks only when it has to", "Screenshots only for controls accessibility can't see, after you allow it, with passwords blacked out.")
+                feature("hand.raised.fill", 0xF59E0B, "You stay in control", "Sending, deleting and purchases wait for approval. Stop with \(store.settings.hotkeys.stop.display) or by moving the mouse.")
+            }
+            BKCallout(tone: .success, icon: "key.fill", title: "Your keys, your Mac", message: "Bring your own OpenAI or Anthropic key. It stays in your Keychain. No account, no NotchBuddy server.")
         }
     }
 
-    func feature(_ icon: String, _ title: String, _ text: String) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: icon).font(.system(size: 15, weight: .semibold)).foregroundStyle(BK.Tone.accent.color).frame(width: 26)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.system(size: 14, weight: .semibold))
-                Text(text).font(.system(size: 12.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    func feature(_ icon: String, _ color: UInt32, _ title: String, _ text: String) -> some View {
+        BKCard(padding: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                BKTile(title: title, color: Color(hex: color), symbol: icon, size: 28)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).font(BK.Font.bodyMedium)
+                    Text(text).font(BK.Font.caption).foregroundStyle(.secondary).lineLimit(3, reservesSpace: true)
+                }
             }
         }
     }
 
     var permissions: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Permissions").font(.system(size: 22, weight: .semibold))
+            Text("Permissions").font(BK.Font.title1)
             Text("macOS will show you where to switch these on. NotchBuddy asks only for what it uses.").font(.system(size: 13)).foregroundStyle(.secondary)
-            BKCard {
+            BKGroup {
                 PermissionRow(kind: .accessibility, status: axGranted ? .granted : .denied) { Task { _ = await PermissionManager.request(.accessibility) } }
-                Divider()
                 PermissionRow(kind: .screenRecording, status: screenGranted ? .granted : .notDetermined) { Task { _ = await PermissionManager.request(.screenRecording) } }
             }
             Text("Automation and Microphone are requested later, only if you use browser reading or voice input.").font(.system(size: 11.5)).foregroundStyle(.secondary)
@@ -125,24 +147,20 @@ struct OnboardingView: View {
 
     var provider: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Connect an AI provider").font(.system(size: 22, weight: .semibold))
-            Picker("", selection: $providerID) {
-                Text("Anthropic").tag("anthropic")
-                Text("OpenAI").tag("openai")
-            }.pickerStyle(.segmented).labelsHidden().frame(width: 260)
+            Text("Connect an AI provider").font(BK.Font.title1)
+            BKSegmented(options: [("anthropic", "Anthropic"), ("openai", "OpenAI")], selection: $providerID)
             BKSecretField(placeholder: providerID == "anthropic" ? "Anthropic API key (sk-ant-…)" : "OpenAI API key (sk-…)", text: $key)
             HStack {
                 Button { Task { await saveAndTest() } } label: {
-                    HStack { if testing { ProgressView().controlSize(.small) }; Text("Save & test connection") }
+                    HStack { if testing { ProgressView().controlSize(.mini) }; Text("Save & test connection") }
                 }
-                .buttonStyle(BKButtonStyle(kind: .secondary)).disabled(key.isEmpty || testing)
+                .buttonStyle(BKButtonStyle(kind: .primary)).disabled(key.isEmpty || testing)
                 if CredentialStore.shared.has(.provider(providerID)) && key.isEmpty {
                     Button("Test saved key") { Task { await saveAndTest() } }.buttonStyle(BKButtonStyle(kind: .ghost))
                 }
             }
             if let t = testState {
-                Label(t.message, systemImage: t.ok ? "checkmark.circle.fill" : "xmark.octagon.fill")
-                    .foregroundStyle(t.ok ? BK.Tone.success.color : BK.Tone.danger.color).font(.system(size: 12.5))
+                BKCallout(tone: t.ok ? .success : .danger, icon: t.ok ? "checkmark" : "xmark", title: t.ok ? "Connected" : "Couldn't connect", message: t.message)
             }
             Text("Keys are stored in the macOS Keychain and sent only to \(providerID == "anthropic" ? "Anthropic" : "OpenAI"). You can add a custom OpenAI-compatible endpoint later in Settings.")
                 .font(.system(size: 11.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -180,34 +198,38 @@ struct OnboardingView: View {
 
     var model: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Default models").font(.system(size: 22, weight: .semibold))
+            Text("Default models").font(BK.Font.title1)
             Text("Automatic routing uses a capable model to plan and a small, fast one to pick each action. You can change any of these later in Settings › Models.")
                 .font(.system(size: 13)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            BKCard {
+            BKGroup {
                 ForEach(ModelRole.allCases) { role in
                     HStack {
-                        Text(role.title).font(.system(size: 13, weight: .medium))
+                        Text(role.title).font(BK.Font.bodyMedium)
                         Spacer()
                         Text((try? ModelRouter(settings: store.settings).route(role)).map { "\($0.provider.config.name) · \($0.model)" } ?? "—")
-                            .font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary)
+                            .font(BK.Font.mono).foregroundStyle(.secondary)
                     }
                 }
             }
-            BKFormRow(title: "Cursor movement", detail: "Visual is easier to follow at first; Fast is quicker.") {
-                Picker("", selection: $store.settings.cursorMode) {
-                    Text("Fast").tag(CursorMode.fast)
-                    Text("Visual").tag(CursorMode.visual)
-                }.pickerStyle(.segmented).labelsHidden().frame(width: 160)
+            BKGroup {
+                BKFormRow(title: "Cursor movement", detail: "Visual is easier to follow at first; Fast is quicker.") {
+                    BKSegmented(options: [(CursorMode.fast, "Fast"), (.visual, "Visual")], selection: $store.settings.cursorMode)
+                }
             }
         }
     }
 
     var firstTask: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Try a safe first task").font(.system(size: 22, weight: .semibold))
+            Text("Try a safe first task").font(BK.Font.title1)
             Text("This opens TextEdit and types one line into a new, unsaved document. Keep your hands off the mouse and watch the notch.")
                 .font(.system(size: 13)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            BKCard { Text(Self.introTask).font(.system(size: 13.5, weight: .medium)) }
+            BKCard {
+                HStack(spacing: 11) {
+                    BKTile(title: "TextEdit", color: BK.Palette.n600, symbol: "doc.text.fill", size: 30)
+                    Text(Self.introTask).font(BK.Font.bodyMedium).fixedSize(horizontal: false, vertical: true)
+                }
+            }
             Button {
                 store.settings.onboardingComplete = true
                 onFinish(Self.introTask)

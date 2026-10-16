@@ -43,6 +43,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !store.settings.onboardingComplete || !AccessibilityEngine.isTrusted {
             showOnboarding()
         }
+        // `--settings [section]` opens Settings at launch (e.g. `--settings integrations`).
+        let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--settings") {
+            showSettings(args.indices.contains(i + 1) ? args[i + 1] : nil)
+        }
     }
 
     /// Menu-bar (accessory) apps get no default main menu, and without an Edit menu macOS has
@@ -101,6 +106,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 920, height: 640),
                                   styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
             window.title = "NotchBuddy Settings"
+            // BoardUI-style chrome: no title bar strip; the traffic lights sit over the sidebar.
+            window.titlebarAppearsTransparent = true
+            window.titleVisibility = .hidden
             window.contentView = NSHostingView(rootView: view)
             window.isReleasedWhenClosed = false
             window.center()
@@ -145,10 +153,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.controller.start(intro) }
                 }
             }
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 520), styleMask: [.titled, .closable, .fullSizeContentView],
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 540), styleMask: [.titled, .closable, .fullSizeContentView],
                                   backing: .buffered, defer: false)
             window.titlebarAppearsTransparent = true
             window.title = "Welcome to NotchBuddy"
+            window.titleVisibility = .hidden
             window.contentView = NSHostingView(rootView: view)
             window.isReleasedWhenClosed = false
             window.center()

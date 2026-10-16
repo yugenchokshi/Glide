@@ -6,6 +6,11 @@ MainActor.assumeIsolated {
         SnapshotRenderer.run(into: CommandLine.arguments[i + 1])
         exit(0)
     }
+    if let i = CommandLine.arguments.firstIndex(of: "--snapshot-settings"), i + 1 < CommandLine.arguments.count {
+        _ = NSApplication.shared
+        SettingsSnapshotRenderer.run(into: CommandLine.arguments[i + 1])
+        exit(0)
+    }
     let app = NSApplication.shared
     let delegate = AppDelegate()
     app.delegate = delegate

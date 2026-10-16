@@ -57,6 +57,8 @@ struct NotchRootView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .animation(.spring(response: 0.38, dampingFraction: 0.82), value: model.presentation)
+        .environment(\.colorScheme, .dark)
+        .environment(\.bkForceDark, true)
         .preferredColorScheme(.dark)
     }
 
@@ -119,17 +121,22 @@ struct NotchInputView: View {
     @State private var voice = VoiceInput.shared
     @State private var recents: [TaskRecord] = []
 
+    var empty: Bool { model.inputText.trimmingCharacters(in: .whitespaces).isEmpty }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if !model.controller.isConfigured {
-                HStack(spacing: 8) {
-                    Image(systemName: "key.fill").foregroundStyle(BK.Tone.warning.color)
+                HStack(spacing: 10) {
+                    let chip = BK.Tone.warning.chip(dark: true)
+                    Image(systemName: "key.fill").font(.system(size: 11, weight: .semibold)).foregroundStyle(chip.text)
+                        .frame(width: 24, height: 24).background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(chip.background))
                     Text("Add an OpenAI or Anthropic key to get started.").font(.system(size: 12)).foregroundStyle(BK.Notch.secondary)
                     Spacer()
                     Button("Open Settings") { model.openSettings("providers") }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
                 }
-                .padding(8)
-                .background(RoundedRectangle(cornerRadius: 10).fill(BK.Tone.warning.color.opacity(0.1)))
+                .padding(7)
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(BK.Notch.raised))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(BK.Notch.border))
             }
             HStack(spacing: 10) {
                 TextField("", text: $model.inputText, prompt: Text("What should I do?").foregroundStyle(BK.Notch.tertiary), axis: .vertical)
@@ -148,23 +155,36 @@ struct NotchInputView: View {
                     }
                 }
                 Button { model.submit() } label: {
-                    HStack(spacing: 5) { Image(systemName: "play.fill"); Text("Start") }
+                    Image(systemName: "arrow.up").font(.system(size: 13, weight: .bold)).foregroundStyle(.white)
+                        .frame(width: 30, height: 30)
+                        .background(Circle().fill(empty ? AnyShapeStyle(BK.Palette.n700) : AnyShapeStyle(BK.accentGradient)))
+                        .overlay(Circle().strokeBorder(LinearGradient(colors: [.white.opacity(empty ? 0.08 : 0.3), .clear], startPoint: .top, endPoint: .center), lineWidth: 1))
+                        .contentShape(Circle())
                 }
-                .buttonStyle(BKButtonStyle(kind: .primary, compact: false))
-                .disabled(model.inputText.trimmingCharacters(in: .whitespaces).isEmpty)
+                .buttonStyle(.plain)
+                .disabled(empty)
                 .keyboardShortcut(.return, modifiers: [])
+                .help("Start")
+                .accessibilityLabel("Start")
             }
-            .padding(.horizontal, 12).padding(.vertical, 9)
-            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(BK.Notch.field))
-            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(BK.Notch.border))
+            .padding(.leading, 14).padding(.trailing, 7).padding(.vertical, 7)
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(BK.Notch.field))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(BK.Notch.border))
 
             HStack(spacing: 6) {
                 ForEach(recents.prefix(3)) { r in
                     Button { model.inputText = r.instruction } label: {
-                        Text(r.instruction).lineLimit(1).font(.system(size: 11))
+                        HStack(spacing: 5) {
+                            Image(systemName: "arrow.counterclockwise").font(.system(size: 9, weight: .bold)).foregroundStyle(BK.Notch.tertiary)
+                            Text(r.instruction).lineLimit(1).font(.system(size: 11.5)).foregroundStyle(BK.Notch.secondary)
+                        }
+                        .padding(.horizontal, 9).padding(.vertical, 5)
+                        .background(Capsule().fill(BK.Notch.raised))
+                        .overlay(Capsule().strokeBorder(BK.Notch.border))
+                        .contentShape(Capsule())
                     }
-                    .buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
-                    .frame(maxWidth: 150)
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: 170)
                 }
                 Spacer()
                 BKIconButton(systemName: "clock.arrow.circlepath", help: "Recent tasks") {
@@ -177,7 +197,7 @@ struct NotchInputView: View {
         .padding(.top, 8)
         .onAppear {
             var seen = Set<String>()
-            recents = LocalStore.shared.recentTasks(limit: 20).filter { $0.status == "completed" && seen.insert($0.instruction).inserted }
+            recents = SnapshotRenderer.isRendering ? [] : LocalStore.shared.recentTasks(limit: 20).filter { $0.status == "completed" && seen.insert($0.instruction).inserted }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { focused = true }
         }
         .onChange(of: model.focusToken) { _, _ in focused = true }
@@ -211,7 +231,11 @@ struct NotchRunningView: View {
                 model.recompute()
             }
         }
-        .padding(.top, 8)
+        .padding(.leading, 14).padding(.trailing, 6).padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(BK.Notch.field))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(BK.Notch.border))
+        .bkIridescentRim(c.phase == .planning || c.phase == .executing, cornerRadius: 14)
+        .padding(.top, 6)
     }
 }
 
@@ -311,13 +335,15 @@ struct NotchApprovalView: View {
         let c = model.controller
         if let req = c.pendingApproval {
             VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 8) {
+                HStack(spacing: 10) {
+                    let chip = BK.Tone.warning.chip(dark: true)
                     Image(systemName: req.kind == .screenshot ? "eye.trianglebadge.exclamationmark.fill" : "hand.raised.fill")
-                        .foregroundStyle(BK.Tone.warning.color)
+                        .font(.system(size: 12, weight: .semibold)).foregroundStyle(chip.text)
+                        .frame(width: 26, height: 26).background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(chip.background))
                     Text(req.kind == .screenshot ? "Allow a screenshot?" : "Approve this action?")
                         .font(.system(size: 13, weight: .semibold)).foregroundStyle(BK.Notch.text)
                     Spacer()
-                    BKBadge(text: "\(req.risk.rawValue) risk", tone: req.risk == .high ? .danger : .warning)
+                    BKBadge(text: "\(req.risk.rawValue.capitalized) risk", tone: req.risk == .high ? .danger : .warning)
                 }
                 Text(req.title).font(.system(size: 14, weight: .medium)).foregroundStyle(BK.Notch.text).lineLimit(2)
                 HStack(spacing: 6) {

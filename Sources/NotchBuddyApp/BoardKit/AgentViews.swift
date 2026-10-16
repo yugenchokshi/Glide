@@ -18,8 +18,8 @@ struct BKPlanProgress: View {
                         .foregroundStyle(color(for: i))
                         .lineLimit(1)
                     Spacer(minLength: 4)
-                    if step.risk == .high { BKBadge(text: "approval", tone: .warning) }
-                    if step.route != .gui { BKBadge(text: step.route.rawValue, tone: .info) }
+                    if step.risk == .high { BKBadge(text: "Approval", tone: .warning) }
+                    if step.route != .gui { BKBadge(text: step.route.rawValue.capitalized, tone: .info) }
                 }
             }
         }
@@ -27,11 +27,13 @@ struct BKPlanProgress: View {
 
     @ViewBuilder func marker(for i: Int) -> some View {
         if i < currentIndex || finished {
-            Image(systemName: "checkmark.circle.fill").font(.system(size: 12)).foregroundStyle(BK.Tone.success.color)
+            Image(systemName: "checkmark.circle.fill").font(.system(size: 13)).foregroundStyle(BK.Tone.success.color)
+                .frame(width: 14, height: 14)
         } else if i == currentIndex {
-            BKAgentOrb(mode: .acting, size: 12)
+            BKProgressRing(size: 13, trackColor: onDark ? BK.Palette.n800 : BK.Palette.n200)
         } else {
-            Circle().strokeBorder(onDark ? BK.Notch.tertiary : Color.secondary.opacity(0.5), lineWidth: 1.2).frame(width: 12, height: 12)
+            Circle().strokeBorder(onDark ? BK.Palette.n700 : BK.Palette.n300, style: StrokeStyle(lineWidth: 1.2, dash: [2.2, 2.2]))
+                .frame(width: 13, height: 13)
         }
     }
 

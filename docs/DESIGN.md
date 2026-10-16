@@ -16,24 +16,40 @@ None of BoardUI's components can be used directly in a native SwiftUI app: they 
 
 | BoardUI pattern | BoardKit native component |
 |---|---|
-| Buttons (primary/secondary/ghost/destructive) | `BKButtonStyle` |
-| Badges / pills | `BKBadge` |
-| Status indicators | `BKStatusDot` (with pulse) |
-| Agent thinking / iridescent light | `BKAgentOrb` (rotating iridescent gradient), `BKShimmerText` |
-| Agent progress | `BKPlanProgress` |
+| Buttons (primary gradient / secondary / ghost / tinted / destructive) | `BKButtonStyle` |
+| Switch | `BKSwitchStyle` (`.toggleStyle(.bk)`), `BKSwitch` |
+| Segmented control | `BKSegmented` |
+| Select / dropdown | `BKMenu` |
+| Chips | `BKBadge` (pastel status colors) |
+| Status dot with halo | `BKStatusDot` |
+| Avatar / app tiles (MCP list rows) | `BKTile` (logo, symbol or initials, optional status dot) |
+| Settings modal (sidebar + grouped rows) | `SettingsPageFrame`, `SettingsSidebar`, `BKGroup`, `BKGroupHeader`, `BKFormRow` |
+| Notification | `BKCallout` |
+| Pill tabs, quick search | `BKPill`, `BKSearchField` |
+| Agent thinking / iridescent light | `BKAgentOrb`, `BKShimmerText` |
+| Composer loader (light travelling round the rim) | `.bkIridescentRim(_:cornerRadius:)` |
+| Agent progress | `BKPlanProgress` with `BKProgressRing` |
 | Activity feed | `BKTimeline` |
-| Cards, form rows | `BKCard`, `BKFormRow`, `BKSectionHeader` |
-| Inputs | `BKTextField`, `BKSecretField` (masked, show/hide) |
+| Cards, empty states | `BKCard`, `BKEmptyState` |
+| Inputs | `BKTextField`, `BKSecretField` (masked, paste, show/hide), `BKTextEditor`, `BKStepper` |
 | Keyboard hints | `BKKeyCap` |
 
 ## Tokens
 
-- **Radius:** 6 / 10 / 14 / 20.
-- **Spacing:** 4 / 8 / 12 / 16 / 24.
-- **Surfaces:** the notch is always pure black, so it merges with the hardware cutout, with white text at 94 / 58 / 36 % opacity and 8 % hairline borders. Settings windows use semantic AppKit colors, so they follow light and dark mode automatically.
-- **Accent:** a violet → blue gradient for primary actions. The iridescent ring (violet, blue, teal, pink) marks agent activity.
-- **Tones:** success `#33D499`, warning `#FABF24`, danger `#F77070`, info `#61A6FA`.
-- **Type:** SF Pro, 11–15 pt in the notch, with semibold titles.
+Values follow BoardUI's published design tokens (its Tailwind theme), re-created as Swift constants in `BK` and `BKTheme`.
+
+- **Neutrals:** BoardUI's neutral scale, including its extra steps (100 `#F7F7F7`, 200 `#EBEBEB`, 925 `#121212`).
+- **Surfaces:** light uses a white canvas, `#F7F7F7` sidebars and row groups, and white controls with `#EBEBEB` hairlines. Dark uses a `#121212` canvas, `#171717` groups and `#262626` controls. `BKTheme` picks the set from the color scheme. The notch is always pure black so it merges with the hardware cutout.
+- **Accent:** BoardUI's blue (`#2673FE` → `#144BE9`). Primary buttons and switches use it as a top-to-bottom gradient with an inner highlight.
+- **Chips:** pastel backgrounds with dark text, e.g. lime-200 / lime-800 for success, yellow-200 / yellow-800 for warning, rose-200 / rose-800 for danger, blue-100 / blue-800 for info. Dark mode uses tinted backgrounds with light text.
+- **Agent light:** the iridescent gradient (violet, blue, teal, pink) marks agent activity: the orb, and the band that circles the notch's status bar while a task is planning or running.
+- **Radius:** 6 / 8 / 10 / 12 / 16 / 20. **Spacing:** 4 / 8 / 12 / 16 / 24 / 32.
+- **Shadows:** BoardUI's `shadow-card` (one soft pixel) on cards and controls, and a hairline-plus-lift float shadow on selected sidebar items and segments.
+- **Type:** SF Pro at macOS sizes. Pages use 18 pt semibold titles, 13 pt body text and 11.5 pt captions.
+
+## Snapshots
+
+`NotchBuddy --snapshot <dir>` renders every notch state, and `NotchBuddy --snapshot-settings <dir>` renders the settings window, onboarding and the Composio key sheet in light and dark mode. Both use demo data in memory: they don't read the Keychain, your settings or your task history, launch MCP servers, or use the network.
 
 ## Notch behavior
 

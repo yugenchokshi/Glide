@@ -9,6 +9,7 @@ public final class CredentialStore: @unchecked Sendable {
     public let service: String
     private let lock = NSLock()
     private var memo: [String: String?] = [:]
+    private var memoryOnly = false
 
     public init(service: String = "dev.notchbuddy.credentials") {
         self.service = service
@@ -34,9 +35,19 @@ public final class CredentialStore: @unchecked Sendable {
         }
     }
 
+    /// Serves (and stores) values in memory only and never touches the Keychain. Used by
+    /// offscreen UI snapshots so rendering never reads real keys or triggers Keychain prompts.
+    public func useMemoryOnly(_ values: [Key: String] = [:]) {
+        lock.withLock {
+            memoryOnly = true
+            memo = Dictionary(uniqueKeysWithValues: values.map { ($0.key.account, Optional($0.value)) })
+        }
+    }
+
     public func get(_ key: Key) -> String? {
         let account = key.account
         if let cached = lock.withLock({ memo[account] }) { return cached }
+        if lock.withLock({ memoryOnly }) { return nil }
         var query = baseQuery(account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -57,6 +68,10 @@ public final class CredentialStore: @unchecked Sendable {
         let account = key.account
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return remove(key) }
+        if lock.withLock({ memoryOnly }) {
+            lock.withLock { memo[account] = trimmed }
+            return true
+        }
         let data = Data(trimmed.utf8)
         var status = SecItemUpdate(baseQuery(account) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
         if status == errSecItemNotFound {
@@ -72,6 +87,10 @@ public final class CredentialStore: @unchecked Sendable {
 
     @discardableResult
     public func remove(_ key: Key) -> Bool {
+        if lock.withLock({ memoryOnly }) {
+            lock.withLock { memo[key.account] = .some(nil) }
+            return true
+        }
         let status = SecItemDelete(baseQuery(key.account) as CFDictionary)
         lock.withLock { memo[key.account] = .some(nil) }
         return status == errSecSuccess || status == errSecItemNotFound

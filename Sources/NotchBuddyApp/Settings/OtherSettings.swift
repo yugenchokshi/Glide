@@ -11,16 +11,15 @@ struct PermissionsSettingsView: View {
 
     var body: some View {
         BKSectionHeader(title: "Permissions", subtitle: "macOS asks you to grant these. NotchBuddy can't grant them to itself.")
-        BKCard {
+        BKGroup {
             ForEach(PermissionKind.allCases) { kind in
                 PermissionRow(kind: kind, status: statuses[kind] ?? .unknown) {
                     Task { statuses[kind] = await PermissionManager.request(kind) }
                 }
-                if kind != PermissionKind.allCases.last { Divider() }
             }
         }
         Text("After granting Accessibility or Screen Recording, macOS may require relaunching NotchBuddy.")
-            .font(.system(size: 11.5)).foregroundStyle(.secondary)
+            .font(BK.Font.caption).foregroundStyle(.secondary).padding(.horizontal, 4)
             .onAppear(perform: refresh)
             .onReceive(timer) { _ in refresh() }
     }
@@ -36,19 +35,41 @@ struct PermissionRow: View {
     let request: () -> Void
 
     var body: some View {
-        BKFormRow(title: kind.title, detail: kind.purpose) {
-            HStack(spacing: 8) {
-                switch status {
-                case .granted: BKBadge(text: "Granted", tone: .success)
-                case .denied: BKBadge(text: kind == .accessibility ? "Required" : "Not granted", tone: kind == .accessibility ? .danger : .warning)
-                case .notDetermined: BKBadge(text: "Not granted", tone: .warning)
-                case .unknown: BKBadge(text: "Asked when needed", tone: .neutral)
-                }
-                if status != .granted {
-                    Button(kind == .automation ? "Open Settings" : "Grant…", action: request)
-                        .buttonStyle(BKButtonStyle(kind: kind == .accessibility ? .primary : .secondary, compact: true))
+        HStack(spacing: 11) {
+            BKTile(title: kind.title, color: color, symbol: icon, size: 30)
+            BKFormRow(title: kind.title, detail: kind.purpose) {
+                HStack(spacing: 8) {
+                    switch status {
+                    case .granted: BKBadge(text: "Granted", tone: .success, icon: "checkmark")
+                    case .denied: BKBadge(text: kind == .accessibility ? "Required" : "Not granted", tone: kind == .accessibility ? .danger : .warning)
+                    case .notDetermined: BKBadge(text: "Not granted", tone: .warning)
+                    case .unknown: BKBadge(text: "Asked when needed", tone: .neutral)
+                    }
+                    if status != .granted {
+                        Button(kind == .automation ? "Open Settings" : "Grant…", action: request)
+                            .buttonStyle(BKButtonStyle(kind: kind == .accessibility ? .primary : .secondary, compact: true))
+                            .fixedSize()
+                    }
                 }
             }
+        }
+    }
+
+    var icon: String {
+        switch kind {
+        case .accessibility: return "accessibility"
+        case .screenRecording: return "rectangle.dashed.badge.record"
+        case .automation: return "gearshape.2.fill"
+        case .microphone: return "mic.fill"
+        }
+    }
+
+    var color: Color {
+        switch kind {
+        case .accessibility: return BK.Palette.accent500
+        case .screenRecording: return Color(hex: 0x8B5CF6)
+        case .automation: return Color(hex: 0xF97316)
+        case .microphone: return Color(hex: 0xF43F5E)
         }
     }
 }
@@ -61,48 +82,50 @@ struct SafetySettingsView: View {
 
     var body: some View {
         BKSectionHeader(title: "Safety", subtitle: "High-risk actions (sending, deleting, publishing, purchasing, security changes) always wait for your approval. Password fields and card numbers are never typed.")
-        BKCard {
-            BKFormRow(title: "Ask before", detail: nil) {
-                Picker("", selection: $store.settings.safety.approvalLevel) {
-                    ForEach(ApprovalLevel.allCases, id: \.self) { Text($0.title).tag($0) }
-                }.labelsHidden().frame(width: 360)
+        BKGroupHeader(title: "Approvals")
+        BKGroup {
+            BKFormRow(title: "Ask before", detail: "Actions at or above this level wait for you in the notch.") {
+                BKMenu(options: ApprovalLevel.allCases.map { ($0, $0.shortTitle) }, selection: $store.settings.safety.approvalLevel, minWidth: 170)
             }
-            Divider()
             BKFormRow(title: "Screenshots to vision models", detail: "Used only when a control isn't exposed to accessibility and local OCR can't find it. Password fields are blacked out first.") {
-                Picker("", selection: $store.settings.safety.screenshotConsent) {
-                    ForEach(ScreenshotConsent.allCases, id: \.self) { Text($0.title).tag($0) }
-                }.labelsHidden().frame(width: 200)
+                BKMenu(options: ScreenshotConsent.allCases.map { ($0, $0.title) }, selection: $store.settings.safety.screenshotConsent, minWidth: 170)
             }
-            Divider()
             BKFormRow(title: "Pause when I move the mouse", detail: "Grabbing the mouse during a task pauses the agent instantly.") {
-                Toggle("", isOn: $store.settings.safety.pauseOnUserInput).labelsHidden().toggleStyle(.switch)
+                BKSwitch(isOn: $store.settings.safety.pauseOnUserInput, label: "Pause when I move the mouse")
             }
         }
-        BKCard {
-            Text("Excluded apps").font(.system(size: 13, weight: .semibold))
-            Text("NotchBuddy will never read or operate these apps (names or bundle IDs).").font(.system(size: 11.5)).foregroundStyle(.secondary)
+        BKGroupHeader(title: "Excluded apps", subtitle: "NotchBuddy will never read or operate these apps (names or bundle IDs).")
+        BKGroup {
             ForEach(store.settings.safety.excludedApps, id: \.self) { app in
-                HStack {
-                    Image(systemName: "nosign").foregroundStyle(.secondary)
-                    Text(app).font(.system(size: 12.5))
+                HStack(spacing: 10) {
+                    BKTile(title: app, color: BK.Palette.n500, symbol: "nosign", size: 24)
+                    Text(app).font(BK.Font.body)
                     Spacer()
-                    Button { store.settings.safety.excludedApps.removeAll { $0 == app } } label: { Image(systemName: "minus.circle") }.buttonStyle(.plain)
+                    Button { store.settings.safety.excludedApps.removeAll { $0 == app } } label: {
+                        Image(systemName: "xmark").font(.system(size: 10, weight: .bold))
+                    }
+                    .buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
+                    .accessibilityLabel("Remove \(app)")
                 }
             }
-            HStack {
+            HStack(spacing: 6) {
                 BKTextField(placeholder: "App name or bundle ID", text: $newApp).onSubmit(add)
-                Button("Add", action: add).buttonStyle(BKButtonStyle(kind: .secondary, compact: true)).disabled(newApp.isEmpty)
+                Button("Add", action: add).buttonStyle(BKButtonStyle(kind: .secondary, compact: true)).fixedSize().disabled(newApp.isEmpty)
             }
         }
-        BKCard {
-            Text("Limits").font(.system(size: 13, weight: .semibold))
-            Stepper("Max steps per task: \(store.settings.limits.maxSteps)", value: $store.settings.limits.maxSteps, in: 3...60)
-            Stepper("Max actions per step: \(store.settings.limits.maxActionsPerStep)", value: $store.settings.limits.maxActionsPerStep, in: 3...40)
-            Stepper("Max actions per task: \(store.settings.limits.maxTotalActions)", value: $store.settings.limits.maxTotalActions, in: 10...300, step: 10)
-            Stepper("Retries before giving up: \(store.settings.limits.retryLimit)", value: $store.settings.limits.retryLimit, in: 0...8)
-            Stepper("Replans after failures: \(store.settings.limits.maxReplans)", value: $store.settings.limits.maxReplans, in: 0...5)
-            Stepper("Task timeout: \(Int(store.settings.limits.taskTimeoutSeconds / 60)) min", value: $store.settings.limits.taskTimeoutSeconds, in: 60...3600, step: 60)
+        BKGroupHeader(title: "Limits", subtitle: "A task stops when it reaches any of these.")
+        BKGroup {
+            limitRow("Max steps per task", BKStepper(value: $store.settings.limits.maxSteps, range: 3...60))
+            limitRow("Max actions per step", BKStepper(value: $store.settings.limits.maxActionsPerStep, range: 3...40))
+            limitRow("Max actions per task", BKStepper(value: $store.settings.limits.maxTotalActions, range: 10...300, step: 10))
+            limitRow("Retries before giving up", BKStepper(value: $store.settings.limits.retryLimit, range: 0...8))
+            limitRow("Replans after failures", BKStepper(value: $store.settings.limits.maxReplans, range: 0...5))
+            limitRow("Task timeout", BKStepper(value: $store.settings.limits.taskTimeoutSeconds, range: 60...3600, step: 60) { "\(Int($0 / 60)) min" })
         }
+    }
+
+    func limitRow(_ title: String, _ stepper: BKStepper) -> some View {
+        BKFormRow(title: title) { stepper }
     }
 
     func add() {
@@ -110,6 +133,16 @@ struct SafetySettingsView: View {
         guard !v.isEmpty, !store.settings.safety.excludedApps.contains(v) else { return }
         store.settings.safety.excludedApps.append(v)
         newApp = ""
+    }
+}
+
+extension ApprovalLevel {
+    var shortTitle: String {
+        switch self {
+        case .highRiskOnly: return "High-risk actions"
+        case .mediumAndHigh: return "Medium and high risk"
+        case .everyAction: return "Every action"
+        }
     }
 }
 
@@ -125,11 +158,9 @@ struct ShortcutsSettingsView: View {
 
     var body: some View {
         BKSectionHeader(title: "Shortcuts", subtitle: "Global shortcuts work from any app. The emergency stop works even when NotchBuddy's UI is hidden.")
-        BKCard {
+        BKGroup {
             row(.open, "Open NotchBuddy", \.open)
-            Divider()
             row(.pauseResume, "Pause / resume", \.pauseResume)
-            Divider()
             row(.stop, "Emergency stop", \.stop)
         }
         .onAppear { conflictText = conflicts() }
@@ -140,13 +171,13 @@ struct ShortcutsSettingsView: View {
         BKFormRow(title: title, detail: conflictText[action]) {
             HStack(spacing: 8) {
                 if recording == action {
-                    Text("Press keys…").font(.system(size: 12)).foregroundStyle(BK.Tone.accent.color)
+                    BKBadge(text: "Press keys…", tone: .info)
                 } else {
                     BKKeyCap(text: store.settings.hotkeys[keyPath: path].display)
                 }
                 Button(recording == action ? "Cancel" : "Change") {
                     if recording == action { endRecording() } else { beginRecording(action, path) }
-                }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
+                }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true)).fixedSize()
             }
         }
     }
@@ -184,30 +215,33 @@ struct SkillsSettingsView: View {
 
     var body: some View {
         BKSectionHeader(title: "Skills", subtitle: "Reusable workflows the planner follows when your request matches. Skills store steps in words, never screen coordinates.")
-        HStack {
+        BKGroupHeader(title: "\(skills.count) skill\(skills.count == 1 ? "" : "s")") {
             Button { editing = Skill(name: "New skill", description: "", triggers: [], steps: []) } label: { Label("New skill", systemImage: "plus") }
-                .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
-            Spacer()
+                .buttonStyle(BKButtonStyle(kind: .secondary, compact: true)).fixedSize()
         }
         if skills.isEmpty {
-            BKCard { Text("No skills yet. Save one from a completed task in History, or create one here.").font(.system(size: 12)).foregroundStyle(.secondary) }
-        }
-        ForEach(skills) { skill in
-            BKCard {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(skill.name).font(.system(size: 13, weight: .semibold))
-                        Text(skill.description).font(.system(size: 11.5)).foregroundStyle(.secondary).lineLimit(2)
+            BKEmptyState(icon: "wand.and.stars", title: "No skills yet", message: "Save one from a completed task in History, or create one here.")
+        } else {
+            BKGroup {
+                ForEach(skills) { skill in
+                    HStack(alignment: .top, spacing: 11) {
+                        BKTile(title: skill.name, color: Color(hex: 0x8B5CF6), symbol: "wand.and.stars", size: 30)
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                Text(skill.name).font(BK.Font.bodyMedium)
+                                if skill.requiresApproval { BKBadge(text: "Approval", tone: .warning) }
+                            }
+                            if !skill.description.isEmpty { Text(skill.description).font(BK.Font.caption).foregroundStyle(.secondary).lineLimit(2) }
+                            Text(skill.steps.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n"))
+                                .font(BK.Font.caption).foregroundStyle(.secondary).padding(.top, 2)
+                        }
+                        Spacer()
+                        Button("Edit") { editing = skill }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true)).fixedSize()
                     }
-                    Spacer()
-                    if skill.requiresApproval { BKBadge(text: "approval", tone: .warning) }
-                    Button("Edit") { editing = skill }.buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
                 }
-                Text(skill.steps.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n"))
-                    .font(.system(size: 11.5)).foregroundStyle(.secondary)
             }
         }
-        EmptyView()
+        Color.clear.frame(height: 0)
             .onAppear(perform: reload)
             .sheet(item: $editing) { skill in
                 SkillEditor(skill: skill, onSave: { s in LocalStore.shared.saveSkill(s); editing = nil; reload() },
@@ -230,34 +264,42 @@ struct SkillEditor: View {
     @State private var apps = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Skill").font(.system(size: 16, weight: .semibold))
-            BKFormRow(title: "Name") { BKTextField(placeholder: "Meeting note", text: $skill.name).frame(width: 320) }
-            BKFormRow(title: "Description") { BKTextField(placeholder: "What it does", text: $skill.description).frame(width: 320) }
-            BKFormRow(title: "Triggers", detail: "Comma-separated phrases") { BKTextField(placeholder: "meeting note, standup notes", text: $triggers).frame(width: 320) }
-            BKFormRow(title: "Parameters", detail: "Comma-separated") { BKTextField(placeholder: "topic, attendees", text: $params).frame(width: 320) }
-            BKFormRow(title: "Preconditions") { BKTextField(placeholder: "Notes is installed", text: $skill.preconditions).frame(width: 320) }
-            BKFormRow(title: "Apps") { BKTextField(placeholder: "Notes", text: $apps).frame(width: 320) }
-            Text("Steps (one per line)").font(.system(size: 13, weight: .medium))
-            TextEditor(text: $steps).font(.system(size: 12)).frame(height: 120)
-                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor)))
-            BKFormRow(title: "Done when") { BKTextField(placeholder: "The note shows the title", text: $skill.verification).frame(width: 320) }
-            Toggle("Always ask for approval", isOn: $skill.requiresApproval)
-            HStack {
-                Button("Delete", role: .destructive, action: onDelete)
-                Spacer()
-                Button("Cancel", action: onCancel)
-                Button("Save") {
-                    func list(_ s: String) -> [String] { s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
-                    skill.triggers = list(triggers)
-                    skill.parameters = list(params)
-                    skill.apps = list(apps)
-                    skill.steps = steps.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-                    onSave(skill)
-                }.keyboardShortcut(.defaultAction)
+        BKThemeReader { t in
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Skill").font(BK.Font.title2)
+                BKGroup {
+                    BKFormRow(title: "Name") { BKTextField(placeholder: "Meeting note", text: $skill.name).frame(width: 300) }
+                    BKFormRow(title: "Description") { BKTextField(placeholder: "What it does", text: $skill.description).frame(width: 300) }
+                    BKFormRow(title: "Triggers", detail: "Comma-separated phrases") { BKTextField(placeholder: "meeting note, standup notes", text: $triggers).frame(width: 300) }
+                    BKFormRow(title: "Parameters", detail: "Comma-separated") { BKTextField(placeholder: "topic, attendees", text: $params).frame(width: 300) }
+                    BKFormRow(title: "Preconditions") { BKTextField(placeholder: "Notes is installed", text: $skill.preconditions).frame(width: 300) }
+                    BKFormRow(title: "Apps") { BKTextField(placeholder: "Notes", text: $apps).frame(width: 300) }
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Steps (one per line)").font(BK.Font.bodyMedium)
+                        BKTextEditor(text: $steps, height: 110)
+                    }
+                    BKFormRow(title: "Done when") { BKTextField(placeholder: "The note shows the title", text: $skill.verification).frame(width: 300) }
+                    BKFormRow(title: "Always ask for approval") { BKSwitch(isOn: $skill.requiresApproval, label: "Always ask for approval") }
+                }
+                HStack {
+                    Button("Delete", role: .destructive, action: onDelete).buttonStyle(BKButtonStyle(kind: .ghost))
+                    Spacer()
+                    Button("Cancel", action: onCancel).buttonStyle(BKButtonStyle(kind: .secondary))
+                    Button("Save") {
+                        func list(_ s: String) -> [String] { s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
+                        skill.triggers = list(triggers)
+                        skill.parameters = list(params)
+                        skill.apps = list(apps)
+                        skill.steps = steps.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+                        onSave(skill)
+                    }
+                    .buttonStyle(BKButtonStyle(kind: .primary))
+                    .keyboardShortcut(.defaultAction)
+                }
             }
+            .padding(22).frame(width: 600)
+            .background(t.canvas)
         }
-        .padding(22).frame(width: 580)
         .onAppear {
             triggers = skill.triggers.joined(separator: ", ")
             params = skill.parameters.joined(separator: ", ")
@@ -278,33 +320,41 @@ struct HistorySettingsView: View {
 
     var body: some View {
         BKSectionHeader(title: "History", subtitle: "What NotchBuddy did, step by step. Stored only on this Mac. Screenshots are never kept.")
-        BKCard {
-            BKFormRow(title: "Keep task history") { Toggle("", isOn: $store.settings.keepHistory).labelsHidden().toggleStyle(.switch) }
-            Divider()
+        BKGroup {
+            BKFormRow(title: "Keep task history") { BKSwitch(isOn: $store.settings.keepHistory, label: "Keep task history") }
             BKFormRow(title: "Clear history", detail: "Deletes every task record and log from this Mac.") {
-                Button("Clear…") { confirmClear = true }.buttonStyle(BKButtonStyle(kind: .destructive, compact: true))
+                Button("Clear…") { confirmClear = true }.buttonStyle(BKButtonStyle(kind: .destructive, compact: true)).fixedSize()
             }
         }
         .confirmationDialog("Delete all task history?", isPresented: $confirmClear) {
             Button("Delete history", role: .destructive) { LocalStore.shared.clearHistory(); reload() }
         }
+        BKGroupHeader(title: "Recent tasks")
+        if tasks.isEmpty {
+            BKEmptyState(icon: "clock", title: "No tasks yet", message: "Tasks you run from the notch show up here.")
+        }
         ForEach(tasks) { t in
-            BKCard(padding: 12) {
-                HStack(alignment: .top) {
-                    BKStatusDot(tone: t.status == "completed" ? .success : (t.status == "running" ? .info : (t.status == "stopped" ? .neutral : .danger)))
+            BKCard(padding: 12, selected: selected?.id == t.id) {
+                HStack(alignment: .top, spacing: 10) {
+                    BKStatusDot(tone: tone(t)).padding(.top, 2)
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(t.instruction).font(.system(size: 13, weight: .medium)).lineLimit(2)
-                        Text(subtitle(t)).font(.system(size: 11)).foregroundStyle(.secondary)
-                        if let s = t.summary ?? t.error { Text(s).font(.system(size: 11.5)).foregroundStyle(.secondary).lineLimit(2) }
+                        Text(t.instruction).font(BK.Font.bodyMedium).lineLimit(2)
+                        HStack(spacing: 6) {
+                            BKBadge(text: t.status.capitalized, tone: tone(t))
+                            Text(subtitle(t)).font(BK.Font.caption).foregroundStyle(.secondary)
+                        }
+                        if let s = t.summary ?? t.error { Text(s).font(BK.Font.caption).foregroundStyle(.secondary).lineLimit(2) }
                     }
                     Spacer()
                     if t.status == "completed", let plan = t.plan {
                         Button("Save as skill") { LocalStore.shared.saveSkill(Skill.from(plan: plan, instruction: t.instruction)) }
-                            .buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
+                            .buttonStyle(BKButtonStyle(kind: .ghost, compact: true)).fixedSize()
                     }
                     Button(selected?.id == t.id ? "Hide" : "Details") {
-                        if selected?.id == t.id { selected = nil } else { selected = t; events = LocalStore.shared.events(taskID: t.id) }
-                    }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
+                        withAnimation(.snappy(duration: 0.25)) {
+                            if selected?.id == t.id { selected = nil } else { selected = t; events = LocalStore.shared.events(taskID: t.id) }
+                        }
+                    }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true)).fixedSize()
                 }
                 if selected?.id == t.id {
                     if let m = t.metrics {
@@ -321,12 +371,22 @@ struct HistorySettingsView: View {
                 }
             }
         }
-        EmptyView().onAppear(perform: reload)
+        Color.clear.frame(height: 0).onAppear(perform: reload)
+    }
+
+    func tone(_ t: TaskRecord) -> BK.Tone {
+        switch t.status {
+        case "completed": return .success
+        case "running": return .info
+        case "stopped": return .neutral
+        case "needsInput": return .warning
+        default: return .danger
+        }
     }
 
     func subtitle(_ t: TaskRecord) -> String {
         let df = RelativeDateTimeFormatter()
-        var s = "\(t.status.capitalized) · \(df.localizedString(for: t.startedAt, relativeTo: Date()))"
+        var s = df.localizedString(for: t.startedAt, relativeTo: Date())
         if let d = t.durationMs { s += " · \(String(format: "%.1fs", d / 1000))" }
         return s
     }

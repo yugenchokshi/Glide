@@ -6,21 +6,21 @@ struct ProvidersSettingsView: View {
 
     var body: some View {
         BKSectionHeader(title: "AI Providers", subtitle: "Bring your own keys. They're stored in your macOS Keychain, sent only to the provider you choose, and never logged or shown to models.")
+        BKGroupHeader(title: "Providers") {
+            Button {
+                let id = "custom-" + UUID().uuidString.prefix(6).lowercased()
+                store.settings.providers.append(ProviderConfig(id: id, kind: .openaiCompatible, name: "Custom endpoint", baseURL: "http://localhost:11434/v1", requiresKey: false))
+            } label: { Label("OpenAI-compatible endpoint", systemImage: "plus") }
+                .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
+                .fixedSize()
+        }
         ForEach($store.settings.providers) { $provider in
             ProviderCard(provider: $provider, onRemove: provider.kind == .openaiCompatible ? {
                 CredentialStore.shared.remove(.provider(provider.id))
                 store.settings.providers.removeAll { $0.id == provider.id }
             } : nil)
         }
-        HStack {
-            Button {
-                let id = "custom-" + UUID().uuidString.prefix(6).lowercased()
-                store.settings.providers.append(ProviderConfig(id: id, kind: .openaiCompatible, name: "Custom endpoint", baseURL: "http://localhost:11434/v1", requiresKey: false))
-            } label: { Label("Add OpenAI-compatible endpoint", systemImage: "plus") }
-                .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
-                    .fixedSize()
-            Spacer()
-        }
+        BKGroupHeader(title: "Selection model", subtitle: "Optional. A fast decision model used only to choose between ambiguous on-screen candidates.")
         JevCard(store: store)
     }
 }
@@ -34,35 +34,34 @@ struct ProviderCard: View {
     @State private var hasKey = false
 
     var body: some View {
-        BKCard {
-            HStack(spacing: 10) {
-                Image(systemName: icon).font(.system(size: 16, weight: .semibold)).foregroundStyle(BK.Tone.accent.color)
-                    .frame(width: 30, height: 30).background(RoundedRectangle(cornerRadius: 8).fill(BK.Tone.accent.color.opacity(0.12)))
-                VStack(alignment: .leading, spacing: 2) {
+        BKGroup {
+            HStack(spacing: 11) {
+                BKTile(title: provider.name, color: tileColor, symbol: icon, size: 32)
+                VStack(alignment: .leading, spacing: 1) {
                     if provider.kind == .openaiCompatible {
-                        TextField("Name", text: $provider.name).textFieldStyle(.plain).font(.system(size: 14, weight: .semibold))
+                        TextField("Name", text: $provider.name).textFieldStyle(.plain).font(BK.Font.headline)
                     } else {
-                        Text(provider.name).font(.system(size: 14, weight: .semibold))
+                        Text(provider.name).font(BK.Font.headline)
                     }
-                    Text(provider.kind.displayName).font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text(provider.kind == .anthropic ? "api.anthropic.com" : (URL(string: provider.baseURL)?.host ?? provider.kind.displayName)).font(BK.Font.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
                 statusBadge
-                Toggle("", isOn: $provider.enabled).labelsHidden().toggleStyle(.switch).help("Use this provider")
+                BKSwitch(isOn: $provider.enabled, label: "Use \(provider.name)").help("Use this provider")
             }
             if provider.kind != .anthropic {
                 BKFormRow(title: "Base URL") {
-                    BKTextField(placeholder: "https://…/v1", text: $provider.baseURL, monospaced: true).frame(width: 340)
+                    BKTextField(placeholder: "https://…/v1", text: $provider.baseURL, monospaced: true).frame(width: 320)
                 }
             }
             if provider.kind == .openaiCompatible {
                 BKFormRow(title: "Requires an API key") {
-                    Toggle("", isOn: $provider.requiresKey).labelsHidden().toggleStyle(.switch)
+                    BKSwitch(isOn: $provider.requiresKey, label: "Requires an API key")
                 }
             }
             BKFormRow(title: "API key", detail: hasKey ? "Saved in Keychain: \(CredentialStore.mask(CredentialStore.shared.get(.provider(provider.id)) ?? ""))" : "Not set") {
                 HStack(spacing: 6) {
-                    BKSecretField(placeholder: hasKey ? "Replace key…" : keyPlaceholder, text: $keyInput).frame(minWidth: 180, maxWidth: 250)
+                    BKSecretField(placeholder: hasKey ? "Replace key…" : keyPlaceholder, text: $keyInput).frame(minWidth: 180, maxWidth: 240)
                     Button("Save") {
                         CredentialStore.shared.set(keyInput, for: .provider(provider.id))
                         keyInput = ""
@@ -74,37 +73,39 @@ struct ProviderCard: View {
                     .disabled(keyInput.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
-            HStack(spacing: 8) {
-                Button { Task { await test() } } label: {
-                    HStack(spacing: 5) {
-                        if testing { ProgressView().controlSize(.small) }
-                        Text("Test connection")
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Button { Task { await test() } } label: {
+                        HStack(spacing: 5) {
+                            if testing { ProgressView().controlSize(.mini) }
+                            Text("Test connection")
+                        }
+                    }
+                    .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
+                    .fixedSize()
+                    .disabled(testing || (provider.requiresKey && !hasKey))
+                    if hasKey {
+                        Button("Remove key") {
+                            CredentialStore.shared.remove(.provider(provider.id))
+                            provider.lastTestOK = nil
+                            refresh()
+                        }
+                        .buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
+                        .fixedSize()
+                    }
+                    if let onRemove {
+                        Button("Remove endpoint", role: .destructive, action: onRemove).buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
+                            .fixedSize()
+                    }
+                    Spacer()
+                    if !provider.models.isEmpty {
+                        Text("\(provider.models.count) model\(provider.models.count == 1 ? "" : "s")").font(BK.Font.caption).foregroundStyle(.secondary)
                     }
                 }
-                .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
-                    .fixedSize()
-                .disabled(testing || (provider.requiresKey && !hasKey))
-                if hasKey {
-                    Button("Remove key") {
-                        CredentialStore.shared.remove(.provider(provider.id))
-                        provider.lastTestOK = nil
-                        refresh()
-                    }
-                    .buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
-                    .fixedSize()
+                if let message {
+                    Text(message).font(BK.Font.caption).foregroundStyle(provider.lastTestOK == true ? BK.Tone.success.color : BK.Tone.danger.color)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                if let onRemove {
-                    Button("Remove endpoint", role: .destructive, action: onRemove).buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
-                    .fixedSize()
-                }
-                Spacer()
-                if !provider.models.isEmpty {
-                    Text("\(provider.models.count) models available").font(.system(size: 11)).foregroundStyle(.secondary)
-                }
-            }
-            if let message {
-                Text(message).font(.system(size: 11.5)).foregroundStyle(provider.lastTestOK == true ? BK.Tone.success.color : BK.Tone.danger.color)
-                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .onAppear(perform: refresh)
@@ -113,8 +114,16 @@ struct ProviderCard: View {
     var icon: String {
         switch provider.kind {
         case .anthropic: return "sparkle"
-        case .openai: return "circle.hexagongrid"
+        case .openai: return "circle.hexagongrid.fill"
         case .openaiCompatible: return "server.rack"
+        }
+    }
+
+    var tileColor: Color {
+        switch provider.kind {
+        case .anthropic: return Color(hex: 0xD97757)
+        case .openai: return Color(hex: 0x10A37F)
+        case .openaiCompatible: return BK.Palette.n600
         }
     }
 
@@ -175,33 +184,30 @@ struct JevCard: View {
     var provider: JevProvider { store.settings.routing.effectiveJevProvider }
 
     var body: some View {
-        BKCard {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("TypeSafe Jev (optional)").font(.system(size: 14, weight: .semibold))
-                    Text("A fast decision model used only to choose between ambiguous on-screen candidates. Your planner and action models still do everything else.")
-                        .font(.system(size: 11.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        BKGroup {
+            HStack(spacing: 11) {
+                BKTile(title: "Jev", color: Color(hex: 0x6366F1), symbol: "bolt.fill", size: 32)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("TypeSafe Jev").font(BK.Font.headline)
+                    Text("Your planner and action models still do everything else.").font(BK.Font.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Toggle("", isOn: $store.settings.routing.useJevForSelection).labelsHidden().toggleStyle(.switch).disabled(!hasKey)
+                BKSwitch(isOn: $store.settings.routing.useJevForSelection, label: "Use Jev for selection").disabled(!hasKey)
             }
             BKFormRow(title: "Connect through", detail: provider == .vercelGateway
                       ? "Uses Vercel's TypeSafe-compatible endpoint, billed to your Vercel account (AI_GATEWAY_API_KEY)."
                       : "Calls api.typesafe.ai with your TypeSafe key.") {
-                Picker("", selection: Binding(get: { provider }, set: { new in
+                BKSegmented(options: JevProvider.allCases.map { ($0, $0.title) }, selection: Binding(get: { provider }, set: { new in
                     store.settings.routing.jevProvider = new
                     store.settings.routing.jevModel = new.defaultModel
                     message = nil
                     refresh()
-                })) {
-                    ForEach(JevProvider.allCases, id: \.self) { Text($0.title).tag($0) }
-                }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 300)
+                }))
             }
             BKFormRow(title: provider == .vercelGateway ? "AI Gateway key" : "API key",
                       detail: hasKey ? "Saved in Keychain: \(CredentialStore.mask(CredentialStore.shared.get(ModelRouter.jevKey(provider)) ?? ""))" : "Not set") {
                 HStack(spacing: 6) {
-                    BKSecretField(placeholder: provider.keyPlaceholder, text: $keyInput).frame(minWidth: 180, maxWidth: 240)
+                    BKSecretField(placeholder: provider.keyPlaceholder, text: $keyInput).frame(minWidth: 170, maxWidth: 220)
                     Button("Save") {
                         CredentialStore.shared.set(keyInput, for: ModelRouter.jevKey(provider))
                         keyInput = ""
@@ -212,23 +218,23 @@ struct JevCard: View {
                     .fixedSize().disabled(keyInput.isEmpty)
                     if hasKey {
                         Button { Task { await test() } } label: {
-                            HStack(spacing: 4) { if testing { ProgressView().controlSize(.small) }; Text("Test") }
+                            HStack(spacing: 4) { if testing { ProgressView().controlSize(.mini) }; Text("Test") }
                         }
                         .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
-                    .fixedSize().disabled(testing)
+                        .fixedSize().disabled(testing)
                         Button("Remove") {
                             CredentialStore.shared.remove(ModelRouter.jevKey(provider))
                             refresh()
                             store.settings.routing.useJevForSelection = false
                         }.buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
-                    .fixedSize()
+                            .fixedSize()
                     }
                 }
             }
             BKFormRow(title: "Model", detail: "Default: \(provider.defaultModel)") {
                 BKTextField(placeholder: provider.defaultModel, text: $store.settings.routing.jevModel, monospaced: true).frame(width: 200)
             }
-            if let message { Text(message).font(.system(size: 11.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+            if let message { Text(message).font(BK.Font.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
         }
         .onAppear(perform: refresh)
     }
@@ -256,25 +262,23 @@ struct ModelsSettingsView: View {
 
     var body: some View {
         BKSectionHeader(title: "Models", subtitle: "Automatic routing picks a capable model for planning and vision and a small, fast one for choosing each action.")
-        BKCard {
-            BKFormRow(title: "Routing") {
-                Picker("", selection: $store.settings.routing.mode) {
-                    Text("Automatic").tag(RoutingSettings.Mode.automatic)
-                    Text("Manual").tag(RoutingSettings.Mode.manual)
-                }.pickerStyle(.segmented).frame(width: 200).labelsHidden()
+        BKGroup {
+            BKFormRow(title: "Routing", detail: store.settings.routing.mode == .automatic ? "NotchBuddy chooses a model for each role." : "You choose the provider, model and effort for each role.") {
+                BKSegmented(options: [(RoutingSettings.Mode.automatic, "Automatic"), (.manual, "Manual")], selection: $store.settings.routing.mode)
             }
             if store.settings.routing.mode == .automatic {
-                Divider()
                 BKFormRow(title: "Preferred provider") {
-                    Picker("", selection: Binding(get: { store.settings.routing.preferredProviderID ?? "" }, set: { store.settings.routing.preferredProviderID = $0.isEmpty ? nil : $0 })) {
-                        Text("First available").tag("")
-                        ForEach(store.settings.providers) { Text($0.name).tag($0.id) }
-                    }.labelsHidden().frame(width: 220)
+                    BKMenu(options: [("", "First available")] + store.settings.providers.map { ($0.id, $0.name) },
+                           selection: Binding(get: { store.settings.routing.preferredProviderID ?? "" }, set: { store.settings.routing.preferredProviderID = $0.isEmpty ? nil : $0 }),
+                           minWidth: 160)
                 }
             }
         }
-        ForEach(ModelRole.allCases) { role in
-            RoleRow(store: store, role: role)
+        BKGroupHeader(title: "Roles")
+        BKGroup {
+            ForEach(ModelRole.allCases) { role in
+                RoleRow(store: store, role: role)
+            }
         }
     }
 }
@@ -284,30 +288,22 @@ struct RoleRow: View {
     let role: ModelRole
 
     var body: some View {
-        BKCard {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(role.title).font(.system(size: 13, weight: .semibold))
-                    Text(role.hint).font(.system(size: 11.5)).foregroundStyle(.secondary)
+                    Text(role.title).font(BK.Font.bodyMedium)
+                    Text(role.hint).font(BK.Font.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
                 if store.settings.routing.mode == .automatic {
-                    Text(automaticLabel).font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary)
+                    Text(automaticLabel).font(BK.Font.mono).foregroundStyle(.secondary)
                 }
             }
             if store.settings.routing.mode == .manual {
-                HStack(spacing: 8) {
-                    Picker("Provider", selection: providerBinding) {
-                        Text("—").tag("")
-                        ForEach(store.settings.providers.filter(\.enabled)) { Text($0.name).tag($0.id) }
-                    }.frame(width: 200)
+                HStack(spacing: 6) {
+                    BKMenu(options: [("", "Provider…")] + store.settings.providers.filter(\.enabled).map { ($0.id, $0.name) }, selection: providerBinding, minWidth: 140)
                     modelField
-                    Picker("Effort", selection: effortBinding) {
-                        Text("default").tag("")
-                        Text("low").tag("low")
-                        Text("medium").tag("medium")
-                        Text("high").tag("high")
-                    }.frame(width: 150)
+                    BKMenu(options: [("", "Default effort"), ("low", "Low"), ("medium", "Medium"), ("high", "High")], selection: effortBinding, minWidth: 110)
                 }
             }
         }
@@ -351,10 +347,8 @@ struct RoleRow: View {
         if models.isEmpty {
             BKTextField(placeholder: "model id", text: modelBinding, monospaced: true).frame(width: 220)
         } else {
-            Picker("Model", selection: modelBinding) {
-                if !models.contains(choice.model) { Text(choice.model.isEmpty ? "—" : choice.model).tag(choice.model) }
-                ForEach(models, id: \.self) { Text($0).tag($0) }
-            }.frame(width: 260)
+            BKMenu(options: (models.contains(choice.model) ? [] : [(choice.model, choice.model.isEmpty ? "Model…" : choice.model)]) + models.map { ($0, $0) },
+                   selection: modelBinding, minWidth: 200)
         }
     }
 }
