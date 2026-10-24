@@ -101,12 +101,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     /// Shows a job event in the notch, and also as a notification if the notch was collapsed
-    /// when it happened (you're probably looking elsewhere).
+    /// when it happened (you're probably looking elsewhere), or if the notch is busy with
+    /// something else and doesn't show this job (a running task, the task field, another
+    /// job's card): its card then waits its turn, and the notification says it's there.
     private func announce(_ job: JobRecord, show: () -> Void) {
-        let wasExpanded = notchModel.isExpanded
         guard notchModel.shouldAnnounce(job) else { return }
+        let wasExpanded = notchModel.isExpanded
         show()
-        if !wasExpanded && store.settings.jobs.notifications {
+        if (!wasExpanded || !notchModel.isShowing(job: job.id)) && store.settings.jobs.notifications {
             JobNotifier.shared.notify(job, approval: JobCenter.shared.pendingApprovals[job.id])
         }
     }

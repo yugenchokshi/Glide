@@ -56,7 +56,7 @@ private struct JobListRow: View {
                 HStack(spacing: 11) {
                     ZStack {
                         BKJobRing(fraction: job.progressFraction ?? (job.status == .completed ? 1 : nil), size: 26, lineWidth: 3,
-                                  trackColor: t.dark ? BK.Palette.n800 : BK.Palette.n200, dimmed: !job.status.canPause && job.status != .completed)
+                                  trackColor: t.dark ? BK.Palette.n800 : BK.Palette.n200, dimmed: !job.status.isActive && job.status != .completed)
                         if job.status.isFinished {
                             Image(systemName: job.status == .completed ? "checkmark" : (job.status == .failed ? "exclamationmark" : "stop.fill"))
                                 .font(.system(size: 9, weight: .bold)).foregroundStyle(job.status.tone.color)
@@ -165,7 +165,7 @@ struct JobDetailView: View {
                 if job.usage.itemsTotal > 0 {
                     ZStack {
                         BKJobRing(fraction: job.progressFraction, size: 46, lineWidth: 4.5, trackColor: t.dark ? BK.Palette.n800 : BK.Palette.n200,
-                                  dimmed: !job.status.canPause && job.status != .completed)
+                                  dimmed: !job.status.isActive && job.status != .completed)
                         Text("\(Int(((job.progressFraction ?? 0) * 100).rounded()))%")
                             .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundStyle(t.text)
                     }
@@ -185,7 +185,7 @@ struct JobDetailView: View {
                 Button { jobs.pause(job.id) } label: { Label("Pause", systemImage: "pause.fill") }
                     .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
             }
-            if s.isResumable {
+            if job.canResume {
                 Button { jobs.resume(job.id) } label: { Label(s == .waiting ? "Run now" : "Resume", systemImage: "play.fill") }
                     .buttonStyle(BKButtonStyle(kind: s == .waiting ? .secondary : .primary, compact: true))
             }
