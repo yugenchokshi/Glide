@@ -81,7 +81,15 @@ final class NotchPanel: NSPanel {
 }
 
 enum NotchPresentation: Equatable {
-    case idle, hover, input, running, detail, approval, result
+    /// `job`: a background job's confirmation or finished card.
+    case idle, hover, input, running, detail, approval, result, job
+}
+
+/// An approval the notch is showing: the quick task's, or one a background job is waiting on.
+struct NotchApproval {
+    var request: ApprovalRequest
+    /// Nil for the quick task.
+    var jobID: String?
 }
 
 @MainActor
@@ -96,26 +104,41 @@ final class NotchModel {
     var resultVisible = false
     var historyOpen = false
     var focusToken = 0
+    /// The detail view shows the background jobs list rather than the last quick task.
+    var jobsDetailOpen = false
+    /// Job whose card (confirmation or result) the notch shows, set when a job needs the user.
+    var attentionJobID: String?
 
     let controller: TaskController
     let settings: SettingsStore
+    let jobs: any JobsSource
     var openSettings: (String?) -> Void = { _ in }
+    /// Opens Settings › Jobs on one job.
+    var openJob: (String) -> Void = { _ in }
     private var dismissWork: DispatchWorkItem?
+    private var jobDismissWork: DispatchWorkItem?
+    /// Last copy of the attention job, so the card survives a reload that briefly drops it.
+    private var attentionSnapshot: JobRecord?
+    /// Jobs the user stopped from the notch: their "stopped" result card would only echo the click.
+    private var stoppedFromNotch: Set<String> = []
 
-    init(controller: TaskController, settings: SettingsStore) {
+    init(controller: TaskController, settings: SettingsStore, jobs: (any JobsSource)? = nil) {
         self.controller = controller
         self.settings = settings
+        self.jobs = jobs ?? JobCenter.shared
     }
 
     func recompute() {
         let c = controller
         let p: NotchPresentation
-        if c.pendingApproval != nil {
+        if activeApproval != nil {
             p = .approval
         } else if c.isRunning {
             p = detailOpen ? .detail : .running
         } else if inputOpen {
             p = historyOpen || detailOpen ? .detail : .input
+        } else if attentionJob != nil {
+            p = .job
         } else if resultVisible {
             p = detailOpen ? .detail : .result
         } else {
@@ -124,18 +147,69 @@ final class NotchModel {
         if p != presentation { presentation = p }
     }
 
+    /// The quick task's approval first (it holds the screen), then the job that last asked for
+    /// attention, then the oldest job's.
+    var activeApproval: NotchApproval? {
+        if let req = controller.pendingApproval { return NotchApproval(request: req, jobID: nil) }
+        let pending = jobs.pendingApprovals
+        guard !pending.isEmpty else { return nil }
+        if let id = attentionJobID, let req = pending[id] { return NotchApproval(request: req, jobID: id) }
+        let id = pending.keys.min { a, b in
+            let da = jobs.job(a)?.createdAt ?? .distantPast, db = jobs.job(b)?.createdAt ?? .distantPast
+            return da == db ? a < b : da < db
+        }
+        guard let id, let req = pending[id] else { return nil }
+        return NotchApproval(request: req, jobID: id)
+    }
+
+    func respondToApproval(_ decision: ApprovalDecision) {
+        guard let approval = activeApproval else { return }
+        if let id = approval.jobID {
+            if decision == .stop { stoppedFromNotch.insert(id) }
+            jobs.respond(jobID: id, decision: decision)
+        } else {
+            controller.respondToApproval(decision)
+        }
+        recompute()
+    }
+
+    /// The job shown in the wing ring: one is running and the notch isn't busy with a quick task.
+    var wingJob: JobRecord? { controller.isRunning ? nil : jobs.activeJob }
+
+    /// The job in the running pill above the task field: the running one, else the most
+    /// recently updated job that's paused, waiting, needs input or awaits confirmation.
+    var pillJob: JobRecord? {
+        if let active = jobs.activeJob { return active }
+        return jobs.jobs.filter { [.paused, .waiting, .needsInput, .awaitingConfirmation].contains($0.status) }
+            .max { $0.updatedAt < $1.updatedAt }
+    }
+
+    /// The job whose card is showing, while it still needs the user.
+    var attentionJob: JobRecord? {
+        guard let id = attentionJobID else { return nil }
+        guard let job = jobs.job(id) ?? (attentionSnapshot?.id == id ? attentionSnapshot : nil) else { return nil }
+        let wantsCard = job.status == .awaitingConfirmation || job.status == .needsInput || job.status.isFinished
+        return wantsCard ? job : nil
+    }
+
+    /// Anything beyond the bare notch (or hover) is on screen.
+    var isExpanded: Bool { presentation != .idle && presentation != .hover }
+
     /// Size of the visible notch shape for the current presentation.
     var size: CGSize {
         let n = geometry.notchRect.size
         let top = n.height
+        // The wings must clear the physical notch for the job ring to be visible at all.
+        let wing: CGFloat = wingJob == nil ? 0 : 64
         switch presentation {
-        case .idle: return CGSize(width: n.width, height: top)
-        case .hover: return CGSize(width: n.width + 24, height: top + 4)
-        case .input: return CGSize(width: max(n.width + 240, 560), height: top + 148)
+        case .idle: return CGSize(width: n.width + wing, height: top)
+        case .hover: return CGSize(width: n.width + max(24, wing + 8), height: top + 4)
+        case .input: return CGSize(width: max(n.width + 240, 560), height: top + 148 + (pillJob == nil ? 0 : 50))
         case .running: return CGSize(width: max(n.width + 200, 500), height: top + 52)
         case .detail: return CGSize(width: max(n.width + 280, 600), height: top + 400)
         case .approval: return CGSize(width: max(n.width + 240, 560), height: top + 190)
         case .result: return CGSize(width: max(n.width + 240, 560), height: top + 116)
+        case .job: return CGSize(width: max(n.width + 240, 560), height: top + (attentionJob?.status == .awaitingConfirmation ? 168 : 116))
         }
     }
 
@@ -151,6 +225,7 @@ final class NotchModel {
         resultVisible = false
         detailOpen = false
         historyOpen = false
+        jobsDetailOpen = false
         focusToken += 1
         recompute()
     }
@@ -159,12 +234,14 @@ final class NotchModel {
         inputOpen = false
         detailOpen = false
         historyOpen = false
+        jobsDetailOpen = false
         resultVisible = false
+        clearJobAttention()
         recompute()
     }
 
     func toggle() {
-        if inputOpen || detailOpen || resultVisible { close() } else { open() }
+        if inputOpen || detailOpen || resultVisible || attentionJob != nil { close() } else { open() }
     }
 
     func submit() {
@@ -192,6 +269,84 @@ final class NotchModel {
         }
         dismissWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + settings.settings.completedDismissSeconds, execute: work)
+    }
+
+    // MARK: Background jobs
+
+    /// Whether a job event should surface at all (card or notification).
+    func shouldAnnounce(_ job: JobRecord) -> Bool {
+        !(job.status == .stopped && stoppedFromNotch.contains(job.id))
+    }
+
+    /// A job needs the user (approval, confirmation, question, finished): show its card.
+    /// Approvals show through `activeApproval` on their own; marking the job also makes its
+    /// approval win over another job's.
+    func jobNeedsAttention(_ id: String) {
+        guard let job = jobs.job(id), shouldAnnounce(job) else { return }
+        showJobCard(job)
+    }
+
+    func jobFinished(_ job: JobRecord) {
+        guard shouldAnnounce(job) else { return }
+        showJobCard(job)
+    }
+
+    private func showJobCard(_ job: JobRecord) {
+        attentionJobID = job.id
+        attentionSnapshot = job
+        recompute()
+        jobDismissWork?.cancel()
+        // Successful results fold away like quick-task results; failures and questions stay.
+        guard job.status == .completed || job.status == .stopped else { return }
+        let id = job.id
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.attentionJobID == id, !self.hovering else { return }
+            self.clearJobAttention()
+            self.recompute()
+        }
+        jobDismissWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(4, settings.settings.completedDismissSeconds), execute: work)
+    }
+
+    private func clearJobAttention() {
+        jobDismissWork?.cancel()
+        jobDismissWork = nil
+        attentionJobID = nil
+        attentionSnapshot = nil
+    }
+
+    func dismissJobCard() {
+        clearJobAttention()
+        recompute()
+    }
+
+    func startJob(_ id: String) {
+        jobs.start(id)
+        // The quick task that handed off to this job left a "Started a background job" result.
+        resultVisible = false
+        dismissJobCard()
+    }
+
+    /// Cancel on the confirmation card: the job never started, so stopping it is final.
+    func cancelJob(_ id: String) {
+        stopJob(id)
+        resultVisible = false
+        dismissJobCard()
+    }
+
+    func stopJob(_ id: String) {
+        stoppedFromNotch.insert(id)
+        jobs.stop(id)
+        recompute()
+    }
+
+    /// Opens the detail view on the "Background jobs" list (from the running pill).
+    func showJobsDetail() {
+        inputOpen = true
+        historyOpen = false
+        detailOpen = true
+        jobsDetailOpen = true
+        recompute()
     }
 }
 
@@ -231,7 +386,7 @@ final class NotchWindowController {
             MainActor.assumeIsolated {
                 guard let self, self.panel.ignoresMouseEvents else { return }
                 let idle = Date().timeIntervalSince(AutomationRuntime.shared.executor.input.lastPost) > 1.0
-                if idle || AutomationRuntime.shared.gate.isPaused || self.model.controller.pendingApproval != nil {
+                if idle || AutomationRuntime.shared.gate.isPaused || self.model.activeApproval != nil {
                     self.panel.ignoresMouseEvents = false
                 }
             }
@@ -252,6 +407,9 @@ final class NotchWindowController {
             _ = model.controller.phase
             _ = model.controller.pendingApproval
             _ = model.hovering
+            _ = model.jobs.jobs
+            _ = model.jobs.pendingApprovals
+            _ = model.attentionJobID
         } onChange: { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -270,10 +428,20 @@ final class NotchWindowController {
         return CGRect(x: g.notchRect.midX - w / 2, y: g.screenFrame.maxY - h, width: w, height: h)
     }
 
+    /// Frame the pending shrink will apply; relayouts toward the same frame leave it scheduled.
+    private var shrinkTarget: CGRect?
+
     func layout(animated: Bool) {
         let target = frame(for: model.size)
         let current = panel.frame
+        // Background jobs publish progress many times a minute. Those relayouts don't change
+        // the size, so they must not cancel (and endlessly postpone) a pending shrink.
+        if animated, current != .zero, target == current || target == shrinkTarget {
+            updateKeyStatus()
+            return
+        }
         shrinkWork?.cancel()
+        shrinkTarget = nil
         if !animated || current == .zero {
             panel.setFrame(target, display: true)
         } else if target.width >= current.width && target.height >= current.height {
@@ -283,8 +451,10 @@ final class NotchWindowController {
             panel.setFrame(current.union(target), display: true)
             let work = DispatchWorkItem { [weak self] in
                 guard let self else { return }
+                self.shrinkTarget = nil
                 self.panel.setFrame(self.frame(for: self.model.size), display: true)
             }
+            shrinkTarget = target
             shrinkWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.42, execute: work)
         }

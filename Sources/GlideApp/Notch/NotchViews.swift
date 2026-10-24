@@ -72,6 +72,7 @@ struct NotchRootView: View {
             case .detail: NotchDetailView(model: model).transition(.opacity)
             case .approval: NotchApprovalView(model: model).transition(.opacity)
             case .result: NotchResultView(model: model).transition(.opacity)
+            case .job: NotchJobCard(model: model).transition(.opacity)
             }
         }
     }
@@ -79,21 +80,27 @@ struct NotchRootView: View {
     /// Content on either side of the physical notch (never under it).
     @ViewBuilder var topWings: some View {
         let c = model.controller
+        let wingJob = model.wingJob
         HStack {
             if model.presentation != .idle {
                 HStack(spacing: 6) {
                     BKAgentOrb(mode: orbMode, size: 14)
-                    if model.presentation == .hover && !c.isRunning {
+                    if model.presentation == .hover && !c.isRunning && wingJob == nil {
                         Text("Glide").font(.system(size: 11, weight: .semibold)).foregroundStyle(BK.Notch.secondary)
                     }
                 }
             } else if c.isRunning {
                 BKAgentOrb(mode: orbMode, size: 12)
+            } else if wingJob != nil {
+                // Static (idle) orb: it sits in the menu bar for as long as the job runs.
+                BKAgentOrb(mode: .idle, size: 10)
             }
             Spacer()
             if c.isRunning, let plan = c.plan, model.presentation != .idle {
                 Text("\(min(c.currentStepIndex + 1, plan.steps.count))/\(plan.steps.count)")
                     .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundStyle(BK.Notch.secondary)
+            } else if let wingJob {
+                NotchJobWing(job: wingJob, showCount: model.isExpanded)
             } else if model.presentation == .hover {
                 BKKeyCap(text: model.settings.settings.hotkeys.open.display, onDark: true)
             }
@@ -170,6 +177,10 @@ struct NotchInputView: View {
             .padding(.leading, 14).padding(.trailing, 7).padding(.vertical, 7)
             .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(BK.Notch.field))
             .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(BK.Notch.border))
+
+            if let job = model.pillJob {
+                NotchJobRow(model: model, job: job, pill: true)
+            }
 
             HStack(spacing: 6) {
                 ForEach(recents.prefix(3)) { r in
@@ -249,9 +260,12 @@ struct NotchDetailView: View {
 
     var body: some View {
         let c = model.controller
+        // With no quick task to show, the detail view is the background jobs list.
+        let showTask = c.isRunning || (!model.jobsDetailOpen && (c.plan != nil || !c.activity.isEmpty))
+        let hasJobs = !model.jobs.unfinishedJobs.isEmpty
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text(model.historyOpen ? "Recent tasks" : (c.instruction.isEmpty ? "Activity" : c.instruction))
+                Text(model.historyOpen ? "Recent tasks" : (!showTask ? "Background jobs" : (c.instruction.isEmpty ? "Activity" : c.instruction)))
                     .font(.system(size: 13, weight: .semibold)).foregroundStyle(BK.Notch.text).lineLimit(2)
                 Spacer()
                 if c.isRunning {
@@ -261,12 +275,15 @@ struct NotchDetailView: View {
                 BKIconButton(systemName: "chevron.up", help: "Collapse") {
                     model.detailOpen = false
                     model.historyOpen = false
+                    model.jobsDetailOpen = false
                     if !c.isRunning && !model.resultVisible { model.inputOpen = false }
                     model.recompute()
                 }
             }
             if model.historyOpen {
                 historyList
+            } else if !showTask {
+                NotchJobsSection(model: model, compact: false)
             } else {
                 HStack(alignment: .top, spacing: 16) {
                     if let plan = c.plan {
@@ -280,6 +297,10 @@ struct NotchDetailView: View {
                         }
                         .onChange(of: c.activity.count) { _, _ in withAnimation { proxy.scrollTo("end") } }
                     }
+                }
+                if hasJobs {
+                    Rectangle().fill(BK.Notch.border).frame(height: 1)
+                    NotchJobsSection(model: model, compact: true)
                 }
             }
         }
@@ -332,8 +353,10 @@ struct NotchApprovalView: View {
     @Bindable var model: NotchModel
 
     var body: some View {
-        let c = model.controller
-        if let req = c.pendingApproval {
+        // The quick task's approval, or a background job's (answered through JobCenter).
+        if let approval = model.activeApproval {
+            let req = approval.request
+            let job = approval.jobID.flatMap { model.jobs.job($0) }
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 10) {
                     let chip = BK.Tone.warning.chip(dark: true)
@@ -347,19 +370,26 @@ struct NotchApprovalView: View {
                 }
                 Text(req.title).font(.system(size: 14, weight: .medium)).foregroundStyle(BK.Notch.text).lineLimit(2)
                 HStack(spacing: 6) {
+                    if let job { BKBadge(text: Self.short(job.title), tone: .accent, icon: "square.stack.3d.up.fill") }
                     if let app = req.appName { BKBadge(text: app, tone: .info) }
-                    ForEach(req.reasons.prefix(3), id: \.self) { BKBadge(text: $0, tone: .warning) }
+                    ForEach(req.reasons.prefix(job == nil ? 3 : 2), id: \.self) { BKBadge(text: Self.short($0), tone: .warning) }
                 }
                 Text(req.detail).font(.system(size: 11.5)).foregroundStyle(BK.Notch.secondary).lineLimit(3)
                 HStack {
-                    Button("Stop task") { c.respondToApproval(.stop) }.buttonStyle(BKButtonStyle(kind: .ghost, compact: true, onDark: true))
+                    Button(approval.jobID == nil ? "Stop task" : "Stop job") { model.respondToApproval(.stop) }
+                        .buttonStyle(BKButtonStyle(kind: .ghost, compact: true, onDark: true))
                     Spacer()
-                    Button("Reject") { c.respondToApproval(.reject) }.buttonStyle(BKButtonStyle(kind: .secondary, compact: false, onDark: true))
-                    Button("Approve") { c.respondToApproval(.approve) }.buttonStyle(BKButtonStyle(kind: .primary))
+                    Button("Reject") { model.respondToApproval(.reject) }.buttonStyle(BKButtonStyle(kind: .secondary, compact: false, onDark: true))
+                    Button("Approve") { model.respondToApproval(.approve) }.buttonStyle(BKButtonStyle(kind: .primary))
                 }
             }
             .padding(.top, 8)
         }
+    }
+
+    /// Badges never wrap (they're fixed-size), so long job titles and reasons are cut.
+    static func short(_ s: String, max: Int = 36) -> String {
+        s.count > max ? String(s.prefix(max - 1)) + "…" : s
     }
 }
 

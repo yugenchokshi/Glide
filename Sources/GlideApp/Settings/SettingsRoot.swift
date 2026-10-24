@@ -5,7 +5,7 @@ import AutomationKit
 import ServiceManagement
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case general, providers, models, integrations, permissions, safety, shortcuts, skills, history, about
+    case general, providers, models, integrations, browser, speed, jobs, permissions, safety, shortcuts, skills, history, about
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -13,6 +13,9 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .providers: return "AI Providers"
         case .models: return "Models"
         case .integrations: return "Integrations"
+        case .browser: return "Browser"
+        case .speed: return "Speed & Commands"
+        case .jobs: return "Jobs"
         case .permissions: return "Permissions"
         case .safety: return "Safety"
         case .shortcuts: return "Shortcuts"
@@ -27,6 +30,9 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .providers: return "key"
         case .models: return "cpu"
         case .integrations: return "square.grid.2x2"
+        case .browser: return "globe"
+        case .speed: return "bolt"
+        case .jobs: return "square.stack.3d.up"
         case .permissions: return "lock.shield"
         case .safety: return "hand.raised"
         case .shortcuts: return "command"
@@ -38,8 +44,8 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 
     /// Sidebar groups, as in BoardUI's settings modal.
     static let groups: [(String, [SettingsSection])] = [
-        ("Settings", [.general, .providers, .models, .integrations]),
-        ("Agent", [.permissions, .safety, .shortcuts, .skills]),
+        ("Settings", [.general, .providers, .models, .integrations, .browser]),
+        ("Agent", [.speed, .jobs, .permissions, .safety, .shortcuts, .skills]),
         ("Data", [.history, .about]),
     ]
 }
@@ -48,6 +54,23 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 @Observable
 final class SettingsNavigation {
     var selection: SettingsSection = .general
+    /// Job shown in Settings › Jobs (nil: the list).
+    var selectedJobID: String?
+
+    /// Sidebar navigation: picking Jobs again returns from a job's detail to the list.
+    func select(_ section: SettingsSection) {
+        if section == .jobs { selectedJobID = nil }
+        selection = section
+    }
+
+    /// Opens Settings › Jobs on one job.
+    func showJob(_ id: String) {
+        selection = .jobs
+        selectedJobID = id
+    }
+
+    /// Identity of the visible page, so the scroll position resets between pages.
+    var pageID: String { selection == .jobs ? "jobs/\(selectedJobID ?? "")" : selection.rawValue }
 }
 
 struct SettingsRootView: View {
@@ -55,6 +78,20 @@ struct SettingsRootView: View {
     let store: SettingsStore
     var onHotkeysChanged: () -> Void
     var hotkeyConflicts: () -> [HotkeyManager.Action: String]
+    let jobs: any JobsSource
+    /// Snapshot hook: fixed browser status instead of polling the bridge.
+    var browserPreview: BrowserSettingsPreview?
+
+    init(nav: SettingsNavigation, store: SettingsStore, onHotkeysChanged: @escaping () -> Void,
+         hotkeyConflicts: @escaping () -> [HotkeyManager.Action: String], jobs: (any JobsSource)? = nil,
+         browserPreview: BrowserSettingsPreview? = nil) {
+        self.nav = nav
+        self.store = store
+        self.onHotkeysChanged = onHotkeysChanged
+        self.hotkeyConflicts = hotkeyConflicts
+        self.jobs = jobs ?? JobCenter.shared
+        self.browserPreview = browserPreview
+    }
 
     var body: some View {
         SettingsPageFrame(nav: nav) { page }
@@ -67,6 +104,9 @@ struct SettingsRootView: View {
         case .providers: ProvidersSettingsView(store: store)
         case .models: ModelsSettingsView(store: store)
         case .integrations: IntegrationsSettingsView(store: store)
+        case .browser: BrowserSettingsView(store: store, preview: browserPreview)
+        case .speed: SpeedSettingsView(store: store)
+        case .jobs: JobsSettingsView(store: store, nav: nav, jobs: jobs)
         case .permissions: PermissionsSettingsView()
         case .safety: SafetySettingsView(store: store)
         case .shortcuts: ShortcutsSettingsView(store: store, onChange: onHotkeysChanged, conflicts: hotkeyConflicts)
@@ -96,7 +136,7 @@ struct SettingsPageFrame<Page: View>: View {
                 }
                 .scrollContentBackground(.hidden)
                 .background(t.canvas)
-                .id(nav.selection)
+                .id(nav.pageID)
             }
             .ignoresSafeArea()
         }
@@ -119,7 +159,7 @@ struct SettingsSidebar: View {
                     Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(t.secondary)
                         .padding(.horizontal, 10).padding(.top, 10).padding(.bottom, 4)
                     ForEach(sections) { s in
-                        SidebarItem(section: s, selected: nav.selection == s) { nav.selection = s }
+                        SidebarItem(section: s, selected: nav.selection == s) { nav.select(s) }
                     }
                 }
                 Spacer()
