@@ -25,6 +25,20 @@ struct PathPattern: Sendable, Hashable {
         case name([Token])
         /// zsh's `**/`: zero or more folders.
         case anyDepth
+
+        /// The name when it's all literal characters (`com.vendor.app`), else nil.
+        var literalName: String? {
+            guard case .name(let t) = self else { return nil }
+            var s = ""
+            for tok in t { guard case .char(let ch) = tok else { return nil }; s.append(ch) }
+            return s
+        }
+
+        /// A name component with at least one wildcard (`*`, `?`, a set, or run-time text).
+        var isWildcard: Bool {
+            guard case .name(let t) = self else { return false }
+            return t.contains { if case .char = $0 { return false }; return true }
+        }
     }
 
     /// From the root folder down; never contains `.` or `..`.

@@ -54,6 +54,14 @@ public enum CommandSafety {
         if parse.tooComplex { checker.acc.raise(.high, "nested too deeply to check") }
         checker.check(parse.list, depth: 0)
         checker.finish()
+        // The concealed-clipboard guard runs once before launch. A command that sleeps or loops
+        // could read a password the user copies while it runs, so a clipboard read after a delay
+        // or in a loop needs approval (the before-launch guard can't catch that).
+        if checker.readsClipboard {
+            let loopOrDelay = checker.programs.contains("sleep")
+                || trimmed.range(of: #"(?:^|[;&|(){}\s])(?:while|until|for|foreach|repeat|select)(?:$|[;&|(){}\s])"#, options: .regularExpression) != nil
+            if loopOrDelay { checker.acc.raise(.high, "reads the clipboard after a delay or in a loop") }
+        }
         let verdict = ToolVerdict(risk: checker.acc.risk, reasons: checker.acc.reasons, blocked: checker.acc.blocked, summary: summary)
         return (verdict, checker.programs, checker.readsClipboard)
     }
@@ -124,6 +132,9 @@ struct ShellRiskChecker {
     var oldCwd: String?
     /// Set when `cd` went to a glob or a partly run-time path: the folders it may be in.
     var cwdPatterns: [PathPattern]?
+    /// Extra folders a relative path may be under because a `cd` might not have taken effect (a
+    /// missing folder, a file, a `cd` inside a subshell or pipeline): the folder before the cd.
+    var cwdAlternates: [String] = []
     /// Texts of words with unquoted glob characters (see `ShellWord.globbed`).
     var globbedTexts: Set<String> = []
     /// Variables the line set to fixed text (`d=~/.ssh`), so `$d/x` can be judged as a path.
@@ -135,6 +146,18 @@ struct ShellRiskChecker {
     /// arithmetic, which runs such text through array subscripts (see `finish`).
     var literalCode: [String] = []
     var arithmetic = false
+    /// The raw text of every arithmetic expression the line evaluates (`(( x ))`, `$(( … ))`,
+    /// `let …`, `[[ … -eq … ]]`): scanned to see whether a run-time variable is read inside.
+    var arithmeticExprs: [String] = []
+    /// A command substitution feeds an arithmetic evaluation (`(( $(cmd) ))`), and whether that
+    /// substitution downloads — zsh and bash run the substitution and then evaluate its output
+    /// as an arithmetic expression, where `a[$(cmd2)]` runs another command.
+    var arithmeticHasSubstitution = false
+    var arithmeticSubDownloads = false
+    /// Variables whose value came from command output (`x=$(cmd)`), `read`, or `printf -v` —
+    /// only known at run time — and the subset filled from a download.
+    var runtimeVars: Set<String> = []
+    var downloadVars: Set<String> = []
     /// The line re-evaluates a value as shell text (`${(e)x}`, `${x@P}`).
     var evaluatesStrings = false
     /// Some command may read the clipboard (`pbpaste`, `osascript -e 'the clipboard'`).
@@ -143,6 +166,12 @@ struct ShellRiskChecker {
     var mentionsClipboard = false
 
     static let maxDepth = 24
+
+    /// Interpreters that can read the clipboard through a scripting bridge (AppleScript, the
+    /// Cocoa bridge, `NSPasteboard`…), so running one is enough reason to re-check for a
+    /// concealed item even when the script text doesn't obviously mention the clipboard.
+    static let scriptInterpreters: Set<String> = ["osascript", "python", "python2", "python3", "perl", "ruby", "node", "nodejs", "php", "lua", "swift",
+                                                   "deno", "bun", "pwsh", "tclsh", "rscript"]
 
     static let downloadIntoShell = "Glide won't run downloaded content straight in a shell or interpreter. Download it, read it, then run it as a separate step."
 
@@ -207,6 +236,17 @@ struct ShellRiskChecker {
             expansionRules(w.text, depth: depth)
         }
         if cmd.arithmetic { arithmetic = true }
+        // Arithmetic evaluation over run-time content: collect the expression text (for the
+        // variable-reference check in `finish`) and note a real command substitution feeding it.
+        let arithHere = cmd.arithmetic || cmd.words.contains { Self.arithmeticText($0.text) }
+        if arithHere {
+            if let t = cmd.arithmeticText { arithmeticExprs.append(t) }
+            for w in cmd.words where Self.arithmeticText(w.text) { arithmeticExprs.append(w.text) }
+            if cmd.words.contains(where: { !$0.substitutions.isEmpty }) {
+                arithmeticHasSubstitution = true
+                if subsDownload { arithmeticSubDownloads = true }
+            }
+        }
         if let h = cmd.heredoc, Self.mentionsClipboard(h) { mentionsClipboard = true }
         for g in cmd.groups { check(g, depth: depth + 1) }
 
@@ -229,7 +269,9 @@ struct ShellRiskChecker {
         stripping: while let first = words.first {
             // Assignment values that are command substitutions were already checked above.
             if Self.isAssignment(first.text) {
-                assignment(first.text, persists: onlyAssignments, depth: depth)
+                assignment(first.text, persists: onlyAssignments, depth: depth,
+                           valueIsCommandOutput: !first.substitutions.isEmpty,
+                           valueSubDownloads: first.substitutions.contains(where: listDownloads))
                 words.removeFirst()
                 continue
             }
@@ -241,14 +283,22 @@ struct ShellRiskChecker {
                 // A condition; anything after its closing bracket (zsh short forms) still runs.
                 let close = first.text == "[[" ? "]]" : "]"
                 guard let end = words.firstIndex(where: { $0.text == close && !$0.quoted }) else { return }
-                if words[1..<end].contains(where: { Self.arithmeticTests.contains($0.text) }) { arithmetic = true }
+                if words[1..<end].contains(where: { Self.arithmeticTests.contains($0.text) }) {
+                    arithmetic = true
+                    arithmeticExprs += words[1..<end].map(\.text)
+                }
                 words.removeFirst(end + 1)
             case "function", "repeat":
                 // `function name { … }`, `repeat 3 cmd`: the body follows the name/count.
                 words.removeFirst(min(2, words.count))
             case "for", "foreach", "select":
-                // The loop variable takes each listed name, so the list counts as paths read.
-                if words.count > 1 { vars[words[1].text] = nil }
+                // The loop variable takes each listed name. It's an assignment of run-time text,
+                // so looping over a risky name (`for GIT_SSH_COMMAND in …; export …`) is judged
+                // like one; and the list counts as paths read.
+                if words.count > 1 {
+                    envAssignment(words[1].text, value: nil, appends: false, depth: depth)
+                    vars[words[1].text] = nil
+                }
                 for w in words.dropFirst(2) where w.text != "in" && w.text != "do" { readCheck(w.text) }
                 // A plain loop header has nothing else; zsh's short form `for f (*.txt) cmd`
                 // puts the list in parentheses and the command right after.
@@ -369,7 +419,13 @@ struct ShellRiskChecker {
                         checkText(([s] + w).joined(separator: " "), depth: ctx.depth + 1)
                         return nil
                     }
-                    if f == "-u" || f == "-P" || f == "-C" { w.removeFirst(); if !w.isEmpty { w.removeFirst() }; continue }
+                    if f == "-P" {
+                        // `env -P dir cmd` runs cmd from `dir`, like putting it on PATH.
+                        w.removeFirst()
+                        if !w.isEmpty { envAssignment("PATH", value: w.removeFirst(), appends: false, depth: ctx.depth) }
+                        continue
+                    }
+                    if f == "-u" || f == "-C" { w.removeFirst(); if !w.isEmpty { w.removeFirst() }; continue }
                     if Self.isAssignment(f) { assignment(f, persists: false, depth: ctx.depth) }
                     if f.hasPrefix("-") || Self.isAssignment(f) { w.removeFirst(); continue }
                     break
@@ -391,6 +447,54 @@ struct ShellRiskChecker {
                 if w.isEmpty { return nil }
                 checkText(w.joined(separator: " "), depth: ctx.depth + 1)
                 return nil
+            case "setsid":
+                w.removeFirst()
+                while let f = w.first, f.hasPrefix("-") { w.removeFirst() }
+            case "taskpolicy":
+                // `taskpolicy [opts] program args`: options, then the program and its arguments.
+                w.removeFirst()
+                while let f = w.first, f.hasPrefix("-") {
+                    w.removeFirst()
+                    if ["-t", "-l", "-g", "-d", "-c", "-p", "-e", "-s", "-a", "-i"].contains(f), !w.isEmpty { w.removeFirst() }
+                }
+                if w.isEmpty { return nil } // -p pid: acts on a process, runs nothing
+            case "sandbox-exec":
+                // `sandbox-exec -f profile|-n name|-p string [-D key=val] program args`.
+                w.removeFirst()
+                while let f = w.first, f.hasPrefix("-") {
+                    w.removeFirst()
+                    if ["-f", "-n", "-p"].contains(f), !w.isEmpty { w.removeFirst() }
+                }
+                if w.isEmpty { return nil }
+            case "zpty":
+                // zsh's zpty module: `zpty name command args` starts a program in a pty. The
+                // read/write/list/delete forms (-r -w -t -d -L) run nothing.
+                w.removeFirst()
+                var runsCommand = true
+                while let f = w.first, f.hasPrefix("-") {
+                    if (Self.shortCluster(f)?.contains(where: { "rwtdL".contains($0) }) ?? false) { runsCommand = false }
+                    w.removeFirst()
+                }
+                guard runsCommand, !w.isEmpty else { return nil }
+                w.removeFirst() // the pty name
+                if w.isEmpty { return nil }
+            case "script":
+                // BSD `script [opts] [file [command …]]`; util-linux `script -c command file`.
+                w.removeFirst()
+                var handled = false
+                while let f = w.first, f.hasPrefix("-"), f != "-" {
+                    w.removeFirst()
+                    if f == "-c" {
+                        checkText(w.first ?? "", depth: ctx.depth + 1)
+                        handled = true
+                        break
+                    }
+                    if ["-F", "-t", "-m", "-o", "-T", "-B", "-I", "-O"].contains(f), !w.isEmpty { w.removeFirst() }
+                }
+                if handled { return nil }
+                if w.isEmpty { return nil }
+                w.removeFirst() // the typescript file
+                if w.isEmpty { return nil } // records an interactive shell; nothing to check
             default:
                 return w
             }
@@ -425,12 +529,29 @@ struct ShellRiskChecker {
     mutating func finish() {
         // A script that mentions the clipboard (`osascript -e 'the clipboard'`, `python3 -c
         // '…NSPasteboard…'`) reads it; a commit message that mentions it doesn't.
-        let scripting: Set<String> = ["osascript", "python", "python2", "python3", "perl", "ruby", "node", "nodejs", "php", "lua", "swift",
-                                      "deno", "bun", "pwsh", "tclsh", "rscript"]
-        if mentionsClipboard, !programs.isDisjoint(with: scripting) { readsClipboard = true }
-        guard arithmetic || evaluatesStrings, !literalCode.isEmpty else { return }
-        acc.raise(.high, "evaluates command text stored in a string\(arithmetic ? " (arithmetic)" : "")")
-        for code in literalCode { checkText(code, depth: 1) }
+        if mentionsClipboard, !programs.isDisjoint(with: Self.scriptInterpreters) { readsClipboard = true }
+        // Arithmetic (or `${(e)…}`/`${…@P}`) that evaluates command text quoted on the line.
+        if (arithmetic || evaluatesStrings), !literalCode.isEmpty {
+            acc.raise(.high, "evaluates command text stored in a string\(arithmetic ? " (arithmetic)" : "")")
+            for code in literalCode { checkText(code, depth: 1) }
+        }
+        // Arithmetic over run-time content: a command substitution feeding it, or a variable set
+        // from command output / read and then read in an arithmetic expression. zsh (and bash,
+        // once the variable is used) evaluate that text, so `a[$(cmd)]` in it runs `cmd`.
+        guard arithmetic else { return }
+        let runtimeRef = runtimeVars.first { name in arithmeticExprs.contains { Self.readsVariable($0, name) } }
+        guard arithmeticHasSubstitution || runtimeRef != nil else { return }
+        if arithmeticSubDownloads || (runtimeRef.map { downloadVars.contains($0) } ?? false) {
+            acc.block(Self.downloadIntoShell, reason: "evaluates downloaded content as arithmetic")
+        } else {
+            acc.raise(.high, "evaluates run-time text as arithmetic (it can run embedded commands)")
+        }
+    }
+
+    /// Whether an arithmetic expression reads variable `name` (bare, `$name` or `${name}`).
+    static func readsVariable(_ expr: String, _ name: String) -> Bool {
+        let n = NSRegularExpression.escapedPattern(for: name)
+        return expr.range(of: "(^|[^A-Za-z0-9_])\\$?\\{?" + n + "([^A-Za-z0-9_]|$)", options: .regularExpression) != nil
     }
 
     /// Parameter expansions that assign or evaluate: `${PATH:=/tmp/x}` and zsh's
@@ -439,7 +560,8 @@ struct ShellRiskChecker {
     mutating func expansionRules(_ text: String, depth: Int) {
         guard text.contains("${") else { return }
         let ns = text as NSString
-        if let re = try? NSRegularExpression(pattern: #"\$\{([A-Za-z_][A-Za-z0-9_]*):{0,2}=([^}]*)\}"#) {
+        // An optional `(flags)` group precedes the name in zsh (`${(A)path::=/tmp}`).
+        if let re = try? NSRegularExpression(pattern: #"\$\{(?:\([^)]*\))?([A-Za-z_][A-Za-z0-9_]*):{0,2}=([^}]*)\}"#) {
             for m in re.matches(in: text, range: NSRange(location: 0, length: ns.length)) where m.numberOfRanges > 2 {
                 envAssignment(ns.substring(with: m.range(at: 1)), value: ns.substring(with: m.range(at: 2)), appends: false, depth: depth)
             }
@@ -863,8 +985,9 @@ struct ShellRiskChecker {
             }
         case "let":
             arithmetic = true
+            arithmeticExprs += a
         case "test":
-            if a.contains(where: { Self.arithmeticTests.contains($0) }) { arithmetic = true }
+            if a.contains(where: { Self.arithmeticTests.contains($0) }) { arithmetic = true; arithmeticExprs += a }
         case "unset":
             if a.contains(where: { $0.contains("[") }) { arithmetic = true }
         case "return", "exit", "shift", "break", "continue":
@@ -882,6 +1005,10 @@ struct ShellRiskChecker {
         case "cd", "pushd":
             let target = Self.operands(a).first
             let previous = cwd
+            // A `cd` can silently not take effect (the folder is missing or is a file, or the
+            // `cd` is in a subshell or pipeline), leaving the shell where it was. So a relative
+            // path after a `cd` is judged against the previous folder as well as the new one.
+            cwdAlternates = previous.map { [$0] } ?? []
             if target == "-" {
                 cwd = oldCwd
                 cwdPatterns = nil
@@ -889,7 +1016,7 @@ struct ShellRiskChecker {
                 switch pathForm(t) {
                 case .literal(let s): cwd = resolve(s); cwdPatterns = nil
                 case .patterns(let ps): cwd = nil; cwdPatterns = ps
-                case .unknown: cwd = nil; cwdPatterns = nil
+                case .unknown: cwd = nil; cwdPatterns = previous.map { [PathPattern(components: PathPattern.literalComponents($0), dynamic: false)] }
                 }
             } else {
                 cwd = home
@@ -899,6 +1026,7 @@ struct ShellRiskChecker {
         case "popd":
             cwd = nil
             cwdPatterns = nil
+            cwdAlternates = oldCwd.map { [$0] } ?? []
 
         default:
             acc.raise(.medium)
@@ -1199,6 +1327,11 @@ struct ShellRiskChecker {
                 }
             } else if x.contains("[") {
                 arithmetic = true
+            } else if !x.hasPrefix("-") && !x.hasPrefix("+"), Self.commandVariables.contains(x) || Self.codeVariables.contains(x)
+                        || Self.codeVariablePrefixes.contains(where: { x.hasPrefix($0) }) {
+                // `export GIT_SSH_COMMAND` (value set elsewhere on the line, e.g. by a loop):
+                // exporting a code-running variable is judged like assigning it.
+                envAssignment(x, value: nil, appends: false, depth: ctx.depth)
             }
         }
         if prog == "integer" || prog == "float" || flags.contains("i") || flags.contains("F") || flags.contains("E") { arithmetic = true }
@@ -1693,6 +1826,19 @@ struct ShellRiskChecker {
             acc.raise(.high, "runs a program set on the command line (git \(sub) \(option))")
             if let value, !value.isEmpty { checkText(value, depth: ctx.depth + 1) }
         }
+        // Git's parse-options accepts any unambiguous prefix of a long option, so `--upl` is
+        // `--upload-pack`. Map an abbreviation back to the dangerous option it stands for.
+        let dangerousLong = ["upload-pack", "receive-pack", "exec", "extcmd", "open-files-in-pager", "config", "template"]
+        func canonicalLong(_ name: String) -> String? {
+            guard name.hasPrefix("--"), name.count > 2 else { return nil }
+            let bare = String(name.dropFirst(2))
+            if dangerousLong.contains(bare) { return bare }
+            // A prefix of at least three characters that begins one of them (git needs ≥1 but
+            // may be ambiguous; over-matching only asks for approval it would otherwise skip).
+            guard bare.count >= 3 else { return nil }
+            let hits = dangerousLong.filter { $0.hasPrefix(bare) }
+            return hits.first
+        }
         var idx = 0
         while idx < rest.count {
             let x = rest[idx]
@@ -1706,24 +1852,24 @@ struct ShellRiskChecker {
                 idx += 1
                 return rest[idx - 1]
             }
-            if ["--upload-pack", "--receive-pack", "--exec"].contains(name) {
-                runs(name, value())
-            } else if x == "-u", sub == "ls-remote" || sub == "clone" {
-                runs(x, value())
-            } else if x == "-x", sub == "rebase" || sub == "difftool" {
-                runs(x, value())
-            } else if name == "--extcmd", sub == "difftool" {
-                runs(name, value())
-            } else if sub == "grep", name == "--open-files-in-pager" {
-                runs(name, inline)
+            let canonical = canonicalLong(name)
+            if let canonical, ["upload-pack", "receive-pack", "exec", "extcmd"].contains(canonical) {
+                runs("--\(canonical)", value())
+            } else if x.hasPrefix("-u"), !x.hasPrefix("--"), sub == "ls-remote" || sub == "clone" {
+                // `-u <path>` or attached `-u<path>` names the upload-pack program.
+                runs("-u", x.count > 2 ? String(x.dropFirst(2)) : value())
+            } else if x.hasPrefix("-x"), !x.hasPrefix("--"), sub == "rebase" || sub == "difftool" {
+                runs("-x", x.count > 2 ? String(x.dropFirst(2)) : value())
+            } else if canonical == "open-files-in-pager", sub == "grep" {
+                runs("--open-files-in-pager", value())
             } else if sub == "grep", let cluster = Self.shortCluster(x),
                       let o = cluster.firstIndex(where: { $0 == "O" || "efABCm".contains($0) }), cluster[o] == "O" {
                 // -O takes its pager attached, also inside a cluster (`-nOless`), unless an
                 // option taking a value (`-e`, `-A`…) came first and the rest is that value.
                 runs("-O", String(cluster[cluster.index(after: o)...]))
-            } else if x == "-c" || name == "--config", sub == "clone" {
+            } else if (x == "-c" || canonical == "config"), sub == "clone" {
                 if let v = value() { gitConfigOverride(v, depth: ctx.depth) }
-            } else if name == "--template", sub == "clone" || sub == "init" {
+            } else if canonical == "template", sub == "clone" || sub == "init" {
                 _ = value()
                 acc.raise(.high, "installs git hooks from a template folder (git \(sub) --template)")
             }
@@ -1826,7 +1972,12 @@ struct ShellRiskChecker {
             // A variable could be anything, so it needs approval (rm is high) rather than a
             // block; a glob is matched against what it would really delete.
             for p in ps where !p.dynamic {
-                if mayBeProtectedFromDeletion(p) {
+                if isLibraryUninstaller(p) {
+                    // `rm -rf ~/Library/*/<bundle id>`: the usual uninstaller shape. The `*`
+                    // could be Keychains, but the literal leaf means it isn't wiping that
+                    // folder, so it needs approval rather than a block.
+                    acc.raise(.high, "deletes items inside ~/Library (\(raw))")
+                } else if mayBeProtectedFromDeletion(p) {
                     acc.block("Glide won't delete your Library or keychain folders.", reason: "deletes \(raw)")
                 } else if recursive, mayBeCriticalTree(p) {
                     acc.block("Glide won't recursively delete \(raw); it could match a system or account folder.", reason: "recursively deletes \(raw)")
@@ -1873,8 +2024,10 @@ struct ShellRiskChecker {
         let (s, valueGlob) = substituteVariablesForPath(raw)
         let glob = globbed ?? globbedTexts.contains(raw) || valueGlob
         let special = PathRules.isDirectoryStackTilde(s)
-        // A relative name after `cd` into a glob is under each folder that glob could be.
-        let relativeToPatterns = cwd == nil && cwdPatterns != nil && !s.hasPrefix("/") && !s.hasPrefix("~") && !s.hasPrefix("$")
+        // A relative name after `cd` into a glob, or after a `cd` that might not have taken
+        // effect, is under more than one folder, so it's matched as patterns rather than one path.
+        let relative = !s.hasPrefix("/") && !s.hasPrefix("~") && !s.hasPrefix("$")
+        let relativeToPatterns = relative && ((cwd == nil && cwdPatterns != nil) || !cwdAlternates.isEmpty)
         if !glob && !special && !Self.hasRunTimeParts(s) && !relativeToPatterns { return .literal(s) }
 
         var base: [[PathPattern.Component]]
@@ -1913,7 +2066,11 @@ struct ShellRiskChecker {
         }
         var out: [PathPattern] = []
         for b in base {
-            guard let ps = PathPattern.make(base: b, text: text, glob: glob, extendedGlob: extendedGlob) else { return .unknown }
+            guard let ps = PathPattern.make(base: b, text: text, glob: glob, extendedGlob: extendedGlob) else {
+                // Too many brace alternatives to enumerate: fail closed to a run-time pattern
+                // that could be anywhere, so secret and persistence roots still match.
+                return .patterns([PathPattern(components: [.anyDepth], dynamic: true)])
+            }
             out += ps
         }
         return .patterns(out)
@@ -1921,9 +2078,11 @@ struct ShellRiskChecker {
 
     /// The folder (or folders, after `cd` into a glob) relative paths start from.
     func currentFolders() -> [[PathPattern.Component]]? {
-        if let cwd { return [PathPattern.literalComponents(cwd)] }
-        if let cwdPatterns { return cwdPatterns.map(\.components) }
-        return nil
+        var out: [[PathPattern.Component]] = []
+        if let cwd { out.append(PathPattern.literalComponents(cwd)) }
+        else if let cwdPatterns { out += cwdPatterns.map(\.components) }
+        out += cwdAlternates.map { PathPattern.literalComponents($0) }
+        return out.isEmpty ? nil : out
     }
 
     /// `/`, top-level system folders, any home folder or volume, `~/Library`.
@@ -1939,11 +2098,24 @@ struct ShellRiskChecker {
             || p.mayReachInside("/Library/Keychains", dotGlob: dotGlob)
     }
 
+    /// `~/Library/<wildcard>/<…literal…>`: a wildcard folder under `~/Library` narrowed by a
+    /// later literal component (a vendor's bundle id), the shape an app uninstaller uses. It
+    /// isn't wiping ~/Library or the keychains, so it's approval-gated rather than blocked.
+    func isLibraryUninstaller(_ p: PathPattern) -> Bool {
+        let homeComps = PathPattern.literalComponents(home)
+        let comps = p.components
+        guard comps.count >= homeComps.count + 2 else { return false }
+        for i in homeComps.indices where comps[i] != homeComps[i] { return false }
+        let libIdx = homeComps.count
+        guard comps[libIdx].literalName == "library", comps[libIdx + 1].isWildcard else { return false }
+        return comps[(libIdx + 2)...].contains { !($0.literalName ?? "").isEmpty }
+    }
+
     // MARK: Variables
 
     /// Records a `NAME=value` word: risky environment variables raise the risk, and a fixed
     /// value is remembered when it lasts for the rest of the line (`persists`).
-    mutating func assignment(_ word: String, persists: Bool, depth: Int) {
+    mutating func assignment(_ word: String, persists: Bool, depth: Int, valueIsCommandOutput: Bool = false, valueSubDownloads: Bool = false) {
         guard let eq = word.firstIndex(of: "=") else { return }
         var name = String(word[..<eq])
         let value = String(word[word.index(after: eq)...])
@@ -1952,6 +2124,12 @@ struct ShellRiskChecker {
         if name.contains("[") { arithmetic = true }
         let base = String(name.prefix { $0 != "[" })
         envAssignment(base, value: value, appends: appends, depth: depth)
+        // A value taken from command output (`x=$(cmd)`) is only known at run time; remember it
+        // so arithmetic that later reads the variable is judged as evaluating that output.
+        if valueIsCommandOutput {
+            runtimeVars.insert(base)
+            if valueSubDownloads { downloadVars.insert(base) }
+        }
         guard persists else { return }
         // An assignment's value isn't globbed, so a `*` in it stays text (bash may glob it when
         // `$name` is used, which `substituteVariablesForPath` reports).
@@ -1969,6 +2147,8 @@ struct ShellRiskChecker {
         let name = String(raw.prefix { $0 != "[" && $0 != "?" })
         envAssignment(name, value: nil, appends: false, depth: ctx.depth)
         vars[name] = nil
+        // Input read from a file or standard input is run-time text, like command output.
+        runtimeVars.insert(name)
     }
 
     /// Environment variables that make programs run a command line they hold.
@@ -1984,6 +2164,7 @@ struct ShellRiskChecker {
         "PERL5OPT", "PERL5LIB", "PERLLIB", "PERL5DB", "PYTHONSTARTUP", "PYTHONPATH", "PYTHONHOME", "NODE_OPTIONS", "NODE_PATH",
         "RUBYOPT", "RUBYLIB", "LUA_INIT", "LUA_PATH", "LUA_CPATH", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS", "PHPRC",
         "PHP_INI_SCAN_DIR", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_PARAMETERS",
+        "GIT_DIR", "GIT_COMMON_DIR", "XDG_CONFIG_HOME",
     ]
     static let codeVariablePrefixes = ["DYLD_", "LD_", "GIT_CONFIG_", "LUA_INIT_"]
 
@@ -2029,8 +2210,11 @@ struct ShellRiskChecker {
                 acc.raise(.high, "sets \(name) to a value only known at run time")
                 return
             }
-            let entries = value.hasPrefix("(") ? value.dropFirst().dropLast(value.hasSuffix(")") ? 1 : 0).split(whereSeparator: \.isWhitespace).map(String.init)
+            var entries = value.hasPrefix("(") ? value.dropFirst().dropLast(value.hasSuffix(")") ? 1 : 0).split(whereSeparator: \.isWhitespace).map(String.init)
                                               : value.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+            // `PATH+=:/dir` appends `:/dir`; the leading separator isn't an empty "current
+            // folder" entry, just the join between the old value and the new one.
+            if appends, entries.first == "" { entries.removeFirst() }
             for e in entries where !trustedSearchEntry(e, name: name) {
                 let shown = e.isEmpty ? "the current folder" : PathRules.display(substituteVariables(e), home: home)
                 acc.raise(.high, "puts \(shown) on \(name.uppercased()), so commands may run programs from there")
@@ -2066,6 +2250,10 @@ struct ShellRiskChecker {
         var out = ""
         var glob = false
         var i = 0
+        func addValue(_ value: String) {
+            out += value
+            if value.contains(where: { "*?[".contains($0) }) { glob = true }
+        }
         while i < c.count {
             if c[i] == "$", i + 1 < c.count {
                 var j = i + 1
@@ -2074,11 +2262,32 @@ struct ShellRiskChecker {
                 let start = j
                 while j < c.count, c[j].isLetter || c[j].isNumber || c[j] == "_" { j += 1 }
                 let name = String(c[start..<j])
-                let closes = !braced || (j < c.count && c[j] == "}")
-                if !name.isEmpty, closes, !(c[start].isNumber), let value = known[name] {
-                    out += value
-                    if value.contains(where: { "*?[".contains($0) }) { glob = true }
-                    i = braced ? j + 1 : j
+                if !name.isEmpty, start < c.count, !(c[start].isNumber), let value = known[name] {
+                    if braced {
+                        // `${HOME}` plain, or `${HOME:-x}`, `${HOME:h}`, `${HOME%foo}`: the value
+                        // is still HOME-derived, so substitute it and drop the modifier (the real
+                        // folder may differ, but over-estimating which folder is the safe side).
+                        var depth = 1
+                        var k = j
+                        while k < c.count, depth > 0 {
+                            if c[k] == "{" { depth += 1 } else if c[k] == "}" { depth -= 1 }
+                            k += 1
+                        }
+                        addValue(value)
+                        i = k
+                        continue
+                    }
+                    addValue(value)
+                    i = j
+                    // `$HOME[1,-1]` (substring) or `$HOME:h` (modifier): still HOME-derived.
+                    if i < c.count, c[i] == "[" {
+                        var depth = 0
+                        while i < c.count { if c[i] == "[" { depth += 1 } else if c[i] == "]" { depth -= 1; i += 1; if depth == 0 { break }; continue }; i += 1 }
+                    }
+                    while i + 1 < c.count, c[i] == ":", c[i + 1].isLetter {
+                        i += 1
+                        while i < c.count, c[i].isLetter { i += 1 }
+                    }
                     continue
                 }
             }

@@ -53,6 +53,9 @@ struct ShellCommand: Sendable, Hashable {
     /// The command is `(( … ))`, which evaluates arithmetic (and, through array subscripts,
     /// can run command text stored in a variable).
     var arithmetic = false
+    /// The raw expression text of a `(( … ))` command, so the checker can see which variables
+    /// it reads (`(( x ))` reads `x`, whose value zsh re-evaluates as an arithmetic expression).
+    var arithmeticText: String?
 
     var isEmpty: Bool { words.isEmpty && redirects.isEmpty && groups.isEmpty && hereString == nil && !arithmetic }
 }
@@ -227,6 +230,7 @@ final class ShellParser {
                     let inner = readBalanced(open: "(", close: ")")
                     if peek() == ")" { i += 1 }
                     cmd.arithmetic = true
+                    cmd.arithmeticText = inner
                     let subs = scanSubstitutions(inner)
                     if !subs.isEmpty { cmd.words.append(ShellWord(text: "", substitutions: subs)) }
                     continue
