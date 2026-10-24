@@ -16,6 +16,15 @@ const MAX_BACKOFF_MS = 30000;
 const PROBE_TIMEOUT_MS = 3000;
 const HELLO_TIMEOUT_MS = 15000;
 const MAX_GLIDE_TABS = 500;
+// chrome.tabs.update/create reply as soon as a navigation starts; Glide waits (at most this
+// long) for it to commit so it never inspects the page being left.
+const NAVIGATION_COMMIT_TIMEOUT_MS = 15000;
+// Glide is "driving" a tab while one of its commands runs there and for a moment after: an
+// action's dialog or popup can arrive between two of the driver's quick polls.
+const ACTIVE_GRACE_MS = 2000;
+// The debugger lets go of tabs Glide didn't open after this long without a command, so it
+// doesn't stay attached to the user's own tabs (and Chrome's debugging bar goes away).
+const IDLE_DETACH_MS = 45000;
 
 // CDP methods refused even though chrome.debugger allows them: each could read or erase data
 // from every site at once, or turn off certificate checks. Glide's browser tools never need them.
@@ -42,6 +51,10 @@ let keepaliveTimer = null;
 let lastStatus = { state: "starting", port: null, chromeVersion: null };
 const attached = new Set(); // tab ids our debugger is attached to
 const attaching = new Map(); // tab id → in-flight attach promise
+const activity = new Map(); // tab id → {inflight, lastAt}: Glide's commands there
+const idleTimers = new Map(); // tab id → timer that detaches a tab Glide didn't open
+const openDialogs = new Map(); // tab id → dialog the page shows that's left for the user
+const navigationWatchers = new Set(); // see watchNavigation
 
 // ---- Event listeners (registered synchronously, as MV3 requires) ----
 
@@ -81,29 +94,33 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   onDebuggerDetach(source, reason).catch((e) => console.warn("Glide: detach handling failed", e));
 });
 
-// JavaScript dialogs freeze the page's scripts until answered, which would stall every
-// automation command on the tab. Answer them the way Glide's own Chrome does — dismiss alerts,
-// let navigation leave the page, decline confirm()/prompt() — and tell Glide what happened.
 chrome.debugger.onEvent.addListener((source, method, params) => {
-  if (method !== "Page.javascriptDialogOpening" || typeof source.tabId !== "number") return;
-  const type = (params && params.type) || "alert";
-  const accept = type === "alert" || type === "beforeunload";
-  chrome.debugger
-    .sendCommand({ tabId: source.tabId }, "Page.handleJavaScriptDialog", { accept })
-    .catch((e) => console.warn("Glide: couldn't answer a dialog", e));
-  if (session && session.verified) {
-    send(session, {
-      event: "dialog",
-      tabId: source.tabId,
-      type,
-      message: String((params && params.message) || "").slice(0, 500),
-      accepted: accept,
-    });
+  if (typeof source.tabId !== "number") return;
+  if (method === "Page.javascriptDialogOpening") {
+    onDialogOpening(source.tabId, params || {}).catch((e) => console.warn("Glide: dialog handling failed", e));
+  } else if (method === "Page.javascriptDialogClosed") {
+    openDialogs.delete(source.tabId);
   }
 });
 
+// A tab opened from one of Glide's tabs while Glide is working in it (a link with
+// target=_blank, a script popup) is Glide's too. A tab opened any other way is the user's.
+chrome.tabs.onCreated.addListener((tab) => {
+  const opener = tab && tab.openerTabId;
+  if (typeof tab.id !== "number" || typeof opener !== "number" || !isDriving(opener)) return;
+  loadGlideTabs()
+    .then((glideTabs) => (glideTabs.has(opener) ? rememberGlideTab(tab.id) : undefined))
+    .catch(() => {});
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  for (const watcher of [...navigationWatchers]) watcher.update(tabId, changeInfo || {}, tab || {});
+});
+
 chrome.tabs.onRemoved.addListener((tabId) => {
-  attached.delete(tabId);
+  forgetAttachment(tabId);
+  activity.delete(tabId);
+  for (const watcher of [...navigationWatchers]) if (watcher.tabId === tabId) watcher.finish();
   forgetGlideTab(tabId).catch(() => {});
 });
 
@@ -361,16 +378,27 @@ async function createTab(params) {
   const url = typeof params.url === "string" && params.url.trim() ? params.url.trim() : "about:blank";
   assertAllowed(url);
   const active = params.active === true;
+  // A new tab starts on an empty page and only then loads the address.
+  const watcher = url === "about:blank" ? null : watchNavigation("about:blank");
   let tab;
   try {
-    tab = await chrome.tabs.create({ url, active });
-  } catch (error) {
-    // Chrome can run with no window open on macOS: open one for the tab.
-    const win = await chrome.windows.create({ url, focused: active });
-    tab = win && win.tabs && win.tabs[0];
-    if (!tab) throw bridgeError("error", `Chrome couldn't open a tab (${messageOf(error)}).`);
+    try {
+      tab = await chrome.tabs.create({ url, active });
+    } catch (error) {
+      // Chrome can run with no window open on macOS: open one for the tab.
+      const win = await chrome.windows.create({ url, focused: active });
+      tab = win && win.tabs && win.tabs[0];
+      if (!tab) throw bridgeError("error", `Chrome couldn't open a tab (${messageOf(error)}).`);
+    }
+    await rememberGlideTab(tab.id);
+    if (watcher) {
+      await watcher.track(tab.id);
+      await watcher.done;
+      tab = await chrome.tabs.get(tab.id).catch(() => tab);
+    }
+  } finally {
+    if (watcher) watcher.finish();
   }
-  await rememberGlideTab(tab.id);
   return tabInfo(tab, new Set([tab.id]));
 }
 
@@ -384,18 +412,79 @@ async function updateTab(params) {
   }
   if (params.active === true) props.active = true;
   let updated = tab;
-  if (Object.keys(props).length > 0) updated = (await chrome.tabs.update(tabId, props)) || tab;
+  const watcher = props.url && props.url !== "about:blank" ? watchNavigation(tab.url || "") : null;
+  try {
+    if (watcher) await watcher.track(tabId);
+    if (Object.keys(props).length > 0) updated = (await chrome.tabs.update(tabId, props)) || tab;
+    if (watcher) {
+      await watcher.done;
+      updated = await chrome.tabs.get(tabId).catch(() => updated);
+    }
+  } finally {
+    if (watcher) watcher.finish();
+  }
   if (params.active === true) await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
   return tabInfo(updated, await loadGlideTabs());
 }
 
 async function removeTab(params) {
   const tabId = requireTabId(params);
-  await getTab(tabId);
-  await detachQuietly(tabId);
-  await chrome.tabs.remove(tabId);
+  const tab = await getTab(tabId);
+  if ((await loadGlideTabs()).has(tabId)) {
+    // Glide's own tab closes while the debugger is still attached, so a "Leave site?" prompt
+    // (the page has unsaved input Glide typed) is answered instead of keeping the tab open.
+    if (await wasAttached(tabId)) await ensureAttached(tabId, tab).catch(() => {});
+    await chrome.tabs.remove(tabId);
+    await detachQuietly(tabId);
+  } else {
+    // The user's own tab: a "Leave site?" prompt there is theirs to answer.
+    await detachQuietly(tabId);
+    await chrome.tabs.remove(tabId);
+  }
   await forgetGlideTab(tabId);
   return null;
+}
+
+/**
+ * Watches for a navigation in one tab to commit: its address changes, or it goes through
+ * loading to complete (a reload of the same address, or a download that leaves the page as it
+ * was). `done` also resolves when the tab closes and after NAVIGATION_COMMIT_TIMEOUT_MS; Glide's
+ * own check that the page has settled takes over from there. Events that arrive before the tab
+ * id is known (tabs.create can report them first) are kept and replayed by `track`.
+ */
+function watchNavigation(fromUrl) {
+  const early = [];
+  const watcher = { tabId: null, sawLoading: false };
+  watcher.done = new Promise((resolve) => (watcher.finish = resolve));
+  watcher.update = (tabId, changeInfo, tab) => {
+    if (watcher.tabId === null) {
+      if (early.length < 100) early.push([tabId, changeInfo, tab]);
+      return;
+    }
+    if (tabId !== watcher.tabId) return;
+    if (changeInfo.url && changeInfo.url !== fromUrl) {
+      watcher.finish();
+    } else if (changeInfo.status === "loading") {
+      watcher.sawLoading = true;
+    } else if (changeInfo.status === "complete" && watcher.sawLoading && tab.url && tab.url !== "about:blank") {
+      watcher.finish();
+    }
+  };
+  watcher.track = async (tabId) => {
+    watcher.tabId = tabId;
+    for (const [id, changeInfo, tab] of early.splice(0)) watcher.update(id, changeInfo, tab);
+    // It may have committed before this listener heard of it.
+    const current = await chrome.tabs.get(tabId).catch(() => null);
+    if (!current) watcher.finish();
+    else if (current.url && current.url !== fromUrl && current.url !== "about:blank") watcher.finish();
+  };
+  const timer = setTimeout(() => watcher.finish(), NAVIGATION_COMMIT_TIMEOUT_MS);
+  navigationWatchers.add(watcher);
+  watcher.done.then(() => {
+    clearTimeout(timer);
+    navigationWatchers.delete(watcher);
+  });
+  return watcher;
 }
 
 async function sendCDP(params) {
@@ -410,22 +499,34 @@ async function sendCDP(params) {
   if (await getSessionValue(G.SESSION_KEYS.paused)) throw bridgeError("canceled_by_user", G.PAUSED_MESSAGE);
   const tab = await getTab(tabId);
   assertAllowed(tab.url || tab.pendingUrl || "about:blank");
+  const dialog = openDialogs.get(tabId);
+  if (dialog) {
+    // The page is frozen until someone answers, and it's the user's dialog: fail at once
+    // rather than hang until the request times out.
+    const what = dialog.message ? ` (“${dialog.message.slice(0, 120)}”)` : "";
+    throw bridgeError("dialog_open", `This tab is showing a ${dialog.type} dialog${what}. Answer it in Chrome, then try again.`);
+  }
   const commandParams = params.params && typeof params.params === "object" ? params.params : {};
-  await ensureAttached(tabId, tab);
+  beginCommand(tabId);
   try {
-    return (await chrome.debugger.sendCommand({ tabId }, method, commandParams)) || {};
-  } catch (error) {
-    if (/not attached/i.test(messageOf(error))) {
-      // Detached since (navigation to another process, or the worker restarted): once more.
-      attached.delete(tabId);
-      await ensureAttached(tabId, tab);
-      try {
-        return (await chrome.debugger.sendCommand({ tabId }, method, commandParams)) || {};
-      } catch (retryError) {
-        throw bridgeError("cdp", messageOf(retryError));
+    await ensureAttached(tabId, tab);
+    try {
+      return (await chrome.debugger.sendCommand({ tabId }, method, commandParams)) || {};
+    } catch (error) {
+      if (/not attached/i.test(messageOf(error))) {
+        // Detached since (navigation to another process, or the worker restarted): once more.
+        attached.delete(tabId);
+        await ensureAttached(tabId, tab);
+        try {
+          return (await chrome.debugger.sendCommand({ tabId }, method, commandParams)) || {};
+        } catch (retryError) {
+          throw bridgeError("cdp", messageOf(retryError));
+        }
       }
+      throw bridgeError("cdp", messageOf(error));
     }
-    throw bridgeError("cdp", messageOf(error));
+  } finally {
+    endCommand(tabId);
   }
 }
 
@@ -435,6 +536,91 @@ async function detachTab(params) {
 }
 
 // ---- Debugger ----
+
+function beginCommand(tabId) {
+  const a = activity.get(tabId) || { inflight: 0, lastAt: 0 };
+  a.inflight += 1;
+  activity.set(tabId, a);
+  clearTimeout(idleTimers.get(tabId));
+  idleTimers.delete(tabId);
+}
+
+function endCommand(tabId) {
+  const a = activity.get(tabId);
+  if (a) {
+    a.inflight = Math.max(0, a.inflight - 1);
+    a.lastAt = Date.now();
+  }
+  if (attached.has(tabId) && !(a && a.inflight > 0)) scheduleIdleDetach(tabId);
+}
+
+/** True while Glide is working in the tab: a command is running there, or just finished. */
+function isDriving(tabId) {
+  const a = activity.get(tabId);
+  return !!a && (a.inflight > 0 || Date.now() - a.lastAt < ACTIVE_GRACE_MS);
+}
+
+function scheduleIdleDetach(tabId) {
+  clearTimeout(idleTimers.get(tabId));
+  const timer = setTimeout(() => {
+    if (idleTimers.get(tabId) !== timer) return;
+    idleTimers.delete(tabId);
+    detachIfIdle(tabId).catch((e) => console.warn("Glide: couldn't let go of an idle tab", e));
+  }, IDLE_DETACH_MS);
+  idleTimers.set(tabId, timer);
+}
+
+/** Lets go of a tab Glide didn't open once Glide has stopped using it. Glide's own tabs stay
+ * attached: their dialogs are answered for Glide, and Glide closes them when it's done. */
+async function detachIfIdle(tabId) {
+  if (!attached.has(tabId)) return;
+  if ((await loadGlideTabs()).has(tabId)) return;
+  if (!attached.has(tabId)) return; // detached while reading storage
+  if (isDriving(tabId)) {
+    // Still in use (or only just): look again later. A new command cancels this anyway.
+    if (!idleTimers.has(tabId)) scheduleIdleDetach(tabId);
+    return;
+  }
+  await detachQuietly(tabId);
+}
+
+/**
+ * JavaScript dialogs freeze the page's scripts until answered, which would stall every command
+ * on the tab. On a tab Glide is working in (its own tab, or one it's sending commands to right
+ * now) they're answered the way Glide's own Chrome does — dismiss alerts, let navigation leave
+ * the page, decline confirm()/prompt() — and Glide is told. Anywhere else the dialog is the
+ * user's: a page's own "Leave site?" or "Delete this?" must never be answered behind their back.
+ */
+async function onDialogOpening(tabId, params) {
+  const type = params.type || "alert";
+  const message = String(params.message || "").slice(0, 500);
+  if (!isDriving(tabId) && !(await loadGlideTabs()).has(tabId)) {
+    openDialogs.set(tabId, { type, message });
+    return;
+  }
+  const accept = type === "alert" || type === "beforeunload";
+  chrome.debugger
+    .sendCommand({ tabId }, "Page.handleJavaScriptDialog", { accept })
+    .catch((e) => console.warn("Glide: couldn't answer a dialog", e));
+  if (session && session.verified) send(session, { event: "dialog", tabId, type, message, accepted: accept });
+}
+
+/** Whether the debugger is on the tab: ours (also from before the worker restarted) or DevTools'. */
+async function wasAttached(tabId) {
+  if (attached.has(tabId)) return true;
+  try {
+    return (await chrome.debugger.getTargets()).some((target) => target.tabId === tabId && target.attached);
+  } catch (e) {
+    return false;
+  }
+}
+
+function forgetAttachment(tabId) {
+  attached.delete(tabId);
+  clearTimeout(idleTimers.get(tabId));
+  idleTimers.delete(tabId);
+  openDialogs.delete(tabId);
+}
 
 function ensureAttached(tabId, tab) {
   if (attached.has(tabId)) return Promise.resolve();
@@ -475,7 +661,7 @@ function ensureAttached(tabId, tab) {
 }
 
 async function detachQuietly(tabId) {
-  attached.delete(tabId);
+  forgetAttachment(tabId);
   try {
     await chrome.debugger.detach({ tabId });
   } catch (e) {
@@ -498,7 +684,7 @@ async function detachAll() {
 
 async function onDebuggerDetach(source, reason) {
   if (typeof source.tabId !== "number") return;
-  attached.delete(source.tabId);
+  forgetAttachment(source.tabId);
   if (reason === "canceled_by_user") {
     // The user dismissed Chrome's debugging bar: stop until they allow it again.
     await chrome.storage.session.set({ [G.SESSION_KEYS.paused]: true });
@@ -624,6 +810,8 @@ function tabInfo(tab, glideTabs) {
     active: !!tab.active,
     windowId: tab.windowId,
     glide: glideTabs.has(tab.id),
+    // The tab it was opened from, so Glide can tell its click's popup from other new tabs.
+    openerId: typeof tab.openerTabId === "number" ? tab.openerTabId : null,
   };
 }
 

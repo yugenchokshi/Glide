@@ -63,11 +63,31 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
         var lastChange = Date.distantPast
     }
 
+    /// A launch callers can join, and how many of them are still waiting for it.
+    private struct ConnectAttempt {
+        let task: Task<Void, Error>
+        var waiters: Int
+    }
+
+    /// Glide's commands in one tab, to tell whether Glide is working there right now.
+    private struct TabActivity {
+        var inflight = 0
+        var lastCommand = Date.distantPast
+    }
+
+    /// An action's dialog or popup can arrive between two of the driver's quick polls, so a tab
+    /// counts as driven for this long after its last command.
+    static let activeGrace: TimeInterval = 2
+
     private var configuration: Configuration
     private var socket: CDPWebSocket?
     private var generation = 0
     private var eventTask: Task<Void, Never>?
-    private var connecting: Task<Void, Error>?
+    private var connecting: ConnectAttempt?
+    /// The latest launch, even one every caller gave up on: it may still be stopping the Chrome
+    /// it started, so the next launch and `shutdown()` wait for it.
+    private var lastAttempt: Task<Void, Error>?
+    private var activity: [String: TabActivity] = [:] // by tab id
     /// The Chrome process when Glide launched it (nil when adopting a running one).
     private var process: Process?
     private var version: String?
@@ -106,30 +126,65 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
     }
 
     /// Launches Chrome (or adopts the one already running on Glide's profile) and connects to
-    /// it. Safe to call concurrently: callers share one attempt. Cancelling a caller (the stop
-    /// button) cancels the launch too, rather than waiting for Chrome to come up.
+    /// it. Safe to call concurrently: callers share one attempt. A cancelled caller (its Stop
+    /// button, its call's timeout) stops waiting at once; the launch itself is cancelled only
+    /// when no other caller is still waiting for it, so one job's stop can't fail another's
+    /// browser call or kill the Chrome it's about to use.
     public func connect() async throws {
         if await isConnected() { return }
         let attempt: Task<Void, Error>
         if let pending = connecting {
-            attempt = pending
+            attempt = pending.task
+            connecting?.waiters += 1
         } else {
-            attempt = Task { try await self.establish() }
-            connecting = attempt
+            let previous = lastAttempt
+            attempt = Task {
+                _ = try? await previous?.value
+                try await self.establish()
+            }
+            connecting = ConnectAttempt(task: attempt, waiters: 1)
+            lastAttempt = attempt
         }
-        defer { if connecting == attempt { connecting = nil } }
+        do {
+            try await Self.wait(for: attempt)
+        } catch is CancellationError where Task.isCancelled {
+            if connecting?.task == attempt {
+                connecting?.waiters -= 1
+                if connecting?.waiters == 0 {
+                    connecting = nil
+                    attempt.cancel()
+                }
+            }
+            throw CancellationError()
+        } catch {
+            if connecting?.task == attempt { connecting = nil }
+            throw error
+        }
+        if connecting?.task == attempt { connecting = nil }
+    }
+
+    /// Waits for `task`, but only until the caller is cancelled. Awaiting a task's value never
+    /// cancels that task, so callers sharing it are unaffected.
+    private static func wait(for task: Task<Void, Error>) async throws {
+        let race = DeadlineRace<Void>()
         try await withTaskCancellationHandler {
-            try await attempt.value
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                race.install(continuation)
+                let relay = Task {
+                    do { race.resolve(.success(try await task.value)) } catch { race.resolve(.failure(error)) }
+                }
+                race.attach(work: relay, timer: Task {})
+            }
         } onCancel: {
-            attempt.cancel()
+            race.cancel()
         }
     }
 
     /// Closes Chrome: politely over CDP, then SIGTERM, then SIGKILL if it still hasn't quit.
     public func shutdown() async {
         // Let a launch in progress stop first, so it can't leave a Chrome running behind us.
-        if let attempt = connecting {
-            attempt.cancel()
+        connecting?.task.cancel()
+        if let attempt = lastAttempt {
             _ = try? await attempt.value
         }
         // List Chrome's helpers while they're still its children (they're reparented once it exits).
@@ -293,8 +348,9 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
         if let a = activeTabID, !ids.contains(a) { activeTabID = nil }
         return infos.compactMap { info in
             guard let id = info["targetId"]?.stringValue else { return nil }
+            let opener = info["openerId"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
             return BrowserTab(id: id, url: info["url"]?.stringValue ?? "", title: info["title"]?.stringValue ?? "",
-                              active: id == activeTabID, ownedByGlide: owned.contains(id))
+                              active: id == activeTabID, ownedByGlide: owned.contains(id), openerID: opener)
         }
     }
 
@@ -354,6 +410,14 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
 
     public func cdp(tabID: String, method: String, params: JSONValue?) async throws -> JSONValue {
         let s = try requireSocket()
+        activity[tabID, default: TabActivity()].inflight += 1
+        defer {
+            if var a = activity[tabID] {
+                a.inflight = max(0, a.inflight - 1)
+                a.lastCommand = Date()
+                activity[tabID] = a
+            }
+        }
         var session = try await ensureSession(tabID)
         var retried = false
         while true {
@@ -458,7 +522,14 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
         dropSession(tabID: tabID)
         owned.remove(tabID)
         dialogs[tabID] = nil
+        activity[tabID] = nil
         if activeTabID == tabID { activeTabID = nil }
+    }
+
+    /// True while Glide is working in the tab: a command is running there, or just finished.
+    private func isDriving(_ tabID: String) -> Bool {
+        guard let a = activity[tabID] else { return false }
+        return a.inflight > 0 || Date().timeIntervalSince(a.lastCommand) < Self.activeGrace
     }
 
     private func resetConnectionState() {
@@ -470,6 +541,7 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
         attaching.removeAll()
         network.removeAll()
         dialogs.removeAll()
+        activity.removeAll()
     }
 
     private func streamEnded(generation gen: Int) {
@@ -487,6 +559,14 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
     private func handle(_ event: CDPEvent) {
         let p = event.params
         switch event.method {
+        case "Target.targetCreated":
+            // A tab opened from one of Glide's tabs while Glide works in it (target=_blank, a
+            // script popup) is Glide's too.
+            let info = p["targetInfo"]
+            if info?["type"]?.stringValue == "page", let id = info?["targetId"]?.stringValue,
+               let opener = info?["openerId"]?.stringValue, owned.contains(opener), isDriving(opener) {
+                owned.insert(id)
+            }
         case "Target.detachedFromTarget":
             if let session = p["sessionId"]?.stringValue, let tab = sessionTabs[session] { dropSession(tabID: tab) }
         case "Target.targetDestroyed":
@@ -512,12 +592,17 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
             network[session] = state
         case "Page.javascriptDialogOpening":
             guard let session = event.sessionID, let s = socket else { return }
+            // Only in tabs Glide is working in (its own, or one it's sending commands to right
+            // now). Anywhere else — a tab the user opened in this window — the dialog is theirs.
+            // A session still being set up has no tab yet: a command of Glide's is waiting on it.
+            let tab = sessionTabs[session]
+            if let tab, !owned.contains(tab), !isDriving(tab) { return }
             let type = p["type"]?.stringValue ?? "alert"
             // Deterministic and safe: confirmations and prompts are declined, so a page can't
             // get a "yes" to "Delete everything?" behind the user's back. Alerts are just closed,
             // and leaving a page Glide is navigating away from is allowed.
             let accept = type == "alert" || type == "beforeunload"
-            if let tab = sessionTabs[session] {
+            if let tab {
                 var list = dialogs[tab] ?? []
                 if list.count < 20 { list.append(BrowserDialog(type: type, message: p["message"]?.stringValue ?? "", accepted: accept)) }
                 dialogs[tab] = list

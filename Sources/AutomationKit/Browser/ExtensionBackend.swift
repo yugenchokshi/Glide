@@ -104,8 +104,9 @@ public final class ExtensionBackend: BrowserBackend {
         guard let number = value["id"]?.intValue, number >= 0 else { return nil }
         let id = String(number)
         let owned = ownedTabs.withLock { $0.contains(id) } || value["glide"]?.boolValue == true
+        let opener = value["openerId"]?.intValue.flatMap { $0 >= 0 ? String($0) : nil }
         return BrowserTab(id: id, url: value["url"]?.stringValue ?? "", title: value["title"]?.stringValue ?? "",
-                          active: value["active"]?.boolValue ?? false, ownedByGlide: owned)
+                          active: value["active"]?.boolValue ?? false, ownedByGlide: owned, openerID: opener)
     }
 }
 

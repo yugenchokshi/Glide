@@ -399,7 +399,8 @@ public final class BrowserDriver: Sendable {
         let tab = try await withDeadline(40, BrowserError.timeout("opening \(target)")) { [backend] in
             try await backend.openTab(url: target, background: background)
         }
-        if target != "about:blank" { _ = try await waitForSettle(tabID: tab.id) }
+        // A new tab starts on an empty page, which is "loaded" at once; wait for the real one.
+        if target != "about:blank" { _ = try await settle(tabID: tab.id, timeout: nil, leaving: .blankPage) }
         return tab
     }
 
@@ -537,12 +538,19 @@ public final class BrowserDriver: Sendable {
     }
 
     /// Loads `url` in the tab and waits for it to settle.
+    ///
+    /// Some backends return before the navigation commits (the extension's `chrome.tabs.update`
+    /// replies as soon as it starts), so the page being left is marked first: until the probe
+    /// sees a different document (or address), the old page doesn't count as loaded.
     public func navigate(tabID: String, url: String) async throws -> BrowserActionOutcome {
         let target = try Self.checkedURL(url)
+        let mark = UUID().uuidString
+        let markedURL = try? await evaluate(tabID: tabID, Self.markDocumentScript(mark), timeout: 3).stringValue
         try await withDeadline(30, BrowserError.timeout("opening \(target)")) { [backend] in
             try await backend.navigate(tabID: tabID, url: target)
         }
-        let settled = try await waitForSettle(tabID: tabID)
+        let leaving: PageBeingLeft? = markedURL.map { .document(mark: mark, url: $0) }
+        let settled = try await settle(tabID: tabID, timeout: nil, leaving: leaving)
         let notes = await dialogNotes(tabID: tabID)
         return BrowserActionOutcome(settled: settled, notes: notes)
     }
@@ -617,6 +625,23 @@ public final class BrowserDriver: Sendable {
     /// Pages that never go fully quiet (polling, tickers) count as settled once they've been
     /// loaded for a few seconds. Never sleeps longer than one 100 ms poll at a time.
     public func waitForSettle(tabID: String, timeout: TimeInterval? = nil) async throws -> Bool {
+        try await settle(tabID: tabID, timeout: timeout, leaving: nil)
+    }
+
+    /// The page a navigation is replacing, which must not be mistaken for the new one.
+    enum PageBeingLeft {
+        /// The document `markDocumentScript` stamped, while it still shows `url` (a change of
+        /// address alone means a same-page navigation happened).
+        case document(mark: String, url: String)
+        /// A new tab's initial empty page.
+        case blankPage
+    }
+
+    /// How long a page that never went away still counts as "not there yet". A navigation that
+    /// doesn't replace the page (a download, an empty response) ends up settling on it.
+    static let leftPageGrace: Duration = .seconds(10)
+
+    private func settle(tabID: String, timeout: TimeInterval?, leaving: PageBeingLeft?) async throws -> Bool {
         let limit = Duration.milliseconds(Int((timeout ?? settleTimeout) * 1000))
         let observer = backend as? any BrowserPageObserving
         let start = ContinuousClock.now
@@ -639,7 +664,14 @@ public final class BrowserDriver: Sendable {
                     countChangedAt = now
                 }
                 let navigating = navAge >= 0 && navAge < 10_000
-                let complete = readyState == "complete" && !navigating
+                var stillOldPage = false
+                switch leaving {
+                case .document(let mark, let markedURL)?: stillOldPage = probe["m"]?.stringValue == mark && url == markedURL
+                case .blankPage?: stillOldPage = url.isEmpty || url == "about:blank"
+                case nil: break
+                }
+                if stillOldPage, now - start >= Self.leftPageGrace { stillOldPage = false }
+                let complete = readyState == "complete" && !navigating && !stillOldPage
                 var activity: BrowserNetworkActivity?
                 if let observer { activity = await observer.networkActivity(tabID: tabID) }
                 let stableFor = now - countChangedAt
@@ -1590,10 +1622,17 @@ extension BrowserDriver {
     /// Cheap state probe for settle detection.
     static let probeScript = #"""
     (() => { let n = 0; try { n = document.getElementsByTagName('*').length; } catch (e) {}
-      return { rs: document.readyState, n: n, nav: window.__glideNavAt ? Date.now() - window.__glideNavAt : -1, u: location.href }; })()
+      return { rs: document.readyState, n: n, nav: window.__glideNavAt ? Date.now() - window.__glideNavAt : -1, u: location.href,
+        m: window.__glideDocMark || '' }; })()
     """#
 
     /// Marks the page so a navigation that starts after an action is noticed even before the
     /// new document arrives (see `waitForSettle`).
     static let armNavigationScript = "(() => {\n\(library)\nG.armNav(); return true;\n})()"
+
+    /// Arms the navigation hook and stamps the current document with `mark` (a UUID, so it's
+    /// safe inside the quotes). Returns the page's address.
+    static func markDocumentScript(_ mark: String) -> String {
+        "(() => {\n\(library)\nG.armNav(); window.__glideDocMark = '\(mark)'; return location.href;\n})()"
+    }
 }

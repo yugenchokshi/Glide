@@ -52,6 +52,19 @@ body.page {
   max-width: 420px;
 }
 
+.card p {
+  margin: 10px 0;
+}
+
+.card .status {
+  margin-top: 10px;
+}
+
+.lead {
+  font-size: 15px;
+  font-weight: 600;
+}
+
 header {
   display: flex;
   align-items: center;

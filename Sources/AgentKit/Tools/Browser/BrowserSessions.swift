@@ -7,7 +7,8 @@ import AutomationKit
 /// Each key (see `key(jobID:itemID:)`) has one "current tab", so parallel job items never step
 /// on each other's pages, and a quick task keeps working in the tab it opened. Tabs Glide opens
 /// are recycled least-recently-used beyond a per-job cap, so a job over 500 items doesn't leave
-/// 500 tabs behind; tabs the user opened are never closed by this.
+/// 500 tabs behind; tabs the user opened are never closed by this, and neither is a tab that is
+/// still some item's, job's or quick task's current tab (the cap is exceeded for a while instead).
 ///
 /// Tools read this synchronously inside `assess` — risk is judged from the element the model
 /// actually saw, without I/O — so it's a lock-protected class rather than an actor. Async work
@@ -25,6 +26,9 @@ public final class BrowserSessions: @unchecked Sendable {
         var backend: BrowserBackendKind
         var tabID: String
         var jobID: String?
+        /// The session key that opened it, so `release` also closes the tabs an item left
+        /// behind (the page before a popup, a `new_tab`), not just its current one.
+        var owner: String?
         var lastUsed: Date
     }
 
@@ -79,23 +83,30 @@ public final class BrowserSessions: @unchecked Sendable {
     /// Makes `tabID` the key's current tab. `openedByGlide` records it as Glide's (for closing and
     /// risk). Returns the Glide tabs to close to stay under the caps; the caller closes them
     /// outside the lock.
+    ///
+    /// Only tabs nobody is working in are recycled: a tab that is another session's current tab
+    /// (a parallel item thinking about its next step, a job's own tab, the quick task's) and the
+    /// tab this key just moved away from are spared, even if that leaves the job over its cap
+    /// until those sessions end.
     @discardableResult
     func adopt(key: String, backend: BrowserBackendKind, tabID: String, jobID: String?, openedByGlide: Bool) -> [GlideTab] {
         lock.withLock {
+            let previous = sessions[key].map { Self.tabKey($0.backend, $0.tabID) }
             sessions[key] = Session(backend: backend, tabID: tabID, jobID: jobID)
             let k = Self.tabKey(backend, tabID)
             if openedByGlide, glideTabs[k] == nil {
-                glideTabs[k] = GlideTab(backend: backend, tabID: tabID, jobID: jobID, lastUsed: Date())
+                glideTabs[k] = GlideTab(backend: backend, tabID: tabID, jobID: jobID, owner: key, lastUsed: Date())
             }
             glideTabs[k]?.lastUsed = Date()
+            var spared = liveTabKeys()
+            if let previous { spared.insert(previous) }
             var victims: [GlideTab] = []
             func evict(where include: (GlideTab) -> Bool, cap: Int) {
                 while glideTabs.values.filter(include).count > cap {
-                    guard let oldest = glideTabs.filter({ include($0.value) && $0.key != k }).min(by: { $0.value.lastUsed < $1.value.lastUsed }) else { return }
+                    guard let oldest = glideTabs.filter({ include($0.value) && !spared.contains($0.key) })
+                        .min(by: { $0.value.lastUsed < $1.value.lastUsed }) else { return }
                     glideTabs[oldest.key] = nil
                     snapshots[oldest.key] = nil
-                    // Whoever still pointed at it (a finished item, most likely) opens a new tab next time.
-                    for (sk, s) in sessions where Self.tabKey(s.backend, s.tabID) == oldest.key { sessions[sk] = nil }
                     victims.append(oldest.value)
                 }
             }
@@ -103,6 +114,11 @@ public final class BrowserSessions: @unchecked Sendable {
             evict(where: { _ in true }, cap: maxTabs)
             return victims
         }
+    }
+
+    /// Tab keys that are some session's current tab. Call with the lock held.
+    private func liveTabKeys() -> Set<String> {
+        Set(sessions.values.map { Self.tabKey($0.backend, $0.tabID) })
     }
 
     func clear(_ key: String) { lock.withLock { _ = sessions.removeValue(forKey: key) } }
@@ -119,16 +135,17 @@ public final class BrowserSessions: @unchecked Sendable {
         for d in ds where d.backend.kind == backend { d.forget(tabID: tabID) }
     }
 
-    /// Records a tab Glide caused to open (a popup from a click) as Glide's.
-    func markGlideTab(backend: BrowserBackendKind, tabID: String, jobID: String?) {
-        lock.withLock {
-            let k = Self.tabKey(backend, tabID)
-            if glideTabs[k] == nil { glideTabs[k] = GlideTab(backend: backend, tabID: tabID, jobID: jobID, lastUsed: Date()) }
-        }
-    }
-
     func isGlideTab(backend: BrowserBackendKind, tabID: String) -> Bool {
         lock.withLock { glideTabs[Self.tabKey(backend, tabID)] != nil }
+    }
+
+    /// True for a tab Glide already accounts for: one it opened, or some session's current tab.
+    /// A click's popup is never one of these, so two parallel items can't both adopt a tab.
+    func isTracked(backend: BrowserBackendKind, tabID: String) -> Bool {
+        lock.withLock {
+            let k = Self.tabKey(backend, tabID)
+            return glideTabs[k] != nil || liveTabKeys().contains(k)
+        }
     }
 
     /// Snapshots kept at most; tabs closed outside Glide never report it, so the oldest go.
@@ -165,20 +182,23 @@ public final class BrowserSessions: @unchecked Sendable {
         return tab.id
     }
 
-    /// Closes the tab of one job item (or of the job itself when `itemID` is nil) if Glide
-    /// opened it. The job engine can call this when an item finishes to free the tab early;
-    /// otherwise tabs are recycled least-recently-used.
+    /// Closes the Glide tabs of one job item (or of the job itself when `itemID` is nil): its
+    /// current tab and any it opened and left behind, unless another session works in them now.
+    /// The job engine calls this when an item finishes to free its tabs early; otherwise tabs
+    /// are recycled least-recently-used.
     public func release(jobID: String?, itemID: String?, hub: BrowserHub = .shared) async {
         let key = Self.key(jobID: jobID, itemID: itemID)
-        let victim: GlideTab? = lock.withLock {
-            guard let s = sessions.removeValue(forKey: key) else { return nil }
-            let k = Self.tabKey(s.backend, s.tabID)
-            guard let g = glideTabs[k], !sessions.values.contains(where: { Self.tabKey($0.backend, $0.tabID) == k }) else { return nil }
-            glideTabs[k] = nil
-            return g
+        let victims: [GlideTab] = lock.withLock {
+            let current = sessions.removeValue(forKey: key).map { Self.tabKey($0.backend, $0.tabID) }
+            let live = liveTabKeys()
+            let mine = glideTabs.filter { ($0.value.owner == key || $0.key == current) && !live.contains($0.key) }
+            for k in mine.keys { glideTabs[k] = nil }
+            return Array(mine.values)
         }
-        guard let victim, let backend = hub.registered(victim.backend) else { return }
-        await close([victim], driver: driver(for: backend))
+        for v in victims {
+            guard let backend = hub.registered(v.backend) else { continue }
+            await close([v], driver: driver(for: backend))
+        }
     }
 
     /// Closes every tab a job opened (call when the job ends).

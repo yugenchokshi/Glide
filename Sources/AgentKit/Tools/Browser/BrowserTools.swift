@@ -72,6 +72,9 @@ struct BrowserRuntime: Sendable {
             throw e
         } catch is CancellationError {
             if context.gate.isStopped { throw AutomationError.stopped }
+            // Cancelled from elsewhere (Glide's Chrome shut down mid-launch, say) while this
+            // call was neither stopped nor cancelled: a failure the model can retry, not a Stop.
+            if !Task.isCancelled { return timed(.failure("The browser was interrupted before this finished. Try again.")) }
             throw CancellationError()
         } catch {
             return timed(.failure(error.localizedDescription))
@@ -306,17 +309,40 @@ struct BrowserClickTool: AgentTool {
             let outcome = try await env.driver.click(tabID: tab, ref: ref)
             let lead = "Clicked \(ref) \(element.role)\(element.name.isEmpty ? "" : " “\(clip(element.name, 60))”")."
             // A link with target=_blank or a script popup opens a new tab: continue there.
-            if !before.isEmpty, let tabs = try? await env.driver.tabs(),
-               let popup = tabs.first(where: { !before.contains($0.id) && !$0.ownedByGlide && !BrowserDriver.isRestricted(url: $0.url) }) {
-                env.sessions.markGlideTab(backend: env.kind, tabID: popup.id, jobID: env.jobID)
-                let victims = env.sessions.adopt(key: env.key, backend: env.kind, tabID: popup.id, jobID: env.jobID, openedByGlide: true)
-                for v in victims where v.tabID != tab { try? await env.driver.closeTab(v.tabID); env.sessions.forgetTab(backend: env.kind, tabID: v.tabID) }
-                _ = try? await env.driver.waitForSettle(tabID: popup.id)
-                return try await env.pageOutput(tab: popup.id, lead: lead, notes: outcome.notes + ["The click opened a new tab (\(popup.id)); now working there. The previous tab is \(tab)."],
-                                                previous: nil, settled: outcome.settled)
+            var notes = outcome.notes
+            if !before.isEmpty, let tabs = try? await env.driver.tabs() {
+                let isTracked = { (id: String) in env.sessions.isTracked(backend: env.kind, tabID: id) }
+                if let popup = Self.popup(openedFrom: tab, before: before, after: tabs, isTracked: isTracked) {
+                    let victims = env.sessions.adopt(key: env.key, backend: env.kind, tabID: popup.id, jobID: env.jobID, openedByGlide: true)
+                    for v in victims { try? await env.driver.closeTab(v.tabID); env.sessions.forgetTab(backend: env.kind, tabID: v.tabID) }
+                    _ = try? await env.driver.waitForSettle(tabID: popup.id)
+                    return try await env.pageOutput(tab: popup.id, lead: lead, notes: notes + ["The click opened a new tab (\(popup.id)); now working there. The previous tab is \(tab)."],
+                                                    previous: nil, settled: outcome.settled)
+                }
+                for other in Self.unexplainedNewTabs(before: before, after: tabs, isTracked: isTracked) {
+                    notes.append("Tab \(other.id) opened meanwhile, but Chrome didn't say from where. If this click opened it, use browser.switch_tab with tab_id \(other.id) to work there.")
+                }
             }
-            return try await env.pageOutput(tab: tab, lead: lead, notes: outcome.notes, previous: previous, settled: outcome.settled)
+            return try await env.pageOutput(tab: tab, lead: lead, notes: notes, previous: previous, settled: outcome.settled)
         }
+    }
+
+    /// The tab a click on `tab` opened: new since the click and opened from `tab`. A tab that
+    /// appeared at the same moment for another reason — the user opening one, another app
+    /// opening a link, a parallel item's popup — has another opener (or none) and is left alone,
+    /// as is any tab Glide already accounts for.
+    static func popup(openedFrom tab: String, before: Set<String>, after tabs: [BrowserTab], isTracked: (String) -> Bool) -> BrowserTab? {
+        tabs.first { $0.openerID == tab && isNewAndFree($0, before: before, isTracked: isTracked) }
+    }
+
+    /// New tabs whose opener the backend didn't report: maybe this click's, maybe not. They're
+    /// only mentioned to the model, which can switch to one (as it would to any tab of the user's).
+    static func unexplainedNewTabs(before: Set<String>, after tabs: [BrowserTab], isTracked: (String) -> Bool) -> [BrowserTab] {
+        tabs.filter { $0.openerID == nil && $0.url != "about:blank" && isNewAndFree($0, before: before, isTracked: isTracked) }.prefix(3).map { $0 }
+    }
+
+    private static func isNewAndFree(_ t: BrowserTab, before: Set<String>, isTracked: (String) -> Bool) -> Bool {
+        !before.contains(t.id) && !isTracked(t.id) && !BrowserDriver.isRestricted(url: t.url)
     }
 }
 
