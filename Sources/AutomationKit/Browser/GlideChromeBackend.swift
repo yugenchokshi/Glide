@@ -73,6 +73,9 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
     private struct TabActivity {
         var inflight = 0
         var lastCommand = Date.distantPast
+        /// The same for actions alone (`BrowserDialogPolicy.isAction`).
+        var actions = 0
+        var lastAction = Date.distantPast
     }
 
     /// An action's dialog or popup can arrive between two of the driver's quick polls, so a tab
@@ -96,6 +99,8 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
     private var attaching: [String: Task<String, Error>] = [:]
     private var network: [String: NetworkState] = [:]   // by session id
     private var dialogs: [String: [BrowserDialog]] = [:] // by tab id
+    /// Dialogs left for the user to answer, by tab id: commands there fail at once meanwhile.
+    private var waitingDialogs: [String: BrowserDialog] = [:]
     private var owned: Set<String> = []
     private var activeTabID: String?
 
@@ -410,11 +415,22 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
 
     public func cdp(tabID: String, method: String, params: JSONValue?) async throws -> JSONValue {
         let s = try requireSocket()
+        // The page is frozen until the user answers its dialog: say so now instead of at the
+        // command's deadline. Answering it is the one thing that still goes through.
+        if let waiting = waitingDialogs[tabID], method != "Page.handleJavaScriptDialog" {
+            throw BrowserError.cdp(BrowserDialogPolicy.waitingMessage(waiting))
+        }
+        let action = BrowserDialogPolicy.isAction(method: method, params: params)
         activity[tabID, default: TabActivity()].inflight += 1
+        if action { activity[tabID, default: TabActivity()].actions += 1 }
         defer {
             if var a = activity[tabID] {
                 a.inflight = max(0, a.inflight - 1)
                 a.lastCommand = Date()
+                if action {
+                    a.actions = max(0, a.actions - 1)
+                    a.lastAction = a.lastCommand
+                }
                 activity[tabID] = a
             }
         }
@@ -422,7 +438,9 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
         var retried = false
         while true {
             do {
-                return try await s.send(method, params: params, sessionID: session, timeout: configuration.commandTimeout)
+                let result = try await s.send(method, params: params, sessionID: session, timeout: configuration.commandTimeout)
+                if method == "Page.handleJavaScriptDialog" { waitingDialogs[tabID] = nil }
+                return result
             } catch let e as CDPError {
                 if e.isSessionGone, !retried {
                     // The debugger detached (e.g. the tab crashed and reloaded): attach again once.
@@ -497,6 +515,9 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
                 throw BrowserError.cdp(e.message)
             }
             guard let session = r["sessionId"]?.stringValue else { throw BrowserError.cdp("Chrome didn't attach to the tab.") }
+            // Known by its tab from now on, so a dialog that arrives while the domains are being
+            // enabled is judged by the rules for that tab.
+            self.sessionTabs[session] = tabID
             _ = try? await s.send("Page.enable", sessionID: session, timeout: 10)
             _ = try? await s.send("Network.enable", sessionID: session, timeout: 10)
             _ = try? await s.send("Emulation.setFocusEmulationEnabled", params: ["enabled": true], sessionID: session, timeout: 10)
@@ -516,6 +537,8 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
             sessionTabs[s] = nil
             network[s] = nil
         }
+        // Without a session the dialog's end can't be seen; don't refuse the tab forever.
+        waitingDialogs[tabID] = nil
     }
 
     private func forget(tabID: String) {
@@ -532,6 +555,12 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
         return a.inflight > 0 || Date().timeIntervalSince(a.lastCommand) < Self.activeGrace
     }
 
+    /// True while one of Glide's actions in the tab is running, or just finished.
+    private func isActing(_ tabID: String) -> Bool {
+        guard let a = activity[tabID] else { return false }
+        return a.actions > 0 || Date().timeIntervalSince(a.lastAction) < Self.activeGrace
+    }
+
     private func resetConnectionState() {
         eventTask?.cancel()
         eventTask = nil
@@ -541,6 +570,7 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
         attaching.removeAll()
         network.removeAll()
         dialogs.removeAll()
+        waitingDialogs.removeAll()
         activity.removeAll()
     }
 
@@ -592,22 +622,28 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
             network[session] = state
         case "Page.javascriptDialogOpening":
             guard let session = event.sessionID, let s = socket else { return }
-            // Only in tabs Glide is working in (its own, or one it's sending commands to right
-            // now). Anywhere else — a tab the user opened in this window — the dialog is theirs.
-            // A session still being set up has no tab yet: a command of Glide's is waiting on it.
-            let tab = sessionTabs[session]
-            if let tab, !owned.contains(tab), !isDriving(tab) { return }
             let type = p["type"]?.stringValue ?? "alert"
-            // Deterministic and safe: confirmations and prompts are declined, so a page can't
-            // get a "yes" to "Delete everything?" behind the user's back. Alerts are just closed,
-            // and leaving a page Glide is navigating away from is allowed.
-            let accept = type == "alert" || type == "beforeunload"
+            let message = String((p["message"]?.stringValue ?? "").prefix(500))
+            // Only in tabs Glide is working in (its own, or one it's sending commands to right
+            // now); see BrowserDialogPolicy. Anywhere else — a tab the user opened in this
+            // window — the dialog is theirs. A session is known by its tab from the moment it
+            // attaches; one that isn't was just set up for a command of Glide's that's waiting.
+            let tab = sessionTabs[session]
+            let answer = BrowserDialogPolicy.answers(type: type, ownedByGlide: tab.map { owned.contains($0) } ?? false,
+                                                     driving: tab.map { isDriving($0) } ?? true, acting: tab.map { isActing($0) } ?? false)
+            guard answer else {
+                if let tab { waitingDialogs[tab] = BrowserDialog(type: type, message: message, accepted: false) }
+                return
+            }
+            let accept = BrowserDialogPolicy.accepts(type: type)
             if let tab {
                 var list = dialogs[tab] ?? []
-                if list.count < 20 { list.append(BrowserDialog(type: type, message: p["message"]?.stringValue ?? "", accepted: accept)) }
+                if list.count < 20 { list.append(BrowserDialog(type: type, message: message, accepted: accept)) }
                 dialogs[tab] = list
             }
             Task { _ = try? await s.send("Page.handleJavaScriptDialog", params: ["accept": .bool(accept)], sessionID: session, timeout: 10) }
+        case "Page.javascriptDialogClosed":
+            if let session = event.sessionID, let tab = sessionTabs[session] { waitingDialogs[tab] = nil }
         default:
             break
         }

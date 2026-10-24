@@ -22,6 +22,8 @@ const NAVIGATION_COMMIT_TIMEOUT_MS = 15000;
 // Glide is "driving" a tab while one of its commands runs there and for a moment after: an
 // action's dialog or popup can arrive between two of the driver's quick polls.
 const ACTIVE_GRACE_MS = 2000;
+// Tabs remembered with the tab whose page opened them (see onCreatedNavigationTarget).
+const MAX_POPUP_SOURCES = 500;
 // The debugger lets go of tabs Glide didn't open after this long without a command, so it
 // doesn't stay attached to the user's own tabs (and Chrome's debugging bar goes away).
 const IDLE_DETACH_MS = 45000;
@@ -51,10 +53,11 @@ let keepaliveTimer = null;
 let lastStatus = { state: "starting", port: null, chromeVersion: null };
 const attached = new Set(); // tab ids our debugger is attached to
 const attaching = new Map(); // tab id → in-flight attach promise
-const activity = new Map(); // tab id → {inflight, lastAt}: Glide's commands there
+const activity = new Map(); // tab id → {inflight, lastAt, actions, lastActionAt}: Glide's commands there
 const idleTimers = new Map(); // tab id → timer that detaches a tab Glide didn't open
 const openDialogs = new Map(); // tab id → dialog the page shows that's left for the user
 const navigationWatchers = new Set(); // see watchNavigation
+const popupSources = new Map(); // tab id → the tab whose page opened it
 
 // ---- Event listeners (registered synchronously, as MV3 requires) ----
 
@@ -103,14 +106,11 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
 });
 
-// A tab opened from one of Glide's tabs while Glide is working in it (a link with
-// target=_blank, a script popup) is Glide's too. A tab opened any other way is the user's.
-chrome.tabs.onCreated.addListener((tab) => {
-  const opener = tab && tab.openerTabId;
-  if (typeof tab.id !== "number" || typeof opener !== "number" || !isDriving(opener)) return;
-  loadGlideTabs()
-    .then((glideTabs) => (glideTabs.has(opener) ? rememberGlideTab(tab.id) : undefined))
-    .catch(() => {});
+// The tab a page opened (a link with target=_blank, window.open). Only webNavigation knows which
+// tab that page was in: chrome.tabs' openerTabId is the window's active tab for these, so a
+// popup from one of Glide's background tabs would look like the user's doing.
+chrome.webNavigation.onCreatedNavigationTarget.addListener((details) => {
+  onPopup(details.sourceTabId, details.tabId).catch((e) => console.warn("Glide: popup handling failed", e));
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -120,6 +120,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   forgetAttachment(tabId);
   activity.delete(tabId);
+  popupSources.delete(tabId);
   for (const watcher of [...navigationWatchers]) if (watcher.tabId === tabId) watcher.finish();
   forgetGlideTab(tabId).catch(() => {});
 });
@@ -503,11 +504,11 @@ async function sendCDP(params) {
   if (dialog) {
     // The page is frozen until someone answers, and it's the user's dialog: fail at once
     // rather than hang until the request times out.
-    const what = dialog.message ? ` (“${dialog.message.slice(0, 120)}”)` : "";
-    throw bridgeError("dialog_open", `This tab is showing a ${dialog.type} dialog${what}. Answer it in Chrome, then try again.`);
+    throw bridgeError("dialog_open", waitingDialogMessage(dialog));
   }
   const commandParams = params.params && typeof params.params === "object" ? params.params : {};
-  beginCommand(tabId);
+  const action = isAction(method, commandParams);
+  beginCommand(tabId, action);
   try {
     await ensureAttached(tabId, tab);
     try {
@@ -526,7 +527,7 @@ async function sendCDP(params) {
       throw bridgeError("cdp", messageOf(error));
     }
   } finally {
-    endCommand(tabId);
+    endCommand(tabId, action);
   }
 }
 
@@ -537,19 +538,24 @@ async function detachTab(params) {
 
 // ---- Debugger ----
 
-function beginCommand(tabId) {
-  const a = activity.get(tabId) || { inflight: 0, lastAt: 0 };
+function beginCommand(tabId, action) {
+  const a = activity.get(tabId) || { inflight: 0, lastAt: 0, actions: 0, lastActionAt: 0 };
   a.inflight += 1;
+  if (action) a.actions += 1;
   activity.set(tabId, a);
   clearTimeout(idleTimers.get(tabId));
   idleTimers.delete(tabId);
 }
 
-function endCommand(tabId) {
+function endCommand(tabId, action) {
   const a = activity.get(tabId);
   if (a) {
     a.inflight = Math.max(0, a.inflight - 1);
     a.lastAt = Date.now();
+    if (action) {
+      a.actions = Math.max(0, a.actions - 1);
+      a.lastActionAt = a.lastAt;
+    }
   }
   if (attached.has(tabId) && !(a && a.inflight > 0)) scheduleIdleDetach(tabId);
 }
@@ -558,6 +564,52 @@ function endCommand(tabId) {
 function isDriving(tabId) {
   const a = activity.get(tabId);
   return !!a && (a.inflight > 0 || Date.now() - a.lastAt < ACTIVE_GRACE_MS);
+}
+
+/** True while one of Glide's actions in the tab is running, or just finished (reads don't count). */
+function isActing(tabId) {
+  const a = activity.get(tabId);
+  return !!a && (a.actions > 0 || Date.now() - a.lastActionAt < ACTIVE_GRACE_MS);
+}
+
+/**
+ * Commands that act on the page the way a person would — input events, navigation, a script
+ * run with a user gesture (the driver's click and typing fallbacks) — rather than read it.
+ * Must match BrowserDialogPolicy.isAction in Glide (BrowserDriver.swift).
+ */
+function isAction(method, params) {
+  if (method.startsWith("Input.")) return true;
+  if (method === "Page.navigate" || method === "Page.navigateToHistoryEntry" || method === "Page.reload") return true;
+  return (method === "Runtime.evaluate" || method === "Runtime.callFunctionOn") && !!params && params.userGesture === true;
+}
+
+/** The error for a command sent to a tab whose dialog is waiting for the user. */
+function waitingDialogMessage(dialog) {
+  const kinds = { alert: "an alert", confirm: "a confirmation dialog", prompt: "a prompt", beforeunload: "a “Leave site?” prompt" };
+  const what = kinds[dialog.type] || "a dialog";
+  const quote = dialog.message ? ` (“${dialog.message.slice(0, 120)}”)` : "";
+  return `This tab is showing ${what}${quote}. Answer it in Chrome, then try again.`;
+}
+
+/**
+ * A page opened a tab. It's remembered with the tab it came from, so Glide can tell its click's
+ * popup from tabs that opened meanwhile. When it came from one of Glide's tabs while Glide works
+ * there it's Glide's too, and if Chrome brought it to the front over the user's tab (a click
+ * opens links in the foreground, even in a background tab) the user's tab goes back in front.
+ */
+async function onPopup(sourceTabId, tabId) {
+  if (typeof sourceTabId !== "number" || typeof tabId !== "number" || sourceTabId < 0 || tabId < 0) return;
+  popupSources.delete(tabId);
+  popupSources.set(tabId, sourceTabId);
+  while (popupSources.size > MAX_POPUP_SOURCES) popupSources.delete(popupSources.keys().next().value);
+  if (!isDriving(sourceTabId) || !(await loadGlideTabs()).has(sourceTabId)) return;
+  await rememberGlideTab(tabId);
+  const [source, popup] = await Promise.all([chrome.tabs.get(sourceTabId).catch(() => null), chrome.tabs.get(tabId).catch(() => null)]);
+  // Chrome sets a link's new tab's openerTabId to the tab that was in front when it opened.
+  const front = popup && popup.openerTabId;
+  if (!source || !popup || source.active || !popup.active || popup.windowId !== source.windowId) return;
+  if (typeof front !== "number" || front === sourceTabId || front === tabId) return;
+  await chrome.tabs.update(front, { active: true }).catch(() => {});
 }
 
 function scheduleIdleDetach(tabId) {
@@ -590,11 +642,17 @@ async function detachIfIdle(tabId) {
  * now) they're answered the way Glide's own Chrome does — dismiss alerts, let navigation leave
  * the page, decline confirm()/prompt() — and Glide is told. Anywhere else the dialog is the
  * user's: a page's own "Leave site?" or "Delete this?" must never be answered behind their back.
+ * In the user's tabs "Leave site?" is accepted only when one of Glide's actions (a click, a key,
+ * a navigation) could have caused it: while Glide merely reads the tab, it's the user closing it
+ * or leaving a half-filled form, and accepting would throw their input away.
+ * Must match BrowserDialogPolicy in Glide (BrowserDriver.swift).
  */
 async function onDialogOpening(tabId, params) {
   const type = params.type || "alert";
   const message = String(params.message || "").slice(0, 500);
-  if (!isDriving(tabId) && !(await loadGlideTabs()).has(tabId)) {
+  // Judged at once: the grace period mustn't run out while storage is read.
+  const working = type === "beforeunload" ? isActing(tabId) : isDriving(tabId);
+  if (!working && !(await loadGlideTabs()).has(tabId)) {
     openDialogs.set(tabId, { type, message });
     return;
   }
@@ -810,8 +868,9 @@ function tabInfo(tab, glideTabs) {
     active: !!tab.active,
     windowId: tab.windowId,
     glide: glideTabs.has(tab.id),
-    // The tab it was opened from, so Glide can tell its click's popup from other new tabs.
-    openerId: typeof tab.openerTabId === "number" ? tab.openerTabId : null,
+    // The tab whose page opened it, so Glide can tell its click's popup from other new tabs.
+    // Not tab.openerTabId: for a link's new tab that's whichever tab was in front at the time.
+    sourceTabId: popupSources.has(tab.id) ? popupSources.get(tab.id) : null,
   };
 }
 

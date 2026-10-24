@@ -37,6 +37,54 @@ public struct BrowserDialog: Sendable, Hashable {
     }
 }
 
+/// When a backend answers a page's JavaScript dialog by itself. Glide's own Chrome uses these
+/// rules; the extension's service_worker.js has the same ones (keep them in step).
+///
+/// A dialog freezes the page until it's answered, so in a tab Glide is working in it's answered
+/// at once, deterministically. Anywhere else it's the user's to answer, and commands sent to the
+/// tab fail at once until they have.
+enum BrowserDialogPolicy {
+    /// Commands that act on the page the way a person would — input events, navigation, a
+    /// script run with a user gesture (the driver's click and typing fallbacks) — rather than
+    /// read it.
+    static func isAction(method: String, params: JSONValue?) -> Bool {
+        if method.hasPrefix("Input.") { return true }
+        switch method {
+        case "Page.navigate", "Page.navigateToHistoryEntry", "Page.reload": return true
+        case "Runtime.evaluate", "Runtime.callFunctionOn": return params?["userGesture"]?.boolValue == true
+        default: return false
+        }
+    }
+
+    /// In Glide's own tabs every dialog is answered. In the user's tabs only while Glide is
+    /// working there (`driving`: a command running or just finished), and "Leave site?" only
+    /// when one of Glide's actions could have caused it (`acting`): while Glide merely reads
+    /// the tab, it's the user closing it or leaving a half-filled form, and accepting would
+    /// throw their input away.
+    static func answers(type: String, ownedByGlide: Bool, driving: Bool, acting: Bool) -> Bool {
+        if ownedByGlide { return true }
+        return type == "beforeunload" ? acting : driving
+    }
+
+    /// Alerts are closed and leaving the page is allowed; confirm() and prompt() are declined,
+    /// so a page never gets a "yes" to "Delete everything?" behind the user's back.
+    static func accepts(type: String) -> Bool { type == "alert" || type == "beforeunload" }
+
+    /// The error for a command sent to a tab whose dialog is waiting for the user.
+    static func waitingMessage(_ dialog: BrowserDialog) -> String {
+        let what: String
+        switch dialog.type {
+        case "alert": what = "an alert"
+        case "confirm": what = "a confirmation dialog"
+        case "prompt": what = "a prompt"
+        case "beforeunload": what = "a “Leave site?” prompt"
+        default: what = "a dialog"
+        }
+        let quote = dialog.message.isEmpty ? "" : " (“\(PageSnapshot.clip(dialog.message, 120))”)"
+        return "This tab is showing \(what)\(quote). Answer it in Chrome, then try again."
+    }
+}
+
 /// Backends that receive CDP events (Glide's own Chrome) adopt this so the driver can wait for a
 /// quiet network instead of guessing, and report dialogs it answered. Backends without events
 /// still work: the driver falls back to watching the DOM settle.
@@ -541,7 +589,9 @@ public final class BrowserDriver: Sendable {
     ///
     /// Some backends return before the navigation commits (the extension's `chrome.tabs.update`
     /// replies as soon as it starts), so the page being left is marked first: until the probe
-    /// sees a different document (or address), the old page doesn't count as loaded.
+    /// sees a different document (or address), the old page doesn't count as loaded. Except
+    /// when the address only adds or repeats a #fragment of the page that's showing: that's a
+    /// same-page jump and the marked page stays (any change of address is noticed anyway).
     public func navigate(tabID: String, url: String) async throws -> BrowserActionOutcome {
         let target = try Self.checkedURL(url)
         let mark = UUID().uuidString
@@ -549,7 +599,9 @@ public final class BrowserDriver: Sendable {
         try await withDeadline(30, BrowserError.timeout("opening \(target)")) { [backend] in
             try await backend.navigate(tabID: tabID, url: target)
         }
-        let leaving: PageBeingLeft? = markedURL.map { .document(mark: mark, url: $0) }
+        let leaving: PageBeingLeft? = markedURL.flatMap { current in
+            Self.isFragmentJump(from: current, to: target) ? nil : .document(mark: mark, url: current)
+        }
         let settled = try await settle(tabID: tabID, timeout: nil, leaving: leaving)
         let notes = await dialogNotes(tabID: tabID)
         return BrowserActionOutcome(settled: settled, notes: notes)
@@ -640,6 +692,18 @@ public final class BrowserDriver: Sendable {
     /// How long a page that never went away still counts as "not there yet". A navigation that
     /// doesn't replace the page (a download, an empty response) ends up settling on it.
     static let leftPageGrace: Duration = .seconds(10)
+
+    /// True when loading `target` in a tab showing `current` keeps the document: `target` has a
+    /// #fragment and is otherwise the same address (browsers scroll to the fragment instead of
+    /// loading the page again, even when the whole address is unchanged).
+    static func isFragmentJump(from current: String, to target: String) -> Bool {
+        guard target.contains("#"), let a = URLComponents(string: current), let b = URLComponents(string: target) else { return false }
+        func page(_ c: URLComponents) -> String {
+            let path = c.percentEncodedPath.isEmpty && c.host != nil ? "/" : c.percentEncodedPath
+            return [c.scheme?.lowercased() ?? "", c.host?.lowercased() ?? "", c.port.map(String.init) ?? "", path, c.percentEncodedQuery ?? ""].joined(separator: "|")
+        }
+        return page(a) == page(b)
+    }
 
     private func settle(tabID: String, timeout: TimeInterval?, leaving: PageBeingLeft?) async throws -> Bool {
         let limit = Duration.milliseconds(Int((timeout ?? settleTimeout) * 1000))

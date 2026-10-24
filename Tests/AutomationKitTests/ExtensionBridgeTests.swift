@@ -1070,7 +1070,7 @@ struct ExtensionBridgeFilesTests {
         let manifest = try ExtensionFixtures.manifest()
         #expect(manifest["manifest_version"] as? Int == 3)
         #expect(manifest["name"] as? String == "Glide")
-        #expect(Set(manifest["permissions"] as? [String] ?? []) == ["debugger", "tabs", "storage", "alarms", "scripting"])
+        #expect(Set(manifest["permissions"] as? [String] ?? []) == ["debugger", "tabs", "webNavigation", "storage", "alarms", "scripting"])
         #expect(manifest["host_permissions"] as? [String] == ["<all_urls>"])
         #expect(manifest["web_accessible_resources"] == nil, "pair.html must not be openable by web pages")
         #expect(manifest["externally_connectable"] == nil)
@@ -1308,10 +1308,15 @@ enum NodeTool {
 ///   dialog <tabId> <type>   the page opens alert()/confirm()/prompt() on its own
 ///   close_dialog <tabId>    the user answers that dialog
 ///   load <tabId>            a held navigation (any address containing "/slow") commits
-///   popup <openerId> <url>  the page opens a tab (target=_blank)
+///   popup <tabId> <url>     the page in that tab opens a tab (target=_blank, window.open). As in
+///                           Chrome, the new tab comes to the front and its openerTabId is the
+///                           tab that was in front; only webNavigation names the real source
+///   open <url>              another app opens a link in Chrome (no opener at all)
 ///   dirty <tabId>           the page has unsaved input: closing it asks "Leave site?"
-/// The CDP method `Test.openDialog` opens a dialog while the command is still running (a click
-/// whose handler calls confirm()). `idleDetachMs` shortens the extension's idle detach delay.
+/// A command whose params include `testDialog: "<type>"` opens that dialog while it's still
+/// running (a click whose handler calls confirm(), the user closing the tab during a read); the
+/// CDP method `Test.openDialog` does the same with `type`. `idleDetachMs` shortens the
+/// extension's idle detach delay.
 final class NodeHarness {
     let process = Process()
     private let input = Pipe()
@@ -1432,6 +1437,7 @@ final class NodeHarness {
     const onRemoved = makeEvent();
     const onCreated = makeEvent();
     const onUpdated = makeEvent();
+    const onCreatedNavigationTarget = makeEvent();
     const noTab = (id) => new Error(`No tab with id: ${id}.`);
     const heldLoads = new Map(); // tab id → commit to run on "load <tabId>"
     const dirtyTabs = new Set(); // tabs whose page asks "Leave site?" when closed
@@ -1459,10 +1465,16 @@ final class NodeHarness {
       }, 5);
     }
 
+    function activate(tab) {
+      for (const other of tabs.values()) if (other.windowId === tab.windowId) other.active = false;
+      tab.active = true;
+    }
+
     function createTab({ url, active, openerTabId }) {
-      const tab = { id: nextTabId++, url: "", title: "", active: !!active, windowId: 10, status: "loading" };
+      const tab = { id: nextTabId++, url: "", title: "", active: false, windowId: 10, status: "loading" };
       if (typeof openerTabId === "number") tab.openerTabId = openerTabId;
       tabs.set(tab.id, tab);
+      if (active) activate(tab);
       onCreated.emit({ ...tab, pendingUrl: url });
       startNavigation(tab, url);
       return tab;
@@ -1487,8 +1499,9 @@ final class NodeHarness {
         },
         async update(id, props) {
           const tab = tabs.get(id); if (!tab) throw noTab(id);
-          const { url, ...rest } = props;
+          const { url, active, ...rest } = props;
           Object.assign(tab, rest);
+          if (active === true) activate(tab);
           if (url !== undefined) startNavigation(tab, url);
           out(`UPDATE ${id} ${JSON.stringify(props)}`);
           return { ...tab };
@@ -1511,6 +1524,7 @@ final class NodeHarness {
         },
         onRemoved, onCreated, onUpdated,
       },
+      webNavigation: { onCreatedNavigationTarget },
       windows: {
         async create({ url }) { const tab = await chrome.tabs.create({ url, active: false }); return { id: 11, tabs: [tab] }; },
         async update(id, props) { out(`FOCUS ${id}`); return {}; },
@@ -1528,6 +1542,11 @@ final class NodeHarness {
         },
         async sendCommand({ tabId }, method, params) {
           if (!attachedTabs.has(tabId)) throw new Error(`Debugger is not attached to the tab with id: ${tabId}.`);
+          const testDialog = method === "Test.openDialog" ? params && params.type : params && params.testDialog;
+          if (testDialog) {
+            onEvent.emit({ tabId }, "Page.javascriptDialogOpening", { type: testDialog, message: `Sure (${testDialog})?` });
+            await new Promise((resolve) => realSetTimeout(resolve, 50));
+          }
           if (method === "Runtime.evaluate" && params && params.expression === "1+1") return { result: { type: "number", value: 2 } };
           if (method === "Page.handleJavaScriptDialog") {
             out(`DIALOG_ANSWERED ${tabId} ${params.accept}`);
@@ -1537,10 +1556,6 @@ final class NodeHarness {
               onEvent.emit({ tabId }, "Page.javascriptDialogClosed", { result: !!params.accept });
               if (finishClose && params.accept) finishClose();
             }, 0);
-          }
-          if (method === "Test.openDialog") {
-            onEvent.emit({ tabId }, "Page.javascriptDialogOpening", { type: params.type, message: `Sure (${params.type})?` });
-            await new Promise((resolve) => realSetTimeout(resolve, 50));
           }
           return { echo: { method, params: params || {} }, attachCount };
         },
@@ -1576,8 +1591,13 @@ final class NodeHarness {
         heldLoads.delete(tabId);
         if (commit) commit();
       } else if (command === "popup") {
-        const tab = createTab({ url: extra, active: false, openerTabId: tabId });
+        const front = [...tabs.values()].find((t) => t.active && t.windowId === 10);
+        const tab = createTab({ url: extra, active: true, openerTabId: front ? front.id : undefined });
+        onCreatedNavigationTarget.emit({ sourceTabId: tabId, sourceFrameId: 0, tabId: tab.id, url: extra, timeStamp: Date.now() });
         out(`POPUP ${tab.id}`);
+      } else if (command === "open") {
+        const tab = createTab({ url: arg, active: false });
+        out(`OPENED ${tab.id}`);
       } else if (command === "dirty") {
         dirtyTabs.add(tabId);
       }
@@ -1785,6 +1805,111 @@ struct ExtensionBridgeEndToEndTests {
         // tab stays attached.
         #expect(await harness.waitFor("DETACH 1", timeout: 10), "\(harness.log)")
         #expect(harness.count("DETACH \(mine.id)") == 0, "\(harness.log)")
+    }
+
+    @Test(.enabled(if: NodeTool.supportsHarness, "Node 22+ isn't installed"))
+    func popupsAreKnownByTheTabWhosePageOpenedThem() async throws {
+        let (bridge, port, token, _) = try await startTestBridge()
+        defer { bridge.stop() }
+        let harness = try NodeHarness(port: port, token: token)
+        defer { harness.stop() }
+        #expect(await bridge.waitForConnection(timeout: 15), "\(harness.log)")
+        let backend = ExtensionBackend(bridge: bridge, connectTimeout: 3)
+        let mine = try await backend.openTab(url: "https://example.org/", background: true)
+        func tabs(until done: ([BrowserTab]) -> Bool) async throws -> [BrowserTab] {
+            var tabs: [BrowserTab] = []
+            for _ in 0..<100 {
+                tabs = try await backend.tabs()
+                if done(tabs) { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            return tabs
+        }
+
+        // Glide clicks a target=_blank link in its background tab. Chrome opens the link in front
+        // and gives it the user's tab (the one in front) as openerTabId; webNavigation says
+        // which page opened it.
+        _ = try await backend.cdp(tabID: mine.id, method: "Input.dispatchMouseEvent", params: ["type": "mouseReleased"])
+        harness.send("popup \(mine.id) https://example.org/pop")
+        #expect(await eventually(3) { harness.values(of: "POPUP").count == 1 }, "\(harness.log)")
+        let ours = try #require(harness.values(of: "POPUP").first)
+        var list = try await tabs { $0.first { $0.id == ours }?.ownedByGlide == true && $0.first { $0.id == "1" }?.active == true }
+        let popup = try #require(list.first { $0.id == ours })
+        #expect(popup.openerID == mine.id && popup.ownedByGlide, "\(popup)")
+        // The user's tab is back in front; Glide carries on in the background.
+        #expect(!popup.active && list.first { $0.id == "1" }?.active == true, "\(list)")
+        #expect(harness.count(#"UPDATE 1 {"active":true}"#) == 1, "\(harness.log)")
+
+        // A link the user opens from their own tab is theirs, and stays in front.
+        harness.send("popup 1 https://example.org/theirs")
+        // A link another app opens has no opener at all.
+        harness.send("open https://example.org/elsewhere")
+        #expect(await eventually(3) { harness.values(of: "POPUP").count == 2 && harness.values(of: "OPENED").count == 1 }, "\(harness.log)")
+        let theirs = try #require(harness.values(of: "POPUP").last)
+        let elsewhere = try #require(harness.values(of: "OPENED").first)
+        list = try await backend.tabs()
+        let fromUser = try #require(list.first { $0.id == theirs })
+        #expect(fromUser.openerID == "1" && !fromUser.ownedByGlide && fromUser.active, "\(fromUser)")
+        let fromApp = try #require(list.first { $0.id == elsewhere })
+        #expect(fromApp.openerID == nil && !fromApp.ownedByGlide, "\(fromApp)")
+
+        // A popup the page in Glide's tab opens by itself, while Glide isn't working there, isn't
+        // Glide's doing; it still says where it came from.
+        try await Task.sleep(for: .milliseconds(2300))
+        harness.send("popup \(mine.id) https://example.org/timer")
+        #expect(await eventually(3) { harness.values(of: "POPUP").count == 3 }, "\(harness.log)")
+        let timer = try #require(harness.values(of: "POPUP").last)
+        try await Task.sleep(for: .milliseconds(200))
+        let byPage = try #require(try await backend.tabs().first { $0.id == timer })
+        #expect(byPage.openerID == mine.id && !byPage.ownedByGlide, "\(byPage)")
+        #expect(harness.count(#"UPDATE 1 {"active":true}"#) == 1, "\(harness.log)")
+    }
+
+    @Test(.enabled(if: NodeTool.supportsHarness, "Node 22+ isn't installed"))
+    func leavePromptsInTheUsersTabsAreAcceptedOnlyForGlidesActions() async throws {
+        let (bridge, port, token, _) = try await startTestBridge()
+        defer { bridge.stop() }
+        let events = EventRecorder()
+        bridge.addEventHandler { events.append($0) }
+        let harness = try NodeHarness(port: port, token: token)
+        defer { harness.stop() }
+        #expect(await bridge.waitForConnection(timeout: 15), "\(harness.log)")
+        let backend = ExtensionBackend(bridge: bridge, connectTimeout: 3)
+        func accepted() -> Int { harness.count("DIALOG_ANSWERED 1 true") }
+
+        // Glide is only reading the user's tab when they close it (or leave a half-filled form):
+        // "Leave site?" is theirs to answer, and Glide's next command says so at once.
+        _ = try await backend.cdp(tabID: "1", method: "Runtime.evaluate", params: ["expression": "document.title", "testDialog": "beforeunload"])
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(accepted() == 0, "\(harness.log)")
+        let blocked = await browserError { _ = try await backend.cdp(tabID: "1", method: "Runtime.evaluate", params: ["expression": "1+1"]) }
+        #expect(blocked?.message.contains("“Leave site?” prompt") == true && blocked?.message.contains("Answer it in Chrome") == true,
+                "\(String(describing: blocked))")
+        harness.send("close_dialog 1")
+        var works = false
+        for _ in 0..<30 where !works {
+            works = (try? await backend.cdp(tabID: "1", method: "Runtime.evaluate", params: ["expression": "1+1"]))?["result"]?["value"]?.intValue == 2
+            if !works { try await Task.sleep(for: .milliseconds(100)) }
+        }
+        #expect(works, "commands work again once the user has answered")
+        // Other dialogs that open during a read are answered as before (confirm() declined).
+        _ = try await backend.cdp(tabID: "1", method: "Runtime.evaluate", params: ["expression": "x", "testDialog": "confirm"])
+        #expect(await harness.waitFor("DIALOG_ANSWERED 1 false"), "\(harness.log)")
+
+        // Glide's own click, or its script click, leaves the page: that's allowed.
+        _ = try await backend.cdp(tabID: "1", method: "Input.dispatchMouseEvent", params: ["type": "mouseReleased", "testDialog": "beforeunload"])
+        #expect(await eventually(3) { accepted() == 1 }, "\(harness.log)")
+        _ = try await backend.cdp(tabID: "1", method: "Runtime.evaluate", params: ["expression": "x", "userGesture": true, "testDialog": "beforeunload"])
+        #expect(await eventually(3) { accepted() == 2 }, "\(harness.log)")
+        // So is a prompt that comes a moment after the action (the click's navigation starts later).
+        harness.send("dialog 1 beforeunload")
+        #expect(await eventually(3) { accepted() == 3 }, "\(harness.log)")
+        #expect(await events.waitFor { if case .dialog(let tab, let d) = $0 { return tab == "1" && d.type == "beforeunload" && d.accepted } else { return false } })
+        // Once Glide has moved on, the prompt is the user's again.
+        try await Task.sleep(for: .milliseconds(2300))
+        harness.send("dialog 1 beforeunload")
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(accepted() == 3, "\(harness.log)")
     }
 
     @Test(.enabled(if: NodeTool.supportsHarness, "Node 22+ isn't installed"))
