@@ -30,8 +30,24 @@ public struct TableData: Codable, Sendable, Hashable {
 public enum TableIO {
     public typealias Reader = @Sendable (_ path: String, _ sheet: String?, _ hasHeader: Bool) throws -> TableData
     /// Updates cells in place (preserving the rest of the file); adds missing columns.
-    /// `keyColumn` nil = match by row order. `updates` are keyed by the key value (or row index as string).
-    public typealias Updater = @Sendable (_ path: String, _ sheet: String?, _ keyColumn: String?, _ updates: [String: [String: String]]) throws -> Void
+    /// `keyColumn` nil = match by row order, where keys are 0-based data-row indexes as strings
+    /// (0 = the first row after the header, as in `TableData.rows`). Otherwise `updates` are keyed
+    /// by the key column's value.
+    public typealias Updater = @Sendable (_ path: String, _ sheet: String?, _ keyColumn: String?, _ updates: [String: [String: String]],
+                                          _ options: UpdateOptions) throws -> Void
+
+    public struct UpdateOptions: Sendable, Hashable {
+        /// Order for columns that don't exist yet (others follow alphabetically).
+        public var columnOrder: [String]
+        /// Who is making the change (job id); a `.bak` copy is kept the first time each owner
+        /// modifies a file that existed before.
+        public var owner: String?
+
+        public init(columnOrder: [String] = [], owner: String? = nil) {
+            self.columnOrder = columnOrder
+            self.owner = owner
+        }
+    }
     public typealias Writer = @Sendable (_ path: String, _ table: TableData) throws -> Void
 
     nonisolated(unsafe) public static var reader: Reader = { path, _, hasHeader in try TableIO.readCSV(path, hasHeader: hasHeader) }

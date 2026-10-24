@@ -204,7 +204,8 @@ struct JobLoopTests {
         let updated = try TableIO.readCSV(path, hasHeader: true)
         #expect(Array(updated.columns.prefix(2)) == ["Company", "Country"])
         #expect(Set(updated.columns) == ["Company", "Country", "website", "ceo"])
-        if usesFallback { #expect(updated.columns == ["Company", "Country", "website", "ceo"]) }
+        // New columns follow the write-back's column order whichever updater ran.
+        #expect(updated.columns == ["Company", "Country", "website", "ceo"])
         #expect(updated.rows.count == 25)
         for (i, row) in updated.records.enumerated() {
             #expect(row["Company"] == "Co \(i + 1)")

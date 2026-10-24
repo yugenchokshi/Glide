@@ -70,17 +70,17 @@ enum JobContextBuilder {
 enum JobWriteBack {
     /// Writes `updates` with an injected updater, else the installed `TableIO.updater`, else
     /// the CSV fallback (which adds new columns in the write-back's column order).
-    static func write(_ path: String, _ wb: WriteBack, _ updates: [String: [String: String]], injected: TableIO.Updater?) throws {
+    static func write(_ path: String, _ wb: WriteBack, _ updates: [String: [String: String]], injected: TableIO.Updater?, owner: String? = nil) throws {
         if let updater = injected ?? TableIO.updater {
-            try updater(path, wb.sheet, wb.keyColumn, updates)
+            try updater(path, wb.sheet, wb.keyColumn, updates, TableIO.UpdateOptions(columnOrder: wb.columns, owner: owner))
         } else {
             try csvUpdate(path, keyColumn: wb.keyColumn, updates: updates, columnOrder: wb.columns)
         }
     }
 
-    /// `TableIO.Updater`-shaped CSV fallback (new columns in alphabetical order).
-    static let csvUpdate: TableIO.Updater = { path, _, keyColumn, updates in
-        try csvUpdate(path, keyColumn: keyColumn, updates: updates, columnOrder: [])
+    /// `TableIO.Updater`-shaped CSV fallback.
+    static let csvUpdate: TableIO.Updater = { path, _, keyColumn, updates, options in
+        try csvUpdate(path, keyColumn: keyColumn, updates: updates, columnOrder: options.columnOrder)
     }
 
     /// Updates cells of a CSV in place: adds missing columns (in `columnOrder`, then

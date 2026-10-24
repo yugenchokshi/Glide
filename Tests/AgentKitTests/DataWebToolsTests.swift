@@ -618,7 +618,7 @@ struct DataWebToolsTests {
             try TableIO.writer(path, TableData(columns: ["k", "v"], rows: [["a", "1"]]))
             #expect(try TableIO.reader(path, nil, true).rows == [["a", "1"]])
             try #require(TableIO.updater != nil)
-            try TableIO.updater?(path, nil, "k", ["a": ["v": "2"], "b": ["v": "3"]])
+            try TableIO.updater?(path, nil, "k", ["a": ["v": "2"], "b": ["v": "3"]], TableIO.UpdateOptions(owner: "test-job"))
             #expect(try TableIO.reader(path, nil, true).rows == [["a", "2"], ["b", "3"]])
             #expect(FileManager.default.fileExists(atPath: path + ".bak"))
             let names = Set(ToolRegistry.standard(settings: AppSettings()).specs(in: [.data]).map(\.name))

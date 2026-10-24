@@ -6,9 +6,10 @@ public enum DataTools {
     /// Call once at launch (app and CLI).
     public static func install() {
         TableIO.reader = { path, sheet, hasHeader in try Spreadsheet.read(path, sheet: sheet, hasHeader: hasHeader) }
-        TableIO.updater = { path, sheet, keyColumn, updates in
-            // Write-back keeps one .bak per file per app session, made before the first change.
-            try Spreadsheet.update(path, sheet: sheet, keyColumn: keyColumn, updates: updates, owner: "job-write-back")
+        TableIO.updater = { path, sheet, keyColumn, updates, options in
+            // A .bak is kept the first time each owner (job) changes a file that existed before.
+            try Spreadsheet.update(path, sheet: sheet, keyColumn: keyColumn, updates: updates,
+                                   owner: options.owner ?? "job-write-back", columnOrder: options.columnOrder)
         }
         TableIO.writer = { path, table in try Spreadsheet.write(path, table) }
         ToolRegistry.registerFactory("data") { _ in tools() }

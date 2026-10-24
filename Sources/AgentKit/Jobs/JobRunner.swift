@@ -875,7 +875,7 @@ public actor JobRunner {
         let batch = pendingWriteBack
         pendingWriteBack = [:]
         do {
-            try JobWriteBack.write(resolvePath(wb.path), wb, batch, injected: config.tableUpdater)
+            try JobWriteBack.write(resolvePath(wb.path), wb, batch, injected: config.tableUpdater, owner: record.id)
             log(ActivityEntry(kind: .tool, title: "Wrote \(batch.count) result\(batch.count == 1 ? "" : "s") to \((wb.path as NSString).lastPathComponent)", route: .data, success: true))
         } catch {
             log(ActivityEntry(kind: .error, title: "Couldn't write results to \((wb.path as NSString).lastPathComponent) yet", detail: error.localizedDescription, route: .data, success: false))
@@ -891,7 +891,7 @@ public actor JobRunner {
         guard !updates.isEmpty else { return }
         let path = resolvePath(wb.path)
         do {
-            try JobWriteBack.write(path, wb, updates, injected: config.tableUpdater)
+            try JobWriteBack.write(path, wb, updates, injected: config.tableUpdater, owner: record.id)
             log(ActivityEntry(kind: .tool, title: "Wrote results for \(updates.count) \(JobPlanner.pluralize(spec.itemLabel, updates.count)) to \((path as NSString).lastPathComponent)", route: .data, success: true))
         } catch {
             throw Interrupt.needsInput("Couldn't write the results back to \(path): \(error.localizedDescription). They're saved in the job; resume to try again.")
