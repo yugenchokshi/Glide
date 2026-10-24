@@ -58,16 +58,39 @@ public struct ActionHint: Codable, Sendable, Hashable {
     }
 }
 
+/// Whether a request runs now as a quick task or becomes a persisted background job.
+public enum PlanMode: String, Codable, Sendable, CaseIterable {
+    /// Run the steps now, in the foreground task.
+    case quick
+    /// Long or repetitive work (many items, waits, schedules, more than ~10 minutes): hand it
+    /// to the job engine, which plans milestones and survives restarts.
+    case job
+}
+
 public struct Plan: Codable, Sendable, Hashable {
     public var goal: String
     public var steps: [PlanStep]
     /// Set when the request can't be planned without more information.
     public var clarification: String?
+    /// How the request should run. Plans saved before this existed decode as `.quick`.
+    public var mode: PlanMode
 
-    public init(goal: String, steps: [PlanStep], clarification: String?) {
+    public init(goal: String, steps: [PlanStep], clarification: String?, mode: PlanMode = .quick) {
         self.goal = goal
         self.steps = steps
         self.clarification = clarification
+        self.mode = mode
+    }
+
+    enum CodingKeys: String, CodingKey { case goal, steps, clarification, mode }
+
+    /// Tolerant decoding so plans stored in task history by older builds (no `mode`) still load.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        goal = try c.decode(String.self, forKey: .goal)
+        steps = try c.decode([PlanStep].self, forKey: .steps)
+        clarification = try c.decodeIfPresent(String.self, forKey: .clarification)
+        mode = ((try? c.decodeIfPresent(PlanMode.self, forKey: .mode)) ?? nil) ?? .quick
     }
 }
 
@@ -76,6 +99,8 @@ enum PlanSchema {
 
     static let schema: JSONValue = Schema.object([
         ("goal", Schema.string("One sentence restating the user's goal.")),
+        ("mode", Schema.string("quick = do it now step by step; job = long or repetitive work that runs in the background (many items, more than ~15 steps, waits or schedules, or more than ~10 minutes).",
+                               enum: PlanMode.allCases.map(\.rawValue))),
         ("clarification", Schema.nullableString("A question for the user if the task is impossible or ambiguous, else null.")),
         ("steps", Schema.array(Schema.object([
             ("title", Schema.string("2-5 word present-progressive label shown to the user, e.g. 'Opening Notes'.")),
@@ -107,7 +132,9 @@ enum PlanSchema {
                 hint: hint))
         }
         let clarification = json["clarification"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
-        return Plan(goal: json["goal"]?.stringValue ?? "", steps: steps, clarification: clarification)
+        // Unknown or missing modes run as quick tasks: the safe default that needs no job host.
+        let mode = json["mode"]?.stringValue.flatMap { PlanMode(rawValue: $0.lowercased()) } ?? .quick
+        return Plan(goal: json["goal"]?.stringValue ?? "", steps: steps, clarification: clarification, mode: mode)
     }
 }
 
@@ -137,16 +164,22 @@ public struct ActorDecision: Sendable, Hashable {
     public var message: String?
     public var toolName: String?
     public var toolArguments: JSONValue?
+    /// GUI batching: further actions to perform in order after this one, against the same
+    /// screen. The runner stops at the first error, unresolved target or unexpected change.
+    public var followUps: [ActorDecision] = []
+    /// The step's output fields (jobs), returned with `step_done`.
+    public var resultFields: [String: JSONValue]? = nil
 }
 
 enum ActorSchema {
     static let actions = ["click", "double_click", "right_click", "type", "key", "scroll", "drag", "focus", "set_value", "select_text",
                           "menu", "launch_app", "activate_app", "open_url", "wait", "call_tool", "none"]
 
-    static let schema: JSONValue = Schema.object([
-        ("thought", Schema.string("One short sentence: what you see and why this action.")),
-        ("status", Schema.string("act = perform the action; step_done = this step is already complete (no action); task_done = whole task complete; need_vision = target is not in the element list and must be found visually; blocked = cannot proceed.", enum: ActorDecision.Status.allCases.map(\.rawValue))),
-        ("action", Schema.string("Action to perform when status is act, else none.", enum: actions)),
+    /// Most follow-up actions one reply may carry (GUI batching).
+    static let maxFollowUps = 5
+
+    /// Fields that describe one concrete action; shared by the main action and follow-ups.
+    static let actionFields: [(String, JSONValue)] = [
         ("element_id", Schema.nullableString("Element id from the list (e.g. e12) the action targets.")),
         ("target_description", Schema.nullableString("Visible label/description of the target when no id fits (used for visual search).")),
         ("text", Schema.nullableString("Text to type or value to set.")),
@@ -161,21 +194,54 @@ enum ActorSchema {
         ("submit", Schema.boolean("Press Return after typing.", nullable: true)),
         ("expect", Schema.nullableString("Visible label expected to appear after the action, if any.")),
         ("risk", Schema.string("Risk of this action.", enum: RiskLevel.allCases.map(\.rawValue))),
+    ]
+
+    /// One follow-up action. Tool calls and `none` aren't allowed in a batch.
+    static let followUpSchema: JSONValue = Schema.object(
+        [("action", Schema.string("Action to perform.", enum: actions.filter { $0 != "call_tool" && $0 != "none" }))] + actionFields)
+
+    static let schema: JSONValue = Schema.object([
+        ("thought", Schema.string("One short sentence: what you see and why this action.")),
+        ("status", Schema.string("act = perform the action; step_done = this step is already complete (no action); task_done = whole task complete; need_vision = target is not in the element list and must be found visually; blocked = cannot proceed.", enum: ActorDecision.Status.allCases.map(\.rawValue))),
+        ("action", Schema.string("Action to perform when status is act, else none.", enum: actions)),
+    ] + actionFields + [
+        ("actions", Schema.array(followUpSchema, description: "Optional follow-up actions (up to \(maxFollowUps)) performed in order AFTER the main action, on this same screen (e.g. fill the next field, then click Save). Only targets from the current list. Null when none.", nullable: true)),
         ("remember", Schema.nullableString("Facts read from the screen worth keeping for later steps (e.g. extracted text), else null.")),
         ("message", Schema.nullableString("For task_done: the result summary for the user. For blocked: why.")),
         ("tool_name", Schema.nullableString("For call_tool: exact tool name.")),
         ("tool_arguments_json", Schema.nullableString("For call_tool: arguments as a JSON object string.")),
+        ("result_fields_json", Schema.nullableString("With step_done, when the step lists output fields: a JSON object string with exactly those fields, else null.")),
     ])
 
     static func decode(_ j: JSONValue) -> ActorDecision {
-        func str(_ k: String) -> String? {
-            guard let s = j[k]?.stringValue, !s.isEmpty, s != "null" else { return nil }
-            return s
+        func str(_ k: String) -> String? { nonEmpty(j[k]) }
+        var d = action(from: j, status: ActorDecision.Status(rawValue: str("status") ?? "act") ?? .act)
+        d.thought = str("thought") ?? ""
+        d.remember = str("remember")
+        d.message = str("message")
+        d.toolName = str("tool_name")
+        d.toolArguments = str("tool_arguments_json").flatMap { JSONValue.extractObject(from: $0) }
+        d.resultFields = str("result_fields_json").flatMap { JSONValue.extractObject(from: $0)?.objectValue }
+        // Capped here so a model can't queue an unbounded batch; items without an action are dropped.
+        d.followUps = (j["actions"]?.arrayValue ?? []).prefix(maxFollowUps).compactMap { item in
+            guard item.objectValue != nil else { return nil }
+            let f = action(from: item, status: .act)
+            return f.action == nil || f.action == "call_tool" ? nil : f
         }
-        let toolArgs = str("tool_arguments_json").flatMap { JSONValue.extractObject(from: $0) }
+        return d
+    }
+
+    private static func nonEmpty(_ v: JSONValue?) -> String? {
+        guard let s = v?.stringValue, !s.isEmpty, s != "null" else { return nil }
+        return s
+    }
+
+    /// Decodes the action fields of the top-level reply or of one follow-up item.
+    private static func action(from j: JSONValue, status: ActorDecision.Status) -> ActorDecision {
+        func str(_ k: String) -> String? { nonEmpty(j[k]) }
         return ActorDecision(
-            status: ActorDecision.Status(rawValue: str("status") ?? "act") ?? .act,
-            thought: str("thought") ?? "",
+            status: status,
+            thought: "",
             action: str("action").flatMap { $0 == "none" ? nil : $0 },
             elementID: str("element_id"),
             targetDescription: str("target_description"),
@@ -191,9 +257,17 @@ enum ActorSchema {
             submit: j["submit"]?.boolValue ?? false,
             expect: str("expect"),
             risk: RiskLevel(rawValue: str("risk") ?? "low") ?? .low,
-            remember: str("remember"),
-            message: str("message"),
-            toolName: str("tool_name"),
-            toolArguments: toolArgs)
+            remember: nil,
+            message: nil,
+            toolName: nil,
+            toolArguments: nil)
+    }
+
+    /// True when two decisions describe the same concrete action (used to drop a follow-up
+    /// that repeats the main action, which would otherwise type or click twice).
+    static func sameAction(_ a: ActorDecision, _ b: ActorDecision) -> Bool {
+        a.action == b.action && a.elementID == b.elementID && a.targetDescription == b.targetDescription && a.text == b.text
+            && a.keys == b.keys && a.menuPath == b.menuPath && a.url == b.url && a.app == b.app && a.toElementID == b.toElementID
+            && a.direction == b.direction
     }
 }

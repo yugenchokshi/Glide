@@ -1,6 +1,106 @@
 import Foundation
 import AutomationKit
 
+/// What the direct routes (command, browser, web, data) and the screen can do right now, so the
+/// planner only plans steps that can actually run and prefers the fast ones.
+public struct RouteAvailability: Sendable, Hashable {
+    public var executionPreference: ExecutionPreference
+    public var commandAccess: CommandAccess
+    public var allowAppleScript: Bool
+    public var allowShortcuts: Bool
+    /// Tool families installed in this process.
+    public var toolFamilies: Set<ToolCategory>
+    /// Status of the preferred browser backend.
+    public var browser: BrowserStatus?
+    /// Glide's own Chrome window can be started on demand when the preferred backend isn't connected.
+    public var browserOnDemand: Bool
+    /// Accessibility permission (needed by gui and native steps).
+    public var accessibilityGranted: Bool
+    /// Something can host background jobs (the app's JobCenter); false in glidectl and tests.
+    public var backgroundJobs: Bool
+
+    public init(executionPreference: ExecutionPreference = .fastest, commandAccess: CommandAccess = .full, allowAppleScript: Bool = true,
+                allowShortcuts: Bool = true, toolFamilies: Set<ToolCategory> = [], browser: BrowserStatus? = nil, browserOnDemand: Bool = false,
+                accessibilityGranted: Bool = true, backgroundJobs: Bool = false) {
+        self.executionPreference = executionPreference
+        self.commandAccess = commandAccess
+        self.allowAppleScript = allowAppleScript
+        self.allowShortcuts = allowShortcuts
+        self.toolFamilies = toolFamilies
+        self.browser = browser
+        self.browserOnDemand = browserOnDemand
+        self.accessibilityGranted = accessibilityGranted
+        self.backgroundJobs = backgroundJobs
+    }
+
+    /// Reads the current state: settings, the installed tool families, the browser hub and the
+    /// Accessibility permission. Cheap (no model calls, no UI).
+    public static func current(settings: AppSettings, tools: ToolRegistry, backgroundJobs: Bool, hub: BrowserHub = .shared) async -> RouteAvailability {
+        let families = Set(tools.specs().map(\.category))
+        var browser: BrowserStatus?
+        var onDemand = false
+        if families.contains(.browser) {
+            let status = await hub.status(settings: settings.browser)
+            browser = status
+            let glideChrome = hub.registered(.glideChrome) != nil && status.chromeInstalled
+            onDemand = glideChrome && (settings.browser.backend == .glideChrome || settings.browser.fallbackToGlideChrome)
+        }
+        return RouteAvailability(executionPreference: settings.tools.executionPreference, commandAccess: settings.tools.commandAccess,
+                                 allowAppleScript: settings.tools.allowAppleScript, allowShortcuts: settings.tools.allowShortcuts,
+                                 toolFamilies: families, browser: browser, browserOnDemand: onDemand,
+                                 accessibilityGranted: AccessibilityEngine.isTrusted, backgroundJobs: backgroundJobs)
+    }
+
+    /// Whether a step on `route` can run now (integrations are reported separately).
+    public func isAvailable(_ route: ExecutionRoute) -> Bool {
+        unavailableReason(route) == nil
+    }
+
+    func unavailableReason(_ route: ExecutionRoute) -> String? {
+        switch route {
+        case .command:
+            if toolFamilies.isDisjoint(with: [.command, .files]) { return "no command tools are installed" }
+            if commandAccess == .off { return "command access is off in Settings" }
+            return nil
+        case .browser:
+            if !toolFamilies.contains(.browser) { return "no browser tools are installed" }
+            if browser?.connected == true || browserOnDemand { return nil }
+            return browser?.chromeInstalled == false ? "Google Chrome isn't installed" : "no browser is connected"
+        case .web: return toolFamilies.contains(.web) ? nil : "no web tools are installed"
+        case .data: return toolFamilies.contains(.data) ? nil : "no spreadsheet tools are installed"
+        case .gui, .native: return accessibilityGranted ? nil : "Accessibility permission isn't granted"
+        case .composio, .mcp, .answer: return nil
+        }
+    }
+
+    var rendered: [String] {
+        var lines: [String] = []
+        switch executionPreference {
+        case .fastest: lines.append("Execution preference: Fastest — use command, browser, web or data whenever they can do the job; gui/native only for what truly needs the screen.")
+        case .showMe: lines.append("Execution preference: Show me — prefer visible native/gui steps so the user can watch; tools are fine for things with no UI.")
+        }
+        lines.append("Routes available now:")
+        func line(_ route: ExecutionRoute, _ detail: String) {
+            if let why = unavailableReason(route) { lines.append("- \(route.rawValue): UNAVAILABLE (\(why))") }
+            else { lines.append("- \(route.rawValue): available" + (detail.isEmpty ? "" : " (\(detail))")) }
+        }
+        let access = commandAccess == .readOnly ? "read-only commands only" : "full access, risky commands ask first"
+        line(.command, "\(access); AppleScript \(allowAppleScript ? "allowed" : "off"); Shortcuts \(allowShortcuts ? "allowed" : "off")")
+        let browserDetail: String
+        if let b = browser, b.connected { browserDetail = "\(b.backend.title), connected" }
+        else if browserOnDemand { browserDetail = "Glide's own Chrome window opens on demand" }
+        else { browserDetail = "" }
+        line(.browser, browserDetail)
+        line(.web, "")
+        line(.data, "CSV and XLSX")
+        line(.gui, "")
+        line(.native, "")
+        lines.append(backgroundJobs ? "Background jobs: available (use mode job for long or repetitive work)."
+                                    : "Background jobs: not available here — always use mode quick.")
+        return lines
+    }
+}
+
 public struct PlanningContext: Sendable {
     public var frontmostApp: String?
     public var windowTitle: String?
@@ -10,9 +110,11 @@ public struct PlanningContext: Sendable {
     public var mcpTools: [MCPTool]
     public var skills: [Skill]
     public var date = Date()
+    /// Which routes can run right now. Nil leaves the route section out of the prompt.
+    public var routes: RouteAvailability?
 
     public init(frontmostApp: String? = nil, windowTitle: String? = nil, runningApps: [String] = [], browserPage: String? = nil,
-                composioToolkits: [String] = [], mcpTools: [MCPTool] = [], skills: [Skill] = []) {
+                composioToolkits: [String] = [], mcpTools: [MCPTool] = [], skills: [Skill] = [], routes: RouteAvailability? = nil) {
         self.frontmostApp = frontmostApp
         self.windowTitle = windowTitle
         self.runningApps = runningApps
@@ -20,6 +122,7 @@ public struct PlanningContext: Sendable {
         self.composioToolkits = composioToolkits
         self.mcpTools = mcpTools
         self.skills = skills
+        self.routes = routes
     }
 
     var rendered: String {
@@ -29,6 +132,7 @@ public struct PlanningContext: Sendable {
         if let f = frontmostApp { lines.append("Frontmost app: \(f)" + (windowTitle.map { " — window “\($0)”" } ?? "")) }
         if let b = browserPage { lines.append("Current browser page: \(b)") }
         if !runningApps.isEmpty { lines.append("Running apps: " + runningApps.prefix(25).joined(separator: ", ")) }
+        if let routes { lines += routes.rendered }
         lines.append("Connected Composio toolkits: " + (composioToolkits.isEmpty ? "none" : composioToolkits.joined(separator: ", ")))
         if mcpTools.isEmpty {
             lines.append("MCP tools: none")
@@ -112,6 +216,10 @@ public struct ActionSelector: Sendable {
         var notes: String
         var extraContext: String?
         var tools: String?
+        /// Fields the step must return with step_done (job steps); empty for quick tasks.
+        var outputFields: [String] = []
+        /// Follow-up actions the actor may batch after the main one (0 = batching off).
+        var maxFollowUps: Int = 0
     }
 
     public func decide(_ input: Input) async throws -> ActorDecision {
@@ -125,6 +233,11 @@ public struct ActionSelector: Sendable {
         CURRENT STEP \(input.step.id): \(input.step.instruction)
         Done when: \(input.step.doneWhen)
         """
+        if !input.outputFields.isEmpty {
+            message += "\nOutput fields (return with step_done in result_fields_json): " + input.outputFields.joined(separator: ", ")
+        }
+        message += input.maxFollowUps > 0 ? "\nFollow-up actions allowed this turn: up to \(input.maxFollowUps)."
+                                          : "\nFollow-up actions: not allowed (set actions to null)."
         if !input.notes.isEmpty { message += "\n\nNotes so far:\n\(input.notes.suffix(5000))" }
         message += "\n\nActions so far in this step:\n" + (input.history.isEmpty ? "(none)" : input.history.suffix(10).joined(separator: "\n"))
         if let extra = input.extraContext { message += "\n\n\(extra)" }
