@@ -84,8 +84,10 @@ public actor JobRunner {
     // Per-run bookkeeping (a resumed job starts these fresh).
     private let clock = SuspendingClock()
     private var lastTick: SuspendingClock.Instant
-    private var approvalsWaiting = 0
-    private var approvalWaitStart: SuspendingClock.Instant?
+    /// Waits for the user in progress (approvals and screen-lease waits, possibly several at
+    /// once from parallel items); their time isn't work time.
+    private var waitsInProgress = 0
+    private var waitStart: SuspendingClock.Instant?
     private var excludedSeconds = 0.0
     /// Executor calls since the last measurable progress (an item finished or a step advanced).
     private var callsWithoutProgress = 0
@@ -204,7 +206,7 @@ public actor JobRunner {
     }
 
     private func runMilestones() async throws {
-        while true {
+        milestones: while true {
             guard let plan = record.plan else { throw Interrupt.failed("The job's plan is missing.") }
             let mi = record.cursor.milestoneIndex
             guard plan.milestones.indices.contains(mi) else { return }
@@ -218,13 +220,15 @@ public actor JobRunner {
             }
             // Steps (re-read every turn: verification may append a remedial step).
             while let m = record.plan?.milestones[mi], record.cursor.stepIndex < m.steps.count {
-                let step = m.steps[record.cursor.stepIndex]
+                let si = record.cursor.stepIndex
+                let step = m.steps[si]
                 try checkpoint()
                 switch step.kind {
                 case .action(let r): try await runAction(step, r, milestoneIndex: mi)
                 case .forEach(let spec): try await runForEach(step, spec, milestoneIndex: mi)
                 case .wait(let w): try await runWait(step, w, milestone: m)
                 }
+                if continueRetry(after: (mi, si)) { continue milestones }
             }
             // A daily wait repeats the rest of the milestone.
             if let m = record.plan?.milestones[mi], let daily = Self.dailyWait(in: m) {
@@ -257,6 +261,61 @@ public actor JobRunner {
         record.cursor.stepIndex += 1
         callsWithoutProgress = 0
         persist()
+    }
+
+    /// Where a job goes back to after "Retry failed items" sent it back to earlier loops (saved
+    /// in the job's engine state, so it survives pauses and restarts). Without it the job would
+    /// run on from the loop and redo every step it had already finished after it, including
+    /// sends and writes, and skip the confirmation of milestones approved the first time.
+    struct RetryReturn: Codable, Equatable, Sendable {
+        /// How far the job had got.
+        var cursor: JobCursor
+        /// Step ids of the loops being redone (all before `cursor`).
+        var loops: [Int]
+
+        static let stateKey = "retryReturn"
+
+        static func load(jobID: String, store: JobStore) -> RetryReturn? {
+            store.state(jobID: jobID, key: stateKey).flatMap { try? JSONDecoder().decode(RetryReturn.self, from: Data($0.utf8)) }
+        }
+
+        func save(jobID: String, store: JobStore) {
+            guard let data = try? JSONEncoder().encode(self) else { return }
+            store.setState(jobID: jobID, key: Self.stateKey, value: String(decoding: data, as: UTF8.self))
+        }
+
+        /// Whether `a` is an earlier position in the plan than `b`.
+        static func precedes(_ a: JobCursor, _ b: JobCursor) -> Bool {
+            (a.milestoneIndex, a.stepIndex) < (b.milestoneIndex, b.stepIndex)
+        }
+    }
+
+    /// After the step at `position` finished during a retry of failed items: on to the next loop
+    /// being redone, or straight back to where the job had got to. Returns whether it moved.
+    private func continueRetry(after position: (milestone: Int, step: Int)) -> Bool {
+        guard let back = RetryReturn.load(jobID: jobID, store: store), let plan = record.plan else { return false }
+        let target = (back.cursor.milestoneIndex, back.cursor.stepIndex)
+        // Never move backwards: a return the job has already passed is stale.
+        guard (position.milestone, position.step) < target else {
+            store.setState(jobID: jobID, key: RetryReturn.stateKey, value: nil)
+            return false
+        }
+        let next = back.loops.compactMap { JobCenter.position(ofStep: $0, in: plan) }
+            .filter { ($0.milestone, $0.step) > (position.milestone, position.step) && ($0.milestone, $0.step) < target }
+            .min { ($0.milestone, $0.step) < ($1.milestone, $1.step) }
+        if let next {
+            record.cursor.milestoneIndex = next.milestone
+            record.cursor.stepIndex = next.step
+            // Keep the iteration the loop's items belong to, so they aren't rebuilt.
+            record.cursor.waitIteration = Int(store.state(jobID: jobID, key: "materialized:\(next.stepID)") ?? "") ?? 0
+        } else {
+            record.cursor = back.cursor
+            store.setState(jobID: jobID, key: RetryReturn.stateKey, value: nil)
+            log(ActivityEntry(kind: .recovery, title: "Retried the failed items; carrying on from where the job was"))
+        }
+        callsWithoutProgress = 0
+        persist()
+        return true
     }
 
     // MARK: - Checkpoints, budgets, stuck detection
@@ -305,13 +364,14 @@ public actor JobRunner {
         return f.string(from: max(0, seconds)) ?? "\(Int(seconds)) s"
     }
 
-    /// Adds running time to `activeSeconds`, leaving out time spent waiting for approvals.
-    /// Uses a clock that stops while the Mac sleeps.
+    /// Adds running time to `activeSeconds`, leaving out time spent waiting for the user: for
+    /// approvals, and for the screen (until they're idle, or behind another job's on-screen
+    /// step). Uses a clock that stops while the Mac sleeps.
     private func tick() {
         let now = clock.now
-        if approvalsWaiting > 0, let start = approvalWaitStart {
+        if waitsInProgress > 0, let start = waitStart {
             excludedSeconds += Self.seconds(now - max(start, lastTick))
-            approvalWaitStart = now
+            waitStart = now
         }
         let elapsed = Self.seconds(now - lastTick) - excludedSeconds
         excludedSeconds = 0
@@ -348,7 +408,16 @@ public actor JobRunner {
             let line = record.statusLine
             record.statusLine = settings.jobs.screenUse == .whenIdle ? "Waiting until you're idle to use the screen…" : "Waiting to use the screen…"
             callbacks.update(record)
-            try await acquireLease()
+            // Waiting for the user to step away (or for another job's on-screen step) can take
+            // hours; it mustn't use up the job's time budget.
+            waitBegan()
+            do {
+                try await acquireLease()
+            } catch {
+                waitEnded()
+                throw error
+            }
+            waitEnded()
             record.statusLine = line
         }
         callsWithoutProgress += 1
@@ -425,13 +494,13 @@ public actor JobRunner {
 
     private func requestApproval(_ request: ApprovalRequest) async -> ApprovalDecision {
         if gate.isStopped || Task.isCancelled { return .stop }
-        approvalBegan()
+        waitBegan()
         let line = record.statusLine
         let waitingLine = "Waiting for your OK: \(request.title)"
         record.statusLine = waitingLine
         persist()
         let decision = await callbacks.approve(request)
-        approvalEnded()
+        waitEnded()
         // Other items may have moved the progress line on meanwhile; only undo our own text.
         if record.statusLine == waitingLine { record.statusLine = line }
         switch decision {
@@ -445,16 +514,16 @@ public actor JobRunner {
         return decision
     }
 
-    private func approvalBegan() {
+    private func waitBegan() {
         tick()
-        approvalsWaiting += 1
-        if approvalsWaiting == 1 { approvalWaitStart = clock.now }
+        waitsInProgress += 1
+        if waitsInProgress == 1 { waitStart = clock.now }
     }
 
-    private func approvalEnded() {
+    private func waitEnded() {
         tick()
-        approvalsWaiting = max(0, approvalsWaiting - 1)
-        if approvalsWaiting == 0 { approvalWaitStart = nil }
+        waitsInProgress = max(0, waitsInProgress - 1)
+        if waitsInProgress == 0 { waitStart = nil }
     }
 
     private func askToStart(_ m: Milestone, index: Int, of count: Int) async throws {
@@ -521,7 +590,8 @@ public actor JobRunner {
 
     // MARK: - Loops
 
-    private func runForEach(_ step: JobStep, _ spec: ForEachSpec, milestoneIndex: Int) async throws {
+    private func runForEach(_ step: JobStep, _ planned: ForEachSpec, milestoneIndex: Int) async throws {
+        let spec = withSourceSheet(planned)
         let iteration = record.cursor.waitIteration
         try materializeIfNeeded(step, spec, iteration: iteration)
         if store.resetRunningItems(jobID: jobID, stepID: step.id) > 0 {
@@ -830,6 +900,16 @@ public actor JobRunner {
     /// runs). Declining keeps the results in the job's table, ready to export.
     private func writeBackAllowed(_ step: JobStep, _ spec: ForEachSpec) async throws -> Bool {
         guard let wb = spec.writeBack, !wb.columns.isEmpty else { return false }
+        // The updaters read a file's first row as its column names. In the headerless file the
+        // items came from, they'd write the new column names over the first item's row and put
+        // every result one row too low.
+        if case .file(let path, _, _, false) = spec.source, sameFile(path, wb.path) {
+            let name = (wb.path as NSString).lastPathComponent
+            log(ActivityEntry(kind: .info, title: "Results will stay in the job instead of \(name)",
+                              detail: "\(name) has no header row, so results can't be matched to its rows safely. Export them as CSV when the job is done.",
+                              stepID: step.id))
+            return false
+        }
         let key = "writeBack:\(step.id)"
         if let answer = store.state(jobID: jobID, key: key) { return answer == "approved" }
         let path = resolvePath(wb.path)
@@ -854,6 +934,22 @@ public actor JobRunner {
         case .stop:
             throw Interrupt.stopped
         }
+    }
+
+    /// Writing back into the file the items came from goes to the sheet they came from. The
+    /// planner may leave the write-back's sheet out, and the updater would then pick the first
+    /// sheet and write results by row number into the rows of a different table.
+    private func withSourceSheet(_ spec: ForEachSpec) -> ForEachSpec {
+        guard var wb = spec.writeBack, wb.sheet == nil, case .file(let path, let sheet?, _, _) = spec.source, sameFile(path, wb.path) else { return spec }
+        var spec = spec
+        wb.sheet = sheet
+        spec.writeBack = wb
+        return spec
+    }
+
+    private func sameFile(_ a: String, _ b: String) -> Bool {
+        func canonical(_ p: String) -> String { URL(fileURLWithPath: resolvePath(p)).standardizedFileURL.resolvingSymlinksInPath().path }
+        return canonical(a) == canonical(b)
     }
 
     static func writeBackUpdate(_ item: JobItem, _ wb: WriteBack) -> (key: String, values: [String: String])? {
