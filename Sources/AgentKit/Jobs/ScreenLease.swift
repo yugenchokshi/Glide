@@ -10,7 +10,12 @@ import CoreGraphics
 /// go ahead of queued jobs (a job holding the lease finishes its current step first) and skip
 /// the idle check.
 public actor ScreenLease {
-    public static let shared = ScreenLease()
+    public static let shared: ScreenLease = {
+        // Read once, on first use (the main actor in the app and glidectl), so the runtime's
+        // lazily made executor is never first created from the lease's own thread.
+        let input = AutomationRuntime.shared.executor.input
+        return ScreenLease(lastSyntheticInput: { input.lastPost })
+    }()
 
     public enum LeaseError: Error, LocalizedError, Sendable, Equatable {
         /// Background jobs aren't allowed to use the screen (`ScreenUse.never`).
@@ -23,8 +28,10 @@ public actor ScreenLease {
         }
     }
 
-    /// Seconds since the user's last mouse or keyboard input.
+    /// Seconds since the last mouse or keyboard input (the user's or Glide's own).
     public typealias IdleProbe = @Sendable () -> Double
+    /// When Glide last posted synthetic mouse or keyboard input (`InputSynthesizer.lastPost`).
+    public typealias SyntheticInputProbe = @Sendable () -> Date
 
     private struct Waiter {
         let id: UUID
@@ -33,21 +40,30 @@ public actor ScreenLease {
         let continuation: CheckedContinuation<Void, any Error>
     }
 
+    /// An input event this close to one of Glide's posts is taken to be that post.
+    static let syntheticWindow: Double = 0.5
+
     private var holder: String?
     private var depth = 0
     private var waiters: [Waiter] = []
-    /// When the current/last hold started and ended; Glide's own synthetic input during a hold
-    /// mustn't count as the user being active.
-    private var heldSince: Date?
-    private var lastHeld: (start: Date, end: Date)?
+    /// The newest input seen that Glide didn't post. The system only reports when the very last
+    /// event happened, so once one of Glide's own events is the latest, this is the evidence of
+    /// when the user last did something.
+    private var lastUserInput: Date?
+    /// Samples the idle time while the lease is held, to catch the user between Glide's actions.
+    private var sampler: Task<Void, Never>?
     private let idleProbe: IdleProbe
+    private let lastSyntheticInput: SyntheticInputProbe
     private let pollInterval: Double
 
     /// - Parameters:
-    ///   - idleProbe: seconds since the user's last input (defaults to the HID system state).
+    ///   - idleProbe: seconds since the last input (defaults to the HID system state).
+    ///   - lastSyntheticInput: when Glide last posted input itself; without it, all input counts
+    ///     as the user's.
     ///   - pollInterval: how often `.whenIdle` re-checks the user's idle time.
-    public init(idleProbe: IdleProbe? = nil, pollInterval: Double = 1) {
+    public init(idleProbe: IdleProbe? = nil, lastSyntheticInput: SyntheticInputProbe? = nil, pollInterval: Double = 1) {
         self.idleProbe = idleProbe ?? ScreenLease.systemIdleSeconds
+        self.lastSyntheticInput = lastSyntheticInput ?? { .distantPast }
         self.pollInterval = max(0.01, pollInterval)
     }
 
@@ -87,8 +103,8 @@ public actor ScreenLease {
         if depth > 1 { depth -= 1; return }
         depth = 0
         holder = nil
-        if let start = heldSince { lastHeld = (start, Date()) }
-        heldSince = nil
+        sampler?.cancel()
+        sampler = nil
         handOff()
     }
 
@@ -137,7 +153,26 @@ public actor ScreenLease {
     private func grant(_ owner: String) {
         holder = owner
         depth = 1
-        heldSince = Date()
+        startSampling()
+    }
+
+    /// While the lease is held, Glide's input keeps becoming the latest event and hides the
+    /// user's, so the idle time is sampled between Glide's actions: a user who comes back
+    /// mid-step is still noticed by the next step's idle check.
+    private func startSampling() {
+        sampler?.cancel()
+        let interval = min(pollInterval, 0.5)
+        sampler = Task.detached(priority: .utility) { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(interval))
+                guard !Task.isCancelled, let lease = self else { return }
+                await lease.sample()
+            }
+        }
+    }
+
+    private func sample() {
+        _ = userIdleSeconds()
     }
 
     private func handOff() {
@@ -160,20 +195,22 @@ public actor ScreenLease {
         }
     }
 
-    /// The user's idle time, ignoring input Glide itself synthesized while it held the lease:
-    /// if the last input event happened during a hold, the user has been idle at least since
-    /// that hold began (they had to be idle for the lease to be granted).
+    /// The user's idle time. Only input Glide actually posted is discounted, not everything
+    /// during a hold: quick tasks hold the lease for their whole run, tool-only ones included,
+    /// and the user is free to keep working meanwhile. When the latest event is one of Glide's,
+    /// the user has been idle since the last input seen that wasn't; if none was seen, Glide's
+    /// own event counts, which errs on the side of waiting.
     private func userIdleSeconds() -> Double {
         let idle = idleProbe()
+        guard idle.isFinite else { return idle }
         let now = Date()
         let lastEvent = now.addingTimeInterval(-idle)
-        if let start = heldSince, lastEvent >= start.addingTimeInterval(-0.25) {
-            return max(idle, now.timeIntervalSince(start))
+        guard abs(lastEvent.timeIntervalSince(lastSyntheticInput())) <= Self.syntheticWindow else {
+            lastUserInput = max(lastUserInput ?? lastEvent, lastEvent)
+            return idle
         }
-        if let held = lastHeld, lastEvent >= held.start.addingTimeInterval(-0.25), lastEvent <= held.end.addingTimeInterval(0.5) {
-            return max(idle, now.timeIntervalSince(held.start))
-        }
-        return idle
+        guard let user = lastUserInput else { return idle }
+        return max(idle, now.timeIntervalSince(user))
     }
 
     /// Seconds since the last mouse or keyboard event in the login session.

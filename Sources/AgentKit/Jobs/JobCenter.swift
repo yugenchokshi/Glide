@@ -21,6 +21,19 @@ public final class JobCenter {
     /// A job reached completed/failed/stopped.
     public var onJobFinished: ((JobRecord) -> Void)?
 
+    /// Which jobs a center looks after on its own: wakes them when they're due, continues them
+    /// when it finds them interrupted or another process lets go of them, and pauses them on
+    /// the emergency stop.
+    public enum Scope: Sendable {
+        /// Every job in the store (the app).
+        case allJobs
+        /// Only the jobs it was asked to create, start, resume or retry. glidectl shares the
+        /// app's store; looking after everything there would take the app's jobs over (with
+        /// glidectl's settings and nobody answering their approvals) and leave them half done
+        /// when glidectl exits.
+        case ownJobs
+    }
+
     /// Everything the center depends on. Production wires the shared store, settings, the
     /// planning model and the installed step router; tests inject their own.
     struct Environment {
@@ -38,6 +51,12 @@ public final class JobCenter {
         var removeFolder: @Sendable (URL) throws -> Void
         var now: @Sendable () -> Date = { Date() }
         var schedulerMaxSleep: Double = 60
+        /// Closes the browser tabs a job opened (when it ends without its runner doing so).
+        var releaseBrowser: @Sendable (String) async -> Void = { await BrowserSessions.shared.releaseJob($0) }
+        /// How often jobs another process is running are re-checked.
+        var elsewherePollSeconds: Double = 2
+        /// Which jobs the center looks after on its own (glidectl: only its own).
+        var scope: Scope = .allJobs
 
         static func production() -> Environment {
             Environment(
@@ -79,6 +98,20 @@ public final class JobCenter {
     @ObservationIgnored private var launched = false
     @ObservationIgnored private var previewItems: [String: [JobItem]]?
     @ObservationIgnored private var previewEvents: [String: [ActivityEntry]]?
+    /// Cross-process locks this center holds (see `JobRunLock`): the jobs it is running or
+    /// planning, and briefly a job it is changing, so another process can't take it meanwhile.
+    @ObservationIgnored private var locks: [String: JobRunLock] = [:]
+    /// Jobs `create` is planning.
+    @ObservationIgnored private var planningIDs: Set<String> = []
+    @ObservationIgnored private var elsewhereWatch: Task<Void, Never>?
+    @ObservationIgnored private var watchingKeepAwake = false
+    /// Jobs this center was asked to create, start, resume or retry (what `.ownJobs` looks after).
+    @ObservationIgnored private var owned: Set<String> = []
+
+    /// Jobs another process (glidectl, or a second copy of Glide) is running right now. They
+    /// share the job store, so this center leaves them alone and only shows what that process
+    /// saves; once it lets go, they're handled like jobs found after a restart.
+    public private(set) var runningElsewhere: Set<String> = []
 
     public init() {}
 
@@ -87,10 +120,12 @@ public final class JobCenter {
     }
 
     /// A center that uses `settings` instead of the saved settings (glidectl uses this to run
-    /// with a different model provider without touching what the app has saved).
-    public convenience init(settingsOverride settings: AppSettings) {
+    /// with a different model provider without touching what the app has saved). glidectl
+    /// passes `.ownJobs`, so it leaves the app's jobs to the app.
+    public convenience init(settingsOverride settings: AppSettings, scope: Scope = .allJobs) {
         var env = Environment.production()
         env.settings = { settings }
+        env.scope = scope
         self.init(environment: env)
     }
 
@@ -115,6 +150,12 @@ public final class JobCenter {
     /// update a moment after the status changes).
     public func isRunnerActive(_ id: String) -> Bool { runners[id] != nil }
 
+    /// Whether another process (glidectl, or a second copy of Glide) is running the job.
+    public func isRunningElsewhere(_ id: String) -> Bool { runningElsewhere.contains(id) }
+
+    /// Whether this center looks after the job on its own (see `Scope`).
+    private func looksAfter(_ id: String) -> Bool { env.scope == .allJobs || owned.contains(id) }
+
     /// Call once at app launch: loads jobs, resumes interrupted ones (per settings) and
     /// schedules waiting ones.
     public func launch() {
@@ -125,29 +166,46 @@ public final class JobCenter {
         let actions = JobScheduler.launchActions(for: jobs, autoResume: settings.jobs.autoResume)
         // Oldest first, so queued jobs keep their order.
         for job in jobs.reversed() {
-            guard let action = actions[job.id], var r = env.store.job(job.id) else { continue }
-            switch action {
-            case .resume:
-                log(job.id, ActivityEntry(kind: .info, title: "Continuing after Glide restarted"))
-                startOrQueue(job.id)
-            case .markInterrupted:
-                r.status = .paused
-                r.statusLine = "Interrupted — resume to continue"
-                r.lastError = "Glide quit while this job was running."
-                save(r)
-            case .markPlanningFailed:
-                r.status = .failed
-                r.statusLine = "Failed: planning was interrupted"
-                r.lastError = "Planning was interrupted when Glide quit. Try the request again."
-                save(r)
-            }
+            guard let action = actions[job.id] else { continue }
+            recover(job.id, action, afterRestart: true)
         }
         reschedule()
+    }
+
+    /// Handles a job left running, planning or queued with nobody working on it: found at
+    /// launch, or let go by another process before it finished.
+    private func recover(_ id: String, _ action: JobScheduler.LaunchAction, afterRestart: Bool) {
+        // Another process is working on it: leave it alone until that process lets go. A job
+        // this center doesn't look after is left alone too.
+        guard looksAfter(id), claim(id) else { return }
+        defer { releaseIfIdle(id) }
+        guard var r = env.store.job(id) else { return }
+        switch action {
+        case .resume:
+            log(id, ActivityEntry(kind: .info, title: afterRestart ? "Continuing after Glide restarted" : "Continuing here after the other Glide process quit"))
+            startOrQueue(id)
+        case .markInterrupted:
+            r.status = .paused
+            r.statusLine = "Interrupted — resume to continue"
+            r.lastError = afterRestart ? "Glide quit while this job was running." : "The other Glide process running this job quit before it finished."
+            save(r)
+        case .markPlanningFailed:
+            r.status = .failed
+            r.statusLine = "Failed: planning was interrupted"
+            r.lastError = afterRestart ? "Planning was interrupted when Glide quit. Try the request again."
+                : "Planning was interrupted when the other Glide process quit. Try the request again."
+            save(r)
+        }
     }
 
     /// Reloads the list from disk.
     public func reload() {
         jobs = env.store.allJobs().filter { !pendingDeletion.contains($0.id) }
+        runningElsewhere = []
+        let elsewhere = jobs.filter { r in
+            r.status.isActive && runners[r.id] == nil && locks[r.id] == nil && JobRunLock.isHeld(folder: lockFolder(r.id))
+        }
+        for r in elsewhere { markElsewhere(r.id) }
     }
 
     /// Plans a job from a request. Small jobs (under the confirmation thresholds) start right
@@ -158,6 +216,15 @@ public final class JobCenter {
         let settings = env.settings()
         let id = UUID().uuidString
         let folder = env.store.ensureFolder(for: id)
+        // Held while planning, so another process starting meanwhile doesn't take the half-made
+        // job for one interrupted by a quit.
+        planningIDs.insert(id)
+        _ = claim(id)
+        owned.insert(id)
+        defer {
+            planningIDs.remove(id)
+            releaseIfIdle(id)
+        }
         var record = JobRecord(id: id, title: Self.shortTitle(text.isEmpty ? "Untitled job" : text), instruction: text, status: .planning,
                                folder: folder.path, budget: settings.jobs.defaultBudget)
         record.statusLine = "Planning…"
@@ -238,7 +305,10 @@ public final class JobCenter {
 
     /// Starts a job that is awaiting confirmation.
     public func start(_ id: String) {
+        guard claim(id) else { return }
+        defer { releaseIfIdle(id) }
         guard let r = env.store.job(id), r.status == .awaitingConfirmation else { return }
+        owned.insert(id)
         log(id, ActivityEntry(kind: .approval, title: "Confirmed by you", success: true))
         startOrQueue(id)
     }
@@ -253,6 +323,9 @@ public final class JobCenter {
             }
             return
         }
+        // Changes to a job another process is running would be overwritten by (or overwrite) its own saves.
+        guard claim(id) else { return }
+        defer { releaseIfIdle(id) }
         guard var r = env.store.job(id) else { return }
         // A sleeping or queued job just stops being scheduled; its wake time is kept.
         guard r.status == .waiting else { return }
@@ -265,7 +338,10 @@ public final class JobCenter {
     }
 
     public func resume(_ id: String) {
-        guard runners[id] == nil, !queue.contains(id), var r = env.store.job(id), r.status.isResumable else { return }
+        guard runners[id] == nil, !queue.contains(id), claim(id) else { return }
+        defer { releaseIfIdle(id) }
+        guard var r = env.store.job(id), r.status.isResumable else { return }
+        owned.insert(id)
         let now = env.now()
         // Resuming a sleeping job means "go now".
         if r.status == .waiting, let wake = r.nextWakeAt, wake > now { r.nextWakeAt = now }
@@ -288,19 +364,24 @@ public final class JobCenter {
             return
         }
         queue.removeAll { $0 == id }
+        guard claim(id) else { return }
+        defer { releaseIfIdle(id) }
         guard var r = env.store.job(id), !r.status.isFinished else { return }
         r.status = .stopped
         r.nextWakeAt = nil
         r.statusLine = "Stopped"
         save(r)
         log(id, ActivityEntry(kind: .info, title: "Stopped by you"))
+        // A run that ended paused, waiting or needing input kept the job's browser tab.
+        releaseBrowserTabs(id)
         onJobFinished?(r)
         reschedule()
     }
 
     /// Emergency stop: cancels every running job's step in flight immediately (the same way
     /// Stop does, so commands and browser actions end now), but leaves the jobs paused so they
-    /// can be resumed. Waiting and queued jobs are paused too.
+    /// can be resumed. Waiting and queued jobs this center looks after are paused too; glidectl's
+    /// Ctrl-C must not pause the app's sleeping jobs, which would then never wake.
     public func haltAll() {
         for (id, handle) in runners {
             halting.insert(id)
@@ -309,7 +390,7 @@ public final class JobCenter {
             handle.task.cancel()
         }
         for id in queue { pause(id) }
-        for job in jobs where job.status == .waiting && runners[job.id] == nil { pause(job.id) }
+        for job in jobs where job.status == .waiting && runners[job.id] == nil && looksAfter(job.id) { pause(job.id) }
     }
 
     /// Re-queues failed items of a finished or paused job and resumes it.
@@ -319,17 +400,35 @@ public final class JobCenter {
             env.store.requeueFailedItems(jobID: id)
             return
         }
+        guard claim(id) else { return }
+        defer { releaseIfIdle(id) }
         guard var r = env.store.job(id), let plan = r.plan, r.status != .planning, r.status != .awaitingConfirmation else { return }
         let steps = env.store.requeueFailedItems(jobID: id)
         guard !steps.isEmpty else { return }
+        owned.insert(id)
         for s in steps { env.store.setState(jobID: id, key: "failureBaseline:\(s)", value: nil) }
-        // Move back to the earliest loop with re-queued items if the job is already past it.
         let positions = steps.compactMap { Self.position(ofStep: $0, in: plan) }.sorted { ($0.milestone, $0.step) < ($1.milestone, $1.step) }
+        // Remember how far the job had got. Once the loops behind that point are redone it goes
+        // straight back there, so the steps it already finished after them (sends, writes,
+        // approval-gated milestones) don't run again. A return still pending from an earlier
+        // retry keeps its place and gains the new loops.
+        let earlier = JobRunner.RetryReturn.load(jobID: id, store: env.store).flatMap { JobRunner.RetryReturn.precedes(r.cursor, $0.cursor) ? $0 : nil }
+        let reached = earlier?.cursor ?? r.cursor
+        let behind = positions.filter { ($0.milestone, $0.step) < (reached.milestoneIndex, reached.stepIndex) }.map(\.stepID)
+        if !behind.isEmpty {
+            // A wait the job was sleeping in keeps its due time for when the job gets back to it.
+            JobRunner.RetryReturn(cursor: reached, loops: Array(Set((earlier?.loops ?? []) + behind)).sorted(),
+                                  wakeAt: earlier.map(\.wakeAt) ?? r.nextWakeAt).save(jobID: id, store: env.store)
+        }
+        // Move back to the earliest loop with re-queued items if the job is already past it.
         if let first = positions.first, (first.milestone, first.step) < (r.cursor.milestoneIndex, r.cursor.stepIndex) {
             r.cursor.milestoneIndex = first.milestone
             r.cursor.stepIndex = first.step
             // Keep the iteration the loop's items belong to, so they aren't rebuilt.
             r.cursor.waitIteration = Int(env.store.state(jobID: id, key: "materialized:\(first.stepID)") ?? "") ?? 0
+            // The loops run first. The wait the job was sleeping in, if any, gets its due time
+            // back with the return above instead of starting over.
+            r.nextWakeAt = nil
             env.store.clearState(jobID: id, prefix: "remedial:")
         }
         let c = env.store.progressCounts(jobID: id, maxAttempts: max(1, r.budget.maxItemAttempts))
@@ -337,8 +436,8 @@ public final class JobCenter {
         r.usage.itemsDone = c.done
         r.usage.itemsFailed = c.failed
         r.usage.itemsSkipped = c.skipped
+        // A job that stays where it is (sleeping in a wait before the loops) keeps its wake time.
         r.status = .paused
-        r.nextWakeAt = nil
         r.lastError = nil
         r.statusLine = "Retrying failed items…"
         save(r)
@@ -348,6 +447,8 @@ public final class JobCenter {
 
     /// Deletes the job's record (its folder is moved to the Trash).
     public func delete(_ id: String) {
+        // Another process is running it; deleting would pull its records out from under it.
+        guard runners[id] != nil || claim(id) else { return }
         resolveApprovals(id, with: .stop)
         queue.removeAll { $0 == id }
         jobs.removeAll { $0.id == id }
@@ -367,6 +468,9 @@ public final class JobCenter {
         let folder = env.store.job(id).map { URL(fileURLWithPath: $0.folder, isDirectory: true) } ?? env.store.folder(for: id)
         env.store.deleteJob(id)
         jobs.removeAll { $0.id == id }
+        // The lock file lives in the folder that's about to go.
+        locks.removeValue(forKey: id)?.release()
+        releaseBrowserTabs(id)
         // Only ever remove folders Glide created for jobs.
         let root = env.store.jobsRoot.standardizedFileURL.resolvingSymlinksInPath().path
         let target = folder.standardizedFileURL.resolvingSymlinksInPath()
@@ -403,9 +507,17 @@ public final class JobCenter {
         return env.store.events(jobID: jobID, limit: limit)
     }
 
-    /// Writes the job's result table(s) as CSV to `url`. The main results (the first loop's
-    /// table) go to `url`; any other tables go next to it as `<name>-<table>.csv`.
+    /// Writes the job's result table(s) as CSV. The main results (the first loop's table) go to
+    /// `url`, the file the user picked; any other tables go next to it as `<name>-<table>.csv`.
+    /// The user never saw those names, so an existing file is never replaced: " 2", " 3"… is
+    /// added instead.
     public func exportResults(_ jobID: String, to url: URL) throws {
+        try exportResultFiles(jobID, to: url)
+    }
+
+    /// `exportResults`, returning every file written (`url` first), so callers can show them all.
+    @discardableResult
+    public func exportResultFiles(_ jobID: String, to url: URL) throws -> [URL] {
         guard let record = env.store.job(jobID) ?? job(jobID) else { throw JobCenterError.notFound }
         let existing = env.store.tableNames(jobID: jobID).filter { env.store.rowCount(jobID: jobID, table: $0) > 0 }
         let loops: [ForEachSpec] = record.plan?.milestones.flatMap(\.steps).compactMap {
@@ -418,8 +530,9 @@ public final class JobCenter {
         if ordered.isEmpty, existing.contains("steps") { ordered = ["steps"] }
         guard !ordered.isEmpty else { throw JobCenterError.nothingToExport }
         let base = url.deletingPathExtension()
+        var written: [URL] = []
         for (i, table) in ordered.enumerated() {
-            let dest = i == 0 ? url : base.deletingLastPathComponent().appendingPathComponent("\(base.lastPathComponent)-\(Self.fileSafe(table)).csv")
+            let dest = i == 0 ? url : Self.unusedExportURL(in: base.deletingLastPathComponent(), name: "\(base.lastPathComponent)-\(Self.fileSafe(table))", besides: written)
             let spec = loops.first { $0.outputTable == table }
             let rows = env.store.rows(jobID: jobID, table: table)
             var columns: [String] = []
@@ -433,6 +546,20 @@ public final class JobCenter {
                 [row.key] + columns.map { c in JobWriteBack.cell(row.fields[c] ?? JobWriteBack.field(c, in: row.fields) ?? .null) }
             })
             try TableIO.writeCSV(dest.path, data)
+            written.append(dest)
+        }
+        return written
+    }
+
+    /// `<name>.csv` in `folder`, or `<name> 2.csv`, `<name> 3.csv`… when that file exists or this
+    /// export already wrote it (two table names can map to the same file name).
+    nonisolated static func unusedExportURL(in folder: URL, name: String, besides written: [URL]) -> URL {
+        let taken = Set(written.map { $0.standardizedFileURL.path.lowercased() })
+        var n = 1
+        while true {
+            let candidate = folder.appendingPathComponent(n == 1 ? "\(name).csv" : "\(name) \(n).csv")
+            if !taken.contains(candidate.standardizedFileURL.path.lowercased()), !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+            n += 1
         }
     }
 
@@ -448,7 +575,12 @@ public final class JobCenter {
     // MARK: - Running
 
     private func startOrQueue(_ id: String) {
-        guard runners[id] == nil, !pendingDeletion.contains(id), var record = env.store.job(id) else { return }
+        guard runners[id] == nil, !pendingDeletion.contains(id), env.store.job(id) != nil else { return }
+        // Another process is running it: leave it to that process.
+        guard claim(id) else { return }
+        // Only a started runner keeps the lock.
+        defer { releaseIfIdle(id) }
+        guard var record = env.store.job(id) else { return }
         let settings = env.settings()
         guard record.plan != nil else {
             record.status = .failed
@@ -461,7 +593,8 @@ public final class JobCenter {
         if runners.count >= max(1, settings.jobs.maxConcurrentJobs) {
             if !queue.contains(id) { queue.append(id) }
             record.status = .waiting
-            record.nextWakeAt = nil
+            // The wake time stays: a wait that came due finishes when the job gets its turn,
+            // instead of starting over (a daily run would otherwise slip to the next day).
             record.statusLine = "Queued — waiting for another job to finish"
             save(record)
             return
@@ -473,6 +606,7 @@ public final class JobCenter {
             record.statusLine = "Failed: step runner not installed"
             save(record)
             log(id, ActivityEntry(kind: .error, title: "Step runner not installed", success: false))
+            releaseBrowserTabs(id)
             onJobFinished?(record)
             onAttentionNeeded?(id)
             return
@@ -504,6 +638,8 @@ public final class JobCenter {
         var r = r
         if pausing.contains(r.id), r.status == .running { r.statusLine = "Pausing after the current step…" }
         upsert(r)
+        // Also catches a "Keep my Mac awake" change the settings observation can't see.
+        updateKeepAwake()
     }
 
     private func runnerFinished(_ id: String, _ final: JobRecord) {
@@ -531,6 +667,8 @@ public final class JobCenter {
                 break
             }
         }
+        // Its final record is saved; another process may take the job from here.
+        releaseIfIdle(id)
         drainQueue()
         reschedule()
         updateKeepAwake()
@@ -540,37 +678,159 @@ public final class JobCenter {
         let max = Swift.max(1, env.settings().jobs.maxConcurrentJobs)
         while runners.count < max, !queue.isEmpty {
             let id = queue.removeFirst()
-            guard let r = env.store.job(id), r.status == .waiting, r.nextWakeAt == nil else { continue }
+            // Queued jobs keep a wake time that already came due; one still in the future is
+            // the scheduler's to start.
+            guard let r = env.store.job(id), r.status == .waiting, r.nextWakeAt.map({ $0 <= env.now() }) ?? true else { continue }
             startOrQueue(id)
         }
+    }
+
+    /// Jobs the scheduler may wake: ones this center looks after, not running here or elsewhere,
+    /// and not already queued.
+    private var schedulable: [JobRecord] {
+        jobs.filter { looksAfter($0.id) && runners[$0.id] == nil && !queue.contains($0.id) && !runningElsewhere.contains($0.id) }
     }
 
     private func reschedule() {
         if scheduler == nil {
             let s = JobScheduler(maxSleepSeconds: env.schedulerMaxSleep, now: env.now) { [weak self] id in self?.wake(id) }
-            s.currentJobs = { [weak self] in
-                guard let self else { return [] }
-                return self.jobs.filter { self.runners[$0.id] == nil }
-            }
+            s.currentJobs = { [weak self] in self?.schedulable ?? [] }
             scheduler = s
         }
-        scheduler?.reschedule(jobs.filter { runners[$0.id] == nil })
+        scheduler?.reschedule(schedulable)
     }
 
     private func wake(_ id: String) {
-        guard runners[id] == nil, let r = env.store.job(id), r.status == .waiting, let wake = r.nextWakeAt, wake <= env.now() else { return }
+        guard runners[id] == nil, looksAfter(id), let r = env.store.job(id) else { return }
+        guard r.status == .waiting, let wake = r.nextWakeAt, wake <= env.now() else {
+            // Another process changed it meanwhile (ran it, or put it back to sleep until later):
+            // show what it saved, so it isn't woken again and the scheduler arms for its new time.
+            if r.status.isActive, JobRunLock.isHeld(folder: lockFolder(id)) { markElsewhere(id) } else { upsert(r, force: true) }
+            return
+        }
         log(id, ActivityEntry(kind: .info, title: "Waking up"))
         startOrQueue(id)
     }
 
     private func updateKeepAwake() {
-        env.keepAwake?(!runners.isEmpty && env.settings().jobs.keepAwake)
+        guard let keepAwake = env.keepAwake else { return }
+        keepAwake(!runners.isEmpty && env.settings().jobs.keepAwake)
+        watchKeepAwakeSetting()
+    }
+
+    /// Follows "Keep my Mac awake" while jobs run: switching it off releases the assertion right
+    /// away and switching it on takes it, instead of waiting for a job to start or finish.
+    private func watchKeepAwakeSetting() {
+        guard !watchingKeepAwake else { return }
+        watchingKeepAwake = true
+        let settings = env.settings
+        withObservationTracking {
+            _ = settings().jobs.keepAwake
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.watchingKeepAwake = false
+                self.updateKeepAwake()
+            }
+        }
+    }
+
+    // MARK: - Other processes
+
+    /// The job's lock lives in its folder (derived from the id, so every process agrees on it).
+    private func lockFolder(_ id: String) -> URL { env.store.folder(for: id) }
+
+    /// Takes the job's cross-process lock unless this center already holds it. False when another
+    /// process is working on the job; it's then shown as running elsewhere until that ends.
+    private func claim(_ id: String) -> Bool {
+        if locks[id] != nil { return true }
+        // Nothing to protect (and no folder to make) for a job that doesn't exist.
+        guard planningIDs.contains(id) || env.store.job(id) != nil else { return true }
+        guard let lock = JobRunLock.tryAcquire(folder: lockFolder(id)) else {
+            markElsewhere(id)
+            return false
+        }
+        locks[id] = lock
+        runningElsewhere.remove(id)
+        return true
+    }
+
+    /// Lets go of the job's lock unless this center is running or planning it.
+    private func releaseIfIdle(_ id: String) {
+        guard runners[id] == nil, !planningIDs.contains(id) else { return }
+        locks.removeValue(forKey: id)?.release()
+    }
+
+    private func markElsewhere(_ id: String) {
+        runningElsewhere.insert(id)
+        queue.removeAll { $0 == id }
+        if let r = env.store.job(id) { upsert(Self.shownAsElsewhere(r), force: true) }
+        watchElsewhere()
+    }
+
+    /// Polls while other processes run jobs: shows their saved progress, and handles each job
+    /// like one found after a restart once its process lets go (a crashed process drops its
+    /// lock too).
+    private func watchElsewhere() {
+        guard elsewhereWatch == nil else { return }
+        let interval = max(0.01, env.elsewherePollSeconds)
+        elsewhereWatch = Task { @MainActor [weak self] in
+            while true {
+                try? await Task.sleep(for: .seconds(interval))
+                guard let self, !Task.isCancelled else { return }
+                if !self.checkElsewhere() {
+                    self.elsewhereWatch = nil
+                    return
+                }
+            }
+        }
+    }
+
+    /// One look at the jobs other processes are running. Returns whether any still are.
+    private func checkElsewhere() -> Bool {
+        for id in runningElsewhere.sorted() {
+            guard let r = env.store.job(id) else {
+                // Deleted by the other process.
+                runningElsewhere.remove(id)
+                jobs.removeAll { $0.id == id }
+                continue
+            }
+            if JobRunLock.isHeld(folder: lockFolder(id)) {
+                upsert(Self.shownAsElsewhere(r), force: true)
+                continue
+            }
+            runningElsewhere.remove(id)
+            upsert(r, force: true)
+            // Only taken over when this center looks after it; glidectl just shows the app's.
+            if looksAfter(id), let action = JobScheduler.launchActions(for: [r], autoResume: env.settings().jobs.autoResume)[id] {
+                recover(id, action, afterRestart: false)
+            }
+        }
+        reschedule()
+        return !runningElsewhere.isEmpty
+    }
+
+    /// The record as shown while another process runs it (only in memory; never saved).
+    nonisolated static func shownAsElsewhere(_ r: JobRecord) -> JobRecord {
+        var r = r
+        r.statusLine = "Running in another Glide process" + (r.statusLine.isEmpty ? "" : " · " + r.statusLine)
+        return r
+    }
+
+    /// Closes the browser tabs the job opened. Its runner does this when a run finishes the
+    /// job; this covers jobs that end, or go away, without a runner.
+    private func releaseBrowserTabs(_ id: String) {
+        let release = env.releaseBrowser
+        Task { await release(id) }
     }
 
     // MARK: - Approvals
 
-    private func enqueueApproval(jobID: String, _ request: ApprovalRequest) async -> ApprovalDecision {
-        guard runners[jobID] != nil, !pendingDeletion.contains(jobID) else { return .stop }
+    func enqueueApproval(jobID: String, _ request: ApprovalRequest) async -> ApprovalDecision {
+        // A Stop (or the emergency stop) can land after the runner checked for one and before
+        // this call. Queuing then would leave the stopped runner waiting on a card for a job the
+        // user already stopped, holding its slot and keeping the Mac awake.
+        guard let handle = runners[jobID], !handle.runner.isStopRequested, !pendingDeletion.contains(jobID) else { return .stop }
         return await withCheckedContinuation { (c: CheckedContinuation<ApprovalDecision, Never>) in
             approvalQueues[jobID, default: []].append((request, c))
             if pendingApprovals[jobID] == nil {

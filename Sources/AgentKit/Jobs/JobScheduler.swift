@@ -64,9 +64,13 @@ final class JobScheduler {
         timer?.cancel()
         timer = nil
         let current = now()
-        for id in Self.dueJobs(jobs, now: current) { onDue(id) }
-        // Jobs just fired are no longer waiting from our point of view.
-        let remaining = jobs.filter { $0.status == .waiting && ($0.nextWakeAt.map { $0 > current } ?? false) }
+        let due = Self.dueJobs(jobs, now: current)
+        for id in due { onDue(id) }
+        // Waking can change a job: it starts, or turns out to have been put back to sleep until
+        // later by another process. Look again, so that new wake time gets a timer too. Jobs
+        // just fired are no longer waiting from our point of view.
+        let latest = due.isEmpty ? jobs : (currentJobs?() ?? jobs)
+        let remaining = latest.filter { $0.status == .waiting && ($0.nextWakeAt.map { $0 > current } ?? false) }
         guard let next = Self.earliestWake(remaining) else {
             nextWake = nil
             return

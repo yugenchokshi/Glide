@@ -250,7 +250,9 @@ func jobCommand(settings base: AppSettings) async -> Int32 {
     var settings = base
     applyMock(&settings)
     settings.safety.pauseOnUserInput = false
-    let center = JobCenter(settingsOverride: settings)
+    // The store is shared with the app: look after only the job this command runs, so the
+    // app's jobs aren't woken, taken over or paused (Ctrl-C) from here.
+    let center = JobCenter(settingsOverride: settings, scope: .ownJobs)
     center.reload()
     switch positional.first {
     case "list":
@@ -287,8 +289,12 @@ func jobCommand(settings base: AppSettings) async -> Int32 {
         } else {
             guard let prefix = positional.dropFirst().first, let j = center.jobs.first(where: { $0.id.hasPrefix(prefix) }) else { print("job not found"); return 1 }
             id = j.id
+            // The app and glidectl share the job store; two runners would repeat the job's work.
+            guard !center.isRunningElsewhere(id) else { print(runningElsewhereMessage); return 1 }
             guard j.status.isResumable else { print("✗ This job is \(j.status.rawValue) and can't be resumed."); return 1 }
             center.resume(id)
+            // The app may have started it between the list being read and the resume.
+            if center.isRunningElsewhere(id) { print(runningElsewhereMessage); return 1 }
         }
         signal(SIGINT, SIG_IGN)
         let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
@@ -321,6 +327,8 @@ func jobCommand(settings base: AppSettings) async -> Int32 {
         return 2
     }
 }
+
+let runningElsewhereMessage = "✗ Glide is already running this job in another process (the app, or another glidectl). Pause or stop it there first."
 
 func printPlan(_ plan: JobPlan) {
     print("Plan: \(plan.goal)")
