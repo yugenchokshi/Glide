@@ -121,9 +121,13 @@ enum FileLocks {
     }
 }
 
-/// Tracks which files Glide has backed up (and created) in this process, per job. The first
-/// in-place change a job makes to a file it didn't create leaves `<file>.bak` with the file as
-/// it was, so a bad write-back can always be undone by hand.
+/// Tracks which files Glide has backed up (and created), per job. The first in-place change a
+/// job makes to a file it didn't create leaves `<file>.bak` with the file as it was, so a bad
+/// write-back can always be undone by hand.
+///
+/// A job can outlive the process (it's resumed after a relaunch, or by `glidectl job resume`),
+/// so each backup is also tagged with its owner in an extended attribute. A resumed job sees its
+/// own backup and keeps it, instead of replacing the original with its half-written file.
 enum FileProvenance {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var backedUp: Set<String> = []
@@ -144,6 +148,10 @@ enum FileProvenance {
         let needed = lock.withLock { !backedUp.contains(k) }
         guard needed else { return nil }
         let bak = path + ".bak"
+        if let owner, isPersistent(owner), backupOwner(bak) == owner {
+            lock.withLock { _ = backedUp.insert(k) }
+            return nil
+        }
         let tmp = (path as NSString).deletingLastPathComponent + "/.\(UUID().uuidString).glide-bak"
         do {
             try fm.copyItem(atPath: path, toPath: tmp)
@@ -156,8 +164,31 @@ enum FileProvenance {
             try? fm.removeItem(atPath: tmp)
             throw SpreadsheetError.toolFailed("Couldn't make a backup copy of “\((path as NSString).lastPathComponent)” before changing it: \(error.localizedDescription)")
         }
+        if let owner, isPersistent(owner) { setBackupOwner(bak, owner) }
         lock.withLock { _ = backedUp.insert(k) }
         return bak
+    }
+
+    /// Forgets what this process remembers, as a relaunch would (tests use it).
+    static func forgetInMemory() { lock.withLock { backedUp.removeAll(); created.removeAll() } }
+
+    /// Quick tasks share one owner name and never resume, so only job owners are remembered
+    /// across processes.
+    private static func isPersistent(_ owner: String) -> Bool { owner != "quick-task" && owner != "-" }
+
+    static let ownerAttribute = "dev.glide.backup-owner"
+
+    static func backupOwner(_ path: String) -> String? {
+        var buffer = [UInt8](repeating: 0, count: 256)
+        let n = getxattr(path, ownerAttribute, &buffer, buffer.count, 0, 0)
+        guard n > 0 else { return nil }
+        return String(decoding: buffer.prefix(n), as: UTF8.self)
+    }
+
+    /// Best effort: without the tag a resumed job just makes a fresh backup, as before.
+    private static func setBackupOwner(_ path: String, _ owner: String) {
+        let bytes = Array(owner.utf8.prefix(255))
+        _ = setxattr(path, ownerAttribute, bytes, bytes.count, 0, 0)
     }
 }
 

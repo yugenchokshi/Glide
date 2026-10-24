@@ -1,6 +1,6 @@
 # Design: long-running jobs and fast tools
 
-Status: in development on `feature/long-jobs-and-speed`. This is the build spec. Shared contracts are already in the code; each component below is built against them.
+Status: implemented on `feature/long-jobs-and-speed`. This was the build spec and is kept as the design record. Where the code ended up different, see [Implementation notes](#implementation-notes) at the end; the code is the reference.
 
 ## Goals
 
@@ -558,3 +558,50 @@ Use BoardKit components and `BKTheme` (read `BoardKit.swift` first; match the ex
 1. Call each family's `install()` at launch (app and glidectl) plus `StepRouter.install()`, `ExtensionBridge.shared.start`, and register `GlideChromeBackend` with `BrowserHub`.
 2. Add glidectl commands: `job run|list|show|resume|stop`, `browser status|open|snapshot|click|type|read`, `tool list|run`.
 3. End-to-end checks: the mock-model command route; jobs over a local CSV with the mock executor and with the scripted model; the browser driver headless; the extension bridge with a fake client; a live run with the user's Chrome extension once it's installed.
+
+---
+
+## Implementation notes
+
+Differences between this spec and the code, as built. Only differences visible in the code are listed.
+
+**Extension bridge and pairing**
+
+- The pairing token never goes over the wire. Instead of `?token=<token>`, the extension connects to `ws://127.0.0.1:<port>/glide?v=1&nonce=<unix seconds>.<32 hex>&proof=<hmac>`, where the proof is HMAC-SHA256(token, `"glide-bridge/v1 client " + nonce`). The bridge refuses nonces more than 120 seconds off or already used. Glide's `hello` request carries its own proof, HMAC(token, `"glide-bridge/v1 server " + nonce`), and the extension obeys nothing else until it has checked it, so a program squatting on the port can't command the browser.
+- The bridge is a raw TCP `NWListener` that parses the HTTP upgrade and does RFC 6455 framing itself (`WebSocketCodec`), not `NWProtocolWebSocket`: the latter doesn't expose the request path, so the proof couldn't be checked, and it can't answer the plain-HTTP `GET /glide/ping` probe the extension uses to tell "Glide isn't running" from "pairing refused". It also rejects requests whose `Host` isn't loopback.
+- Whether an extension has paired is stored in the Keychain (`browser.bridge-paired`) next to the token (`browser.bridge-token`). The `hello` reply also carries `protocol`.
+- The extension does more than the spec asked: it refuses a list of DevTools methods (reading all cookies, clearing cookies, cache or site data, ignoring certificate errors, download behavior); it answers JavaScript dialogs itself and reports them as `dialog` events; it treats `about:` pages other than `about:blank`/`about:srcdoc` and `javascript:` URLs as restricted; when the user dismisses Chrome's debugging bar, it pauses until **Allow again** in the popup; it detaches from every tab when Glide disconnects; the popup can also forget the pairing.
+- The extension id is `ijondegifnhgojpklbepjoeocacalghd` (`ExtensionBridge.extensionID`, recomputed with `swift scripts/extension_id.swift`).
+- `browser.bridgePort` exists in settings but Settings › Browser has no control for it.
+
+**Paths and storage**
+
+- Everything lives under `~/Library/Application Support/Glide/`, not `…/NotchBuddy/`: the database is `glide.sqlite` (shared with task history), job folders are `Jobs/<id>/`, and Glide's Chrome profile is `GlideChrome/`.
+- `JobStore` has one more table than listed, `job_state`, for per-job bookkeeping: which budget stopped the job, write-back answers, remedial-step counts, failure-rate baselines and loop materialization.
+
+**Tools and data**
+
+- `TableIO.Updater` takes a fifth parameter, `UpdateOptions(columnOrder:owner:)`: the order for columns that don't exist yet, and the owner (job id, else the item or `"quick-task"`) that decides when a `.bak` is made. Backups are tracked per owner, in memory and in a `dev.glide.backup-owner` extended attribute on the `.bak`, so a job resumed in a new process (after a relaunch, or `glidectl job resume`) keeps its original backup.
+- CSV writes neutralize formula-like text (prefixed with `'`). XLSX updates refuse to overwrite shared or array formula cells and ask Excel to recalculate on open.
+- `shell.run` spawns with `posix_spawn` and `POSIX_SPAWN_SETPGROUP` (`ProcessRunner`), because `Foundation.Process` can't start the child in a new process group. The environment filter also drops names containing `PASSWD` and `CREDENTIAL`.
+- *Off* and *Read-only* command access also leave tools out of the registry (*Off* removes the whole family; *Read-only* leaves out tools that can only change things), on top of blocking calls.
+- `fs.read` also extracts RTF and Word text. `clipboard.read` refuses items a password manager marked as concealed. `sheet.read` has a `start_row` argument.
+- Web tools are not all low risk: URLs on this Mac or the local network are medium. They refuse URLs with an embedded password. `web.search` POSTs to DuckDuckGo's HTML endpoint and fails with a clear message on a bot check.
+- `ToolStepRunner` caps a batch at 10 calls, and a step that has 2 calls declined ends as blocked and asks the user how to proceed.
+- `BrowserSessions` keeps at most 4 Glide-opened tabs per job and 12 overall, closing the least recently used.
+
+**Jobs**
+
+- Writing back into a spreadsheet that already exists asks for approval once per loop. The answer is stored in `job_state`; declining keeps the results in the job's table.
+- The emergency stop calls `JobCenter.haltAll()`: it cancels every runner like Stop does, but the jobs end `.paused` (resumable) instead of `.stopped`. Waiting and queued jobs are paused too.
+- Resuming a job that stopped on a budget extends that budget by its original amount.
+- An item whose step returns `blocked` (it needs the user, e.g. a sign-in) is failed without further retries.
+- `JobRunner` caps loop parallelism at 8 regardless of the plan; the planner's own caps (4, 2 with browser, 1 with screen steps) are as specified.
+- Jobs that were still being planned (no plan saved yet) when Glide quit fail at launch with a message, since planning can't continue.
+- The quick-task handoff goes through `ExecutionOrchestrator`'s `JobHandoff` closure, which `TaskController` supplies; the planner is told whether background jobs are available (`RouteAvailability.backgroundJobs`), which is false in `glidectl run` and tests.
+
+**glidectl**
+
+- Implemented: `tool list [--category]`, `tool run <name> '<json>' [--yes] [--headless] [--json]`, `browser status`, `job run "<task>" [--mock-url] [--yes]`, `job list`, `job show <id>`, `job resume <id>`.
+- Not implemented: `job stop` (Ctrl-C during `job run` or `job resume` halts the job, paused), and `browser open|snapshot|click|type|read` (use `tool run browser.*`; each `tool run` is its own process, so tab state doesn't carry over).
+- `glidectl` always uses Glide's own Chrome, because the app owns the bridge port.

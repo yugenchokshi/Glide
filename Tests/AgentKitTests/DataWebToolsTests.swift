@@ -334,6 +334,25 @@ struct DataWebToolsTests {
             #expect(throws: SpreadsheetError.self) { try Spreadsheet.update(path, keyColumn: nil, updates: ["first": ["a": "b"]]) }
         }
 
+        @Test func resumedJobKeepsItsOriginalBackup() throws {
+            let dir = try tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+            let path = dir.appendingPathComponent("companies.csv").path
+            let original = "Company,Shout\nAcme,\nGlobex,\n"
+            try original.write(toFile: path, atomically: true, encoding: .utf8)
+            let job = "job-\(UUID().uuidString)"
+            try Spreadsheet.update(path, keyColumn: "Company", updates: ["Acme": ["Shout": "ACME"]], owner: job)
+            #expect(FileProvenance.backupOwner(path + ".bak") == job)
+            // The job is resumed in a new process: its half-written file must not replace the original.
+            FileProvenance.forgetInMemory()
+            let c = try Spreadsheet.update(path, keyColumn: "Company", updates: ["Globex": ["Shout": "GLOBEX"]], owner: job)
+            #expect(c.backupPath == nil)
+            #expect(try String(contentsOfFile: path + ".bak", encoding: .utf8) == original)
+            // Another job still backs up the file as it finds it.
+            let other = try Spreadsheet.update(path, keyColumn: "Company", updates: ["Acme": ["Shout": "acme"]], owner: "job-\(UUID().uuidString)")
+            #expect(other.backupPath == path + ".bak")
+            #expect(try String(contentsOfFile: path + ".bak", encoding: .utf8).contains("GLOBEX"))
+        }
+
         @Test func appendCreatesThenExtends() throws {
             let dir = try tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
             let path = dir.appendingPathComponent("log.csv").path
