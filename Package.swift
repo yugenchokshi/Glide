@@ -42,7 +42,7 @@ let package = Package(
         // Local mock MCP (stdio) and scripted OpenAI-compatible endpoint for tests.
         .executableTarget(name: "NBMockServers"),
         .testTarget(name: "AutomationKitTests", dependencies: ["AutomationKit"]),
-        .testTarget(name: "AgentKitTests", dependencies: ["AgentKit", "AutomationKit"]),
+        .testTarget(name: "AgentKitTests", dependencies: ["AgentKit", "AutomationKit"], resources: [.copy("Fixtures")]),
     ],
     swiftLanguageModes: [.v6]
 )
