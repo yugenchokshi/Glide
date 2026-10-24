@@ -169,6 +169,24 @@ enum BrowserRisk {
         return key.count == 1 ? (mods.contains("shift") ? key.uppercased() : key) : nil
     }
 
+    static let focusMoved = "Glide can't tell which field gets text typed after Tab, Enter or a similar key in the same call. Press that key first, then type in a separate call."
+
+    /// Keys that keep focus where it is: typing, Backspace/Delete, and the editing shortcuts
+    /// (select all, copy, cut, paste, undo, redo). Caret keys only count inside a text field;
+    /// anywhere else they can move focus (radio groups, menus, lists).
+    static func keepsFocus(key: String, mods: Set<String>, inTextField: Bool) -> Bool {
+        let command = !mods.isDisjoint(with: ["meta", "cmd", "command", "super", "control", "ctrl"])
+        let alt = !mods.isDisjoint(with: ["alt", "option", "opt"])
+        if !command && !alt {
+            if typedText(key: key, mods: mods) != nil { return key != "space" && key != "spacebar" || inTextField }
+            if ["backspace", "delete", "del"].contains(key) { return true }
+            let caret: Set<String> = ["arrowleft", "left", "arrowright", "right", "arrowup", "up", "arrowdown", "down", "home", "end"]
+            return inTextField && caret.contains(key)
+        }
+        if command && !alt { return ["a", "c", "x", "v", "z", "y", "backspace", "delete", "del"].contains(key) }
+        return false
+    }
+
     static func press(keys: String, page: PageSnapshot?) -> ToolVerdict {
         let summary = "Press \(PageSnapshot.clip(keys, 60))\(on(page))"
         let focused = page?.focusedElement
@@ -176,13 +194,22 @@ enum BrowserRisk {
         let combos = keys.split(whereSeparator: \.isWhitespace).map(pressCombo)
 
         // Pressing keys one at a time types just like browser.type, so the same fields are off
-        // limits: password fields and payment card details, typed or pasted.
+        // limits: password fields and payment card details, typed or pasted. The snapshot only
+        // says where focus is now, so text typed after a key that can move focus (Tab, Enter,
+        // Escape, a shortcut…) could land in any field, even one on the next page.
         var typed = ""
         var entersText = false
+        var moved = false
         for c in combos {
-            if let t = typedText(key: c.key, mods: c.mods) { typed += t; entersText = true }
             let command = !c.mods.isDisjoint(with: ["meta", "cmd", "command", "super", "control", "ctrl"])
-            if (command && c.key == "v") || (c.mods.contains("shift") && c.key == "insert") { entersText = true }
+            let pastes = (command && c.key == "v") || (c.mods.contains("shift") && c.key == "insert")
+            let types = typedText(key: c.key, mods: c.mods)
+            if (types != nil || pastes) && moved {
+                return ToolVerdict(risk: .high, reasons: ["types after moving focus"], blocked: focusMoved, summary: summary)
+            }
+            if let t = types { typed += t; entersText = true }
+            if pastes { entersText = true }
+            if !keepsFocus(key: c.key, mods: c.mods, inTextField: inTextField) { moved = true }
         }
         if entersText, let f = focused {
             if f.secure || f.inputType == "password" {

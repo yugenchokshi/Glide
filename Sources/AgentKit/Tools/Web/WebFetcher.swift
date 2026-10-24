@@ -256,11 +256,13 @@ public enum WebFetcher {
 
     private static func perform(_ request: URLRequest, maxBytes: Int) async throws -> FetchedResource {
         guard let url = request.url else { throw WebError.invalidURL("The request has no URL.") }
-        let originIsLocal = isLocalHost(url.host)
-        // A public-looking name that points into this Mac or the local network was judged as
-        // a public page; refuse it rather than reach a local service unasked.
+        var originIsLocal = isLocalHost(url.host)
+        // The user asked for this address, so a name that resolves to this Mac or the local
+        // network (a corporate intranet on split DNS, Tailscale, a `.test` dev host) is fetched
+        // as a local origin rather than refused. The redirect and connection-peer checks below
+        // still refuse a *public* origin that is steered to a local address (DNS rebinding).
         if !originIsLocal, let host = url.host, await resolvesToLocal(host) {
-            throw WebError.refused("\(host) points to an address on this Mac or your local network. Use that address itself (for example http://192.168.1.1/) so Glide can ask first, or open it in the browser.")
+            originIsLocal = true
         }
         return try await perform(request, maxBytes: maxBytes, originIsLocal: originIsLocal, resolvesToLocal: { await resolvesToLocal($0) })
     }

