@@ -250,7 +250,9 @@ func jobCommand(settings base: AppSettings) async -> Int32 {
     var settings = base
     applyMock(&settings)
     settings.safety.pauseOnUserInput = false
-    let center = JobCenter(settingsOverride: settings)
+    // The store is shared with the app: look after only the job this command runs, so the
+    // app's jobs aren't woken, taken over or paused (Ctrl-C) from here.
+    let center = JobCenter(settingsOverride: settings, scope: .ownJobs)
     center.reload()
     switch positional.first {
     case "list":

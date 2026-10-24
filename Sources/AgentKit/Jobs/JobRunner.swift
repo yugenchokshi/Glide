@@ -272,6 +272,9 @@ public actor JobRunner {
         var cursor: JobCursor
         /// Step ids of the loops being redone (all before `cursor`).
         var loops: [Int]
+        /// When the wait at `cursor` was due, if the job was sleeping there. Restored on the way
+        /// back, so a 24-hour wait 22 hours in doesn't start over after the retry.
+        var wakeAt: Date? = nil
 
         static let stateKey = "retryReturn"
 
@@ -310,6 +313,7 @@ public actor JobRunner {
             record.cursor.waitIteration = Int(store.state(jobID: jobID, key: "materialized:\(next.stepID)") ?? "") ?? 0
         } else {
             record.cursor = back.cursor
+            record.nextWakeAt = back.wakeAt
             store.setState(jobID: jobID, key: RetryReturn.stateKey, value: nil)
             log(ActivityEntry(kind: .recovery, title: "Retried the failed items; carrying on from where the job was"))
         }

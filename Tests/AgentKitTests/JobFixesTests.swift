@@ -48,7 +48,8 @@ func makeTestCenter(_ fx: JobFixture, plan: JobPlan?, executor: (any StepExecuti
                     settings: @escaping @MainActor () -> AppSettings = { testSettings() },
                     lease: ScreenLease = ScreenLease(idleProbe: { 1000 }), now: @escaping @Sendable () -> Date = { Date() },
                     keepAwake: (@MainActor (Bool) -> Void)? = nil,
-                    releaseBrowser: @escaping @Sendable (String) async -> Void = { _ in }) -> JobCenter {
+                    releaseBrowser: @escaping @Sendable (String) async -> Void = { _ in },
+                    scope: JobCenter.Scope = .allJobs) -> JobCenter {
     let planner: any JobPlanning = plan.map { FixedPlanner(plan: $0) } ?? FailingPlanner()
     var env = JobCenter.Environment(
         store: fx.store, settings: settings, planner: { _ in planner },
@@ -57,6 +58,7 @@ func makeTestCenter(_ fx: JobFixture, plan: JobPlan?, executor: (any StepExecuti
         removeFolder: { url in try FileManager.default.removeItem(at: url) }, now: now, schedulerMaxSleep: 0.05)
     env.releaseBrowser = releaseBrowser
     env.elsewherePollSeconds = 0.05
+    env.scope = scope
     return JobCenter(environment: env)
 }
 
@@ -237,6 +239,57 @@ struct JobRunLockTests {
         #expect(await eventuallyOnMain { app.job(record.id)?.status == .completed })
         #expect(app.events(record.id).contains { $0.title.contains("other Glide process quit") })
     }
+
+    /// glidectl shares the app's store but looks after only the job it runs: it doesn't take
+    /// over a job the app let go of (the user quit the app), wake the app's sleeping jobs, or
+    /// pause them on Ctrl-C.
+    @Test func glidectlLeavesTheAppsJobsToTheApp() async throws {
+        let fx = try JobFixture()
+        defer { fx.cleanup() }
+        func plan(_ id: Int) -> JobPlan { JobPlan(goal: "g\(id)", milestones: [Milestone(id: 1, title: "m", steps: [action(id, "Step \(id)")])]) }
+        // The app is running this one.
+        let running = fx.record(plan(1))
+        let appLock = try #require(JobRunLock.tryAcquire(folder: fx.store.folder(for: running.id)))
+        // And has these two asleep: one due in a moment, one tomorrow.
+        var soon = fx.record(plan(2))
+        soon.status = .waiting
+        soon.nextWakeAt = Date().addingTimeInterval(0.2)
+        fx.store.saveJob(soon)
+        var later = fx.record(plan(3))
+        later.status = .waiting
+        later.nextWakeAt = Date().addingTimeInterval(86_400)
+        fx.store.saveJob(later)
+
+        let own = JobPlan(goal: "Mine", milestones: [Milestone(id: 1, title: "m", steps: [
+            action(5, "My step"), JobStep(id: 6, title: "An hour", kind: .wait(.duration(seconds: 3600))),
+        ])])
+        let executor = ScriptedExecutor()
+        let cli = makeTestCenter(fx, plan: own, executor: executor, scope: .ownJobs)
+        cli.reload()
+        #expect(cli.isRunningElsewhere(running.id))
+        // The sleeping job's time comes while glidectl watches the app's running one.
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(executor.calls.isEmpty)
+        #expect(fx.store.job(soon.id)?.status == .waiting)
+
+        // The user quits the app mid-run: its lock goes, the job stays "running" for the app.
+        appLock.release()
+        #expect(await eventuallyOnMain { !cli.isRunningElsewhere(running.id) })
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(executor.calls.isEmpty)
+        #expect(fx.store.job(running.id)?.status == .running)
+        #expect(fx.store.job(running.id)?.lastError == nil)
+
+        // glidectl's own job still runs, sleeps, and is the only one Ctrl-C pauses.
+        let mine = await cli.create(instruction: "mine")
+        #expect(await eventuallyOnMain { cli.job(mine.id)?.status == .waiting && !cli.hasRunner(mine.id) })
+        cli.haltAll()
+        #expect(fx.store.job(mine.id)?.status == .paused)
+        #expect(fx.store.job(soon.id)?.status == .waiting)
+        #expect(fx.store.job(later.id)?.status == .waiting)
+        #expect(fx.store.job(later.id)?.nextWakeAt.map { $0.timeIntervalSinceNow > 80_000 } == true)
+        #expect(executor.calls.map(\.stepID) == [5])
+    }
 }
 
 // MARK: - JobCenter fixes
@@ -312,6 +365,75 @@ struct JobCenterFixTests {
         #expect(await eventuallyOnMain { center.job(blocker.id)?.status == .completed })
         #expect(await eventuallyOnMain { center.job(sleeper.id)?.status == .completed })
         #expect(executor.calls.contains { $0.stepID == 3 })
+    }
+
+    /// glidectl ran a sleeping job early and it went back to sleep until later. When the app's
+    /// old wake time comes, it must pick up the new one rather than forget the job.
+    @Test func aJobPutBackToSleepElsewhereStillWakes() async throws {
+        let fx = try JobFixture()
+        defer { fx.cleanup() }
+        let t = Date(timeIntervalSince1970: 1_900_000_000)
+        let clock = TestClock(t)
+        let plan = JobPlan(goal: "Twice", milestones: [Milestone(id: 1, title: "m", steps: [
+            JobStep(id: 1, title: "A while", kind: .wait(.duration(seconds: 3600))), action(2, "After"),
+        ])])
+        var z = fx.record(plan)
+        z.status = .waiting
+        z.nextWakeAt = t.addingTimeInterval(10)
+        fx.store.saveJob(z)
+        let executor = ScriptedExecutor()
+        let app = makeTestCenter(fx, plan: plan, executor: executor, now: clock.function)
+        app.launch()
+
+        // Another process re-slept it meanwhile.
+        z.nextWakeAt = t.addingTimeInterval(100)
+        fx.store.saveJob(z)
+        clock.set(t.addingTimeInterval(11))
+        #expect(await eventuallyOnMain { app.job(z.id)?.nextWakeAt == t.addingTimeInterval(100) })
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(executor.calls.isEmpty)
+
+        clock.set(t.addingTimeInterval(101))
+        #expect(await eventuallyOnMain { app.job(z.id)?.status == .completed })
+        #expect(executor.calls.contains { $0.stepID == 2 })
+    }
+
+    /// "Retry failed items" while the job sleeps in a 24-hour wait 22 hours in: after the loop is
+    /// redone the job finishes the wait it was in, instead of sleeping another full day.
+    @Test func retryingKeepsTheWaitItWasSleepingIn() async throws {
+        let fx = try JobFixture()
+        defer { fx.cleanup() }
+        let t = Date(timeIntervalSince1970: 1_900_000_000)
+        let clock = TestClock(t)
+        let plan = JobPlan(goal: "Research, wait, follow up", milestones: [Milestone(id: 1, title: "m", steps: [
+            listLoop(["ok", "bad"]), JobStep(id: 2, title: "A day", kind: .wait(.duration(seconds: 86_400))), action(3, "Following up"),
+        ])])
+        let failBad = Mutex(true)
+        let store = fx.store
+        let executor = ScriptedExecutor { req, _ in
+            if let s = ScriptedExecutor.standard(req) { return s }
+            if let id = req.itemID, store.item(id)?.title == "bad", failBad.withLock({ $0 }) { return StepResult(status: .failed("blocked by site")) }
+            return StepResult(status: .done, fields: ["answer": "y"])
+        }
+        let center = makeTestCenter(fx, plan: plan, executor: executor, now: clock.function)
+        let job = await center.create(instruction: "research")
+        #expect(await eventuallyOnMain { center.job(job.id)?.status == .waiting && !center.hasRunner(job.id) })
+        let due = t.addingTimeInterval(86_400)
+        #expect(fx.store.job(job.id)?.nextWakeAt == due)
+        #expect(fx.store.job(job.id)?.usage.itemsFailed == 1)
+
+        clock.set(t.addingTimeInterval(80_000))
+        failBad.withLock { $0 = false }
+        center.retryFailedItems(job.id)
+        #expect(await eventuallyOnMain {
+            center.job(job.id)?.status == .waiting && !center.hasRunner(job.id) && center.job(job.id)?.usage.itemsFailed == 0
+        })
+        #expect(fx.store.job(job.id)?.nextWakeAt == due)
+        #expect(!executor.calls.contains { $0.stepID == 3 })
+
+        clock.set(due.addingTimeInterval(1))
+        #expect(await eventuallyOnMain { center.job(job.id)?.status == .completed })
+        #expect(executor.calls.filter { $0.stepID == 3 }.count == 1)
     }
 
     /// "Retry failed" redoes the loop's failed items, then goes back to where the job was:
