@@ -327,16 +327,30 @@ func jobCommand(settings base: AppSettings) async -> Int32 {
         var interrupts = 0
         sig.setEventHandler {
             interrupts += 1
-            // Nothing here to halt (the job runs in another process, or nothing runs it any
-            // more), or a second Ctrl-C: stop following and quit.
-            guard interrupts == 1, center.isRunnerActive(id) else {
+            switch interrupts {
+            case 1 where center.isRunnerActive(id):
+                // Like the emergency stop: end the step in flight now, keep the job paused and resumable.
+                print("\n■ halting — resume with: glidectl job resume \(id.prefix(8)) (Ctrl-C again to quit)")
+                center.haltAll()
+            case 2 where center.isRunnerActive(id):
+                // The halted step is still unwinding (a command being ended, a browser call), and
+                // until it has, the job is saved as running. Quitting drops its lock, so the app
+                // would continue it as a job whose process quit. Give the step a moment to end
+                // the job as paused; if it hasn't by then, save it as paused here.
+                print("\n■ quitting once the step has stopped (Ctrl-C again to quit right away)")
+                Task { @MainActor in
+                    let deadline = Date().addingTimeInterval(3)
+                    while center.isRunnerActive(id), Date() < deadline { try? await Task.sleep(for: .milliseconds(50)) }
+                    center.saveHaltedForExit()
+                    quitNow(130)
+                }
+            default:
+                // Nothing here to halt (the job runs in another process, or nothing runs it any
+                // more), or Ctrl-C a third time: save what still unwinds as paused, and quit.
                 print("\n■ quitting")
+                center.saveHaltedForExit()
                 quitNow(130, force: interrupts > 2)
-                return
             }
-            // Like the emergency stop: end the step in flight now, keep the job paused and resumable.
-            print("\n■ halting — resume with: glidectl job resume \(id.prefix(8)) (Ctrl-C again to quit now)")
-            center.haltAll()
         }
         sig.resume()
         // Follow the job: print new log lines, answer approvals, stop when it settles.

@@ -79,6 +79,9 @@ public actor JobRunner {
     /// This job's own stop/pause switch, so controlling one job never affects another.
     private nonisolated let gate = ExecutionGate()
     private nonisolated let work = Mutex<Task<JobRecord, Never>?>(nil)
+    /// Set by `detachFromStore()`. Each save of the record checks it under this lock, so none
+    /// can land after the owner's own save of the job.
+    private nonisolated let detached = Mutex(false)
     private var leaseOwner: String { "job:\(jobID)" }
 
     // Per-run bookkeeping (a resumed job starts these fresh).
@@ -127,6 +130,12 @@ public actor JobRunner {
     public nonisolated func pause() { gate.pause() }
 
     public nonisolated var isStopRequested: Bool { gate.isStopped }
+
+    /// Stops this runner from saving the job's record again. Used when the process is about to
+    /// exit before a halted runner has unwound (`JobCenter.saveHaltedForExit`): the owner saves
+    /// the record itself, and a late save from here (still running, or stopped) would undo
+    /// that. When this returns, no save of the runner's is in progress.
+    nonisolated func detachFromStore() { detached.withLock { $0 = true } }
 
     /// Runs until the job finishes, waits, pauses, needs input or is stopped, and returns the
     /// final record (also persisted). Cancelling the calling task stops the job.
@@ -1270,8 +1279,13 @@ public actor JobRunner {
     private func persist() {
         tick()
         record.updatedAt = config.now()
-        store.saveJob(record)
-        callbacks.update(record)
+        let r = record
+        let store = self.store
+        let saved = detached.withLock { detached -> Bool in
+            if !detached { store.saveJob(r) }
+            return !detached
+        }
+        if saved { callbacks.update(r) }
     }
 
     private func log(_ entry: ActivityEntry) {

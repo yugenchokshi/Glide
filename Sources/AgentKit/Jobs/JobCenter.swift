@@ -95,6 +95,9 @@ public final class JobCenter {
     @ObservationIgnored private var pausing: Set<String> = []
     /// Jobs interrupted by the emergency stop; they end as `.paused` (resumable), not `.stopped`.
     @ObservationIgnored private var halting: Set<String> = []
+    /// Jobs `saveHaltedForExit` saved while their runner was still unwinding. That runner no
+    /// longer saves, so if the process is still here when it finishes, this center saves its end.
+    @ObservationIgnored private var savedForExit: Set<String> = []
     @ObservationIgnored private var scheduler: JobScheduler?
     @ObservationIgnored private var launched = false
     @ObservationIgnored private var previewItems: [String: [JobItem]]?
@@ -445,14 +448,49 @@ public final class JobCenter {
     /// can be resumed. Waiting and queued jobs this center looks after are paused too; glidectl's
     /// Ctrl-C must not pause the app's sleeping jobs, which would then never wake.
     public func haltAll() {
-        for (id, handle) in runners {
-            halting.insert(id)
-            resolveApprovals(id, with: .stop)
-            handle.runner.stop()
-            handle.task.cancel()
-        }
+        for (id, handle) in runners { halt(id, handle) }
         for id in queue { pause(id) }
         for job in jobs where job.status == .waiting && runners[job.id] == nil && looksAfter(job.id) { pause(job.id) }
+    }
+
+    /// For a process about to exit while jobs it runs haven't finished unwinding from a halt
+    /// (glidectl's Ctrl-C pressed again while a command is being ended or a browser call
+    /// returns). Until their runners finish, those jobs are saved as running, or briefly as
+    /// stopped, and the exit drops their locks: another Glide process would then continue them
+    /// as jobs whose process quit, or couldn't resume them. This halts what still runs here and
+    /// saves it as paused now; its runners save nothing more. The locks stay held until the
+    /// process exits, so nothing takes the jobs over while their steps still unwind.
+    public func saveHaltedForExit() {
+        for (id, handle) in runners {
+            halt(id, handle)
+            handle.runner.detachFromStore()
+            savedForExit.insert(id)
+            // Deleted while its runner unwinds. The deletion waits for the runner to finish, which
+            // the exit skips, so the record goes now rather than staying behind as running.
+            if pendingDeletion.contains(id) {
+                env.store.deleteJob(id)
+                continue
+            }
+            // A run that already ended waiting, paused, needing input or finished saved that.
+            guard var r = env.store.job(id), r.status == .running || r.status == .stopped else { continue }
+            Self.markHalted(&r)
+            save(r)
+            log(id, ActivityEntry(kind: .info, title: "Halted by the emergency stop"))
+        }
+    }
+
+    /// Ends the job's step in flight now (the way Stop does); the job ends as `.paused`.
+    private func halt(_ id: String, _ handle: RunnerHandle) {
+        halting.insert(id)
+        resolveApprovals(id, with: .stop)
+        handle.runner.stop()
+        handle.task.cancel()
+    }
+
+    /// How a job the emergency stop interrupted is left: paused, so it can be resumed.
+    nonisolated static func markHalted(_ r: inout JobRecord) {
+        r.status = .paused
+        r.statusLine = "Halted by the emergency stop — resume to continue"
     }
 
     /// Re-queues failed items of a finished or paused job and resumes it.
@@ -708,12 +746,15 @@ public final class JobCenter {
         runners[id] = nil
         pausing.remove(id)
         resolveApprovals(id, with: .stop)
+        let saved = savedForExit.remove(id) != nil
         var final = final
         if halting.remove(id) != nil, final.status == .stopped {
-            final.status = .paused
-            final.statusLine = "Halted by the emergency stop — resume to continue"
+            Self.markHalted(&final)
             save(final)
-            log(id, ActivityEntry(kind: .info, title: "Halted by the emergency stop"))
+            if !saved { log(id, ActivityEntry(kind: .info, title: "Halted by the emergency stop")) }
+        } else if saved {
+            // Its runner stopped saving for an exit that hasn't come; what it ended with stands.
+            save(final)
         }
         if pendingDeletion.contains(id) {
             performDeletion(id)

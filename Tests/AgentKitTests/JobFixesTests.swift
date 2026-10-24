@@ -79,6 +79,18 @@ func makeTestCenter(_ fx: JobFixture, plan: JobPlan?, executor: (any StepExecuti
     return JobCenter(environment: env)
 }
 
+/// Waits for `condition` without letting the main actor run, the way a process exiting would
+/// leave a center's main-actor work (the end of its runners) undone. Other threads go on.
+@MainActor
+func holdingMainActor(timeout: Double = 5, until condition: () -> Bool) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if condition() { return true }
+        usleep(5_000)
+    }
+    return condition()
+}
+
 func temporaryFolder() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("glide-joblock-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -566,6 +578,55 @@ struct JobCenterFixTests {
         #expect(cliExecutor.calls.isEmpty)
     }
 
+    /// glidectl's Ctrl-C halts the job, and pressed again it quits while the halted step is
+    /// still unwinding (a command being ended, a browser call). The job must be left paused:
+    /// saved as running, the app would continue it once the exit drops its lock; saved as
+    /// stopped (the runner's last save, before the halt makes that a pause), it couldn't be
+    /// resumed.
+    @Test(arguments: [false, true])
+    func quittingWhileAHaltedStepUnwindsLeavesTheJobPaused(runnerSavedItsEnd: Bool) async throws {
+        let fx = try JobFixture()
+        defer { fx.cleanup() }
+        let plan = JobPlan(goal: "g", milestones: [Milestone(id: 1, title: "m", steps: [action(1, "Slow to stop"), action(2, "After")])])
+        let latch = Latch()
+        let executor = ScriptedExecutor { req, _ in
+            if req.step.id == 1 { await latch.wait() }
+            return ScriptedExecutor.standard(req) ?? StepResult(status: .done)
+        }
+        let cli = makeTestCenter(fx, plan: plan, executor: executor, scope: .ownJobs)
+        let job = await cli.create(instruction: "long job")
+        #expect(await eventuallyOnMain { executor.calls.count == 1 })
+        cli.haltAll()
+        #expect(cli.isRunnerActive(job.id))
+        #expect(fx.store.job(job.id)?.status == .running)
+        if runnerSavedItsEnd {
+            // The step ends and the runner saves the job as stopped, but the process exits
+            // before this center gets to turn that into a pause (a moment later).
+            latch.open()
+            #expect(holdingMainActor { fx.store.job(job.id)?.status == .stopped })
+        }
+
+        cli.saveHaltedForExit()
+        let saved = try #require(fx.store.job(job.id))
+        #expect(saved.status == .paused)
+        #expect(saved.statusLine.contains("resume"))
+        // What the app decides when it finds the job after the exit: leave it as it is.
+        #expect(JobScheduler.launchActions(for: [saved], autoResume: true).isEmpty)
+        // Nothing takes it over while its step still unwinds here. (That the runner's own last
+        // save can't undo this is `aDetachedRunnerLeavesTheSavedRecordAlone`.)
+        #expect(JobRunLock.isHeld(folder: fx.store.folder(for: job.id)))
+
+        // The process stayed after all: once the runner is done, the job is still paused (and
+        // says so once), and resuming it finishes the job.
+        latch.open()
+        #expect(await eventuallyOnMain { !cli.isRunnerActive(job.id) })
+        #expect(fx.store.job(job.id)?.status == .paused)
+        #expect(fx.store.events(jobID: job.id).filter { $0.title == "Halted by the emergency stop" }.count == 1)
+        cli.resume(job.id)
+        #expect(await eventuallyOnMain { cli.job(job.id)?.status == .completed })
+        #expect(executor.calls.contains { $0.stepID == 2 })
+    }
+
     /// glidectl ran a sleeping job early and it went back to sleep until later. When the app's
     /// old wake time comes, it must pick up the new one rather than forget the job.
     @Test func aJobPutBackToSleepElsewhereStillWakes() async throws {
@@ -847,6 +908,36 @@ struct JobRunnerFixTests {
         let resumed = try await fx.resumeRunner(record.id, executor).run()
         #expect(resumed.status == .completed)
         #expect(executor.stepIDs.filter { $0 == 1 }.count == 2)
+    }
+
+    /// Once its owner has saved the job for an exit, a runner still ending its run saves
+    /// nothing more (nor reports a save), so the record the owner saved stands.
+    @Test func aDetachedRunnerLeavesTheSavedRecordAlone() async throws {
+        let fx = try JobFixture()
+        defer { fx.cleanup() }
+        let plan = JobPlan(goal: "g", milestones: [Milestone(id: 1, title: "m", steps: [action(1, "Slow to stop"), action(2, "After")])])
+        let latch = Latch()
+        let executor = ScriptedExecutor { req, _ in
+            if req.step.id == 1 { await latch.wait() }
+            return ScriptedExecutor.standard(req) ?? StepResult(status: .done)
+        }
+        let updates = Mutex(0)
+        let runner = fx.runner(fx.record(plan), executor, callbacks: JobRunner.Callbacks(update: { _ in updates.withLock { $0 += 1 } }))
+        let task = Task { await runner.run() }
+        #expect(await eventually { executor.calls.count == 1 })
+        runner.detachFromStore()
+        var saved = try #require(fx.store.job(runner.jobID))
+        JobCenter.markHalted(&saved)
+        fx.store.saveJob(saved)
+        let reported = updates.withLock { $0 }
+        runner.stop()
+        latch.open()
+        let final = await task.value
+        #expect(final.status == .stopped)
+        let stored = try #require(fx.store.job(runner.jobID))
+        #expect(stored.status == .paused)
+        #expect(stored.statusLine == saved.statusLine)
+        #expect(updates.withLock { $0 } == reported)
     }
 
     /// Updaters read the first row as column names, so a headerless source file is left as it
