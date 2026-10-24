@@ -147,9 +147,11 @@ final class PreviewJobs: JobsSource {
         pendingApprovals[jobID] = nil
         if decision == .stop { set(jobID, .stopped) }
     }
-    func exportResults(_ jobID: String, to url: URL) throws {
+    func exportResultFiles(_ jobID: String, to url: URL) throws -> [URL] {
         throw CocoaError(.featureUnsupported, userInfo: [NSLocalizedDescriptionKey: "Export isn't available in previews."])
     }
+    func isRunningElsewhere(_ id: String) -> Bool { false }
+    func reload() {}
 
     struct Demo {
         var source: PreviewJobs

@@ -378,6 +378,8 @@ final class NotchModel {
         jobsDetailOpen = false
         focusToken += 1
         recompute()
+        // Pick up jobs glidectl started or changed, after the notch is already open.
+        Task { @MainActor [jobs] in jobs.reload() }
     }
 
     func close() {

@@ -121,7 +121,7 @@ struct BrowserSettingsView: View {
     var pairDetail: String {
         if paired { return "Paired with this Mac. Pair again after reinstalling the extension." }
         if pairing == nil { return "Available once Glide's browser bridge is running." }
-        return "Opens a page in Chrome that connects the extension to Glide. Or copy the code and paste it into the extension's popup."
+        return "Opens a page in Chrome where you confirm the connection. Or copy the code and paste it into the extension's popup."
     }
 
     // MARK: Status
@@ -212,7 +212,7 @@ struct BrowserSettingsView: View {
         Task {
             do {
                 _ = try await NSWorkspace.shared.open([url], withApplicationAt: chrome, configuration: NSWorkspace.OpenConfiguration())
-                pairNote = "Pairing page opened in Chrome. It connects in a few seconds."
+                pairNote = "Pairing page opened in Chrome. Click Pair there to finish."
             } catch {
                 pairNote = "Couldn't open Chrome (\(error.localizedDescription)). Copy the pairing code and paste it into the extension's popup."
             }

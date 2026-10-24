@@ -18,6 +18,7 @@ struct JobsSettingsView: View {
             BKSectionHeader(title: "Jobs",
                             subtitle: "Long tasks run as background jobs: loops over many items, waits and schedules. Progress is saved after every item, so a job survives quitting Glide or restarting your Mac.")
             JobsListSection(jobs: jobs) { nav.selectedJobID = $0 }
+                .onAppear { jobs.reload() }
             JobDefaultsSection(store: store)
         }
     }
@@ -96,7 +97,7 @@ struct JobDetailView: View {
     @State private var search = ""
     @State private var confirmDelete = false
     @State private var actionError: String?
-    @State private var exportedTo: URL?
+    @State private var exportedTo: [URL] = []
 
     /// Items rendered at once; the rest stay a filter or search away.
     static let visibleItems = 200
@@ -174,9 +175,31 @@ struct JobDetailView: View {
         }
     }
 
+    /// glidectl (or another copy of Glide) is running this job; this window only shows it.
+    var elsewhere: Bool { jobs.isRunningElsewhere(job.id) }
+
     var controls: some View {
         HStack(spacing: 6) {
             let s = job.status
+            if elsewhere {
+                Label("Running in another Glide process", systemImage: "terminal")
+                    .font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+            } else {
+                actionButtons(s)
+            }
+            Spacer(minLength: 8)
+            Button(action: export) { Label("Export CSV", systemImage: "square.and.arrow.up") }
+                .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
+                .disabled(s == .planning)
+            Button { confirmDelete = true } label: { Label("Delete", systemImage: "trash") }
+                .buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
+                .disabled(s.isActive || elsewhere)
+                .help(s.isActive || elsewhere ? "Pause or stop the job before deleting it." : "Delete this job")
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder func actionButtons(_ s: JobStatus) -> some View {
             if s == .awaitingConfirmation {
                 Button { jobs.start(job.id) } label: { Label("Start", systemImage: "play.fill") }
                     .buttonStyle(BKButtonStyle(kind: .primary, compact: true))
@@ -197,16 +220,6 @@ struct JobDetailView: View {
                 Button { jobs.retryFailedItems(job.id) } label: { Label("Retry \(job.usage.itemsFailed) failed", systemImage: "arrow.clockwise") }
                     .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
             }
-            Spacer(minLength: 8)
-            Button(action: export) { Label("Export CSV", systemImage: "square.and.arrow.up") }
-                .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
-                .disabled(s == .planning)
-            Button { confirmDelete = true } label: { Label("Delete", systemImage: "trash") }
-                .buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
-                .disabled(s.isActive)
-                .help(s.isActive ? "Pause or stop the job before deleting it." : "Delete this job")
-        }
-        .fixedSize(horizontal: false, vertical: true)
     }
 
     @ViewBuilder var callouts: some View {
@@ -215,9 +228,10 @@ struct JobDetailView: View {
                 Button("Dismiss") { self.actionError = nil }.buttonStyle(BKButtonStyle(kind: .ghost, compact: true))
             }
         }
-        if let exportedTo {
-            BKCallout(tone: .success, icon: "checkmark", title: "Exported", message: exportedTo.path) {
-                Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([exportedTo]) }
+        if !exportedTo.isEmpty {
+            BKCallout(tone: .success, icon: "checkmark", title: exportedTo.count == 1 ? "Exported" : "Exported \(exportedTo.count) files",
+                      message: exportedTo.map(\.path).joined(separator: "\n")) {
+                Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting(exportedTo) }
                     .buttonStyle(BKButtonStyle(kind: .secondary, compact: true)).fixedSize()
             }
         }
@@ -405,11 +419,10 @@ struct JobDetailView: View {
             guard response == .OK, let url = panel.url else { return }
             MainActor.assumeIsolated {
                 do {
-                    try source.exportResults(id, to: url)
-                    exportedTo = url
+                    exportedTo = try source.exportResultFiles(id, to: url)
                     actionError = nil
                 } catch {
-                    exportedTo = nil
+                    exportedTo = []
                     actionError = "Couldn't export the results: \(error.localizedDescription)"
                 }
             }

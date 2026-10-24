@@ -29,7 +29,13 @@ protocol JobsSource: AnyObject {
     func retryFailedItems(_ id: String)
     func delete(_ id: String)
     func respond(jobID: String, decision: ApprovalDecision)
-    func exportResults(_ jobID: String, to url: URL) throws
+    /// Writes the results as CSV and returns every file written (other tables go next to `url`).
+    func exportResultFiles(_ jobID: String, to url: URL) throws -> [URL]
+    /// Another process (glidectl, or a second copy of Glide) is running the job, so this one
+    /// only shows it.
+    func isRunningElsewhere(_ id: String) -> Bool
+    /// Re-reads jobs from disk, picking up ones glidectl created or changed.
+    func reload()
 }
 
 extension JobCenter: JobsSource {
@@ -282,14 +288,19 @@ struct NotchJobRow: View {
     @ViewBuilder var controls: some View {
         let jobs = model.jobs
         let id = job.id
-        if job.status == .awaitingConfirmation {
+        // glidectl (or another copy of Glide) runs it; only that process can control it.
+        let mine = !jobs.isRunningElsewhere(id)
+        if !mine {
+            BKIconButton(systemName: "terminal", help: "Running in another Glide process") {}
+                .disabled(true)
+        } else if job.status == .awaitingConfirmation {
             BKIconButton(systemName: "play.fill", help: "Start job") { model.userDecision { jobs.start(id) } }
         } else if job.status.canPause {
             BKIconButton(systemName: "pause.fill", help: "Pause job") { model.userDecision { jobs.pause(id) } }
         } else if job.canResume {
             BKIconButton(systemName: "play.fill", help: job.status == .waiting ? "Run now" : "Resume job") { model.userDecision { jobs.resume(id) } }
         }
-        if !job.status.isFinished {
+        if mine, !job.status.isFinished {
             BKIconButton(systemName: "stop.fill", help: "Stop job", tone: .danger) { model.userDecision { model.stopJob(id) } }
         }
         if pill {
