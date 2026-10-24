@@ -70,12 +70,21 @@ public final class BrowserHub: @unchecked Sendable {
 
     public func status(settings: BrowserSettings) async -> BrowserStatus {
         let installed = ChromeLocator.executable(override: settings.chromePath) != nil
+        let paired = isExtensionPaired?() ?? false
+        // When the extension isn't connected, say what tasks will use instead.
+        let fallbackNote = settings.backend == .extensionBridge && settings.fallbackToGlideChrome && registered(.glideChrome) != nil && installed
+            ? " Glide's own Chrome window is used until it connects." : ""
         guard let b = registered(settings.backend) else {
-            return BrowserStatus(backend: settings.backend, connected: false, detail: "Not set up", chromeInstalled: installed, extensionPaired: false)
+            return BrowserStatus(backend: settings.backend, connected: false, detail: fallbackNote.isEmpty ? "Not set up" : "Not set up." + fallbackNote,
+                                 chromeInstalled: installed, extensionPaired: paired)
         }
         let connected = await b.isConnected()
-        return BrowserStatus(backend: settings.backend, connected: connected,
-                             detail: connected ? "Connected" : "Not connected", chromeInstalled: installed,
-                             extensionPaired: isExtensionPaired?() ?? false)
+        var detail = connected ? "Connected" : "Not connected"
+        if let describing = b as? any BrowserStatusDescribing {
+            detail = await describing.statusDetail()
+        } else if !connected, !fallbackNote.isEmpty {
+            detail = "Not connected." + fallbackNote
+        }
+        return BrowserStatus(backend: settings.backend, connected: connected, detail: detail, chromeInstalled: installed, extensionPaired: paired)
     }
 }
