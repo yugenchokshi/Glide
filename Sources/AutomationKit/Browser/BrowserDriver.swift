@@ -37,6 +37,54 @@ public struct BrowserDialog: Sendable, Hashable {
     }
 }
 
+/// When a backend answers a page's JavaScript dialog by itself. Glide's own Chrome uses these
+/// rules; the extension's service_worker.js has the same ones (keep them in step).
+///
+/// A dialog freezes the page until it's answered, so in a tab Glide is working in it's answered
+/// at once, deterministically. Anywhere else it's the user's to answer, and commands sent to the
+/// tab fail at once until they have.
+enum BrowserDialogPolicy {
+    /// Commands that act on the page the way a person would — input events, navigation, a
+    /// script run with a user gesture (the driver's click and typing fallbacks) — rather than
+    /// read it.
+    static func isAction(method: String, params: JSONValue?) -> Bool {
+        if method.hasPrefix("Input.") { return true }
+        switch method {
+        case "Page.navigate", "Page.navigateToHistoryEntry", "Page.reload": return true
+        case "Runtime.evaluate", "Runtime.callFunctionOn": return params?["userGesture"]?.boolValue == true
+        default: return false
+        }
+    }
+
+    /// In Glide's own tabs every dialog is answered. In the user's tabs only while Glide is
+    /// working there (`driving`: a command running or just finished), and "Leave site?" only
+    /// when one of Glide's actions could have caused it (`acting`): while Glide merely reads
+    /// the tab, it's the user closing it or leaving a half-filled form, and accepting would
+    /// throw their input away.
+    static func answers(type: String, ownedByGlide: Bool, driving: Bool, acting: Bool) -> Bool {
+        if ownedByGlide { return true }
+        return type == "beforeunload" ? acting : driving
+    }
+
+    /// Alerts are closed and leaving the page is allowed; confirm() and prompt() are declined,
+    /// so a page never gets a "yes" to "Delete everything?" behind the user's back.
+    static func accepts(type: String) -> Bool { type == "alert" || type == "beforeunload" }
+
+    /// The error for a command sent to a tab whose dialog is waiting for the user.
+    static func waitingMessage(_ dialog: BrowserDialog) -> String {
+        let what: String
+        switch dialog.type {
+        case "alert": what = "an alert"
+        case "confirm": what = "a confirmation dialog"
+        case "prompt": what = "a prompt"
+        case "beforeunload": what = "a “Leave site?” prompt"
+        default: what = "a dialog"
+        }
+        let quote = dialog.message.isEmpty ? "" : " (“\(PageSnapshot.clip(dialog.message, 120))”)"
+        return "This tab is showing \(what)\(quote). Answer it in Chrome, then try again."
+    }
+}
+
 /// Backends that receive CDP events (Glide's own Chrome) adopt this so the driver can wait for a
 /// quiet network instead of guessing, and report dialogs it answered. Backends without events
 /// still work: the driver falls back to watching the DOM settle.
@@ -399,7 +447,8 @@ public final class BrowserDriver: Sendable {
         let tab = try await withDeadline(40, BrowserError.timeout("opening \(target)")) { [backend] in
             try await backend.openTab(url: target, background: background)
         }
-        if target != "about:blank" { _ = try await waitForSettle(tabID: tab.id) }
+        // A new tab starts on an empty page, which is "loaded" at once; wait for the real one.
+        if target != "about:blank" { _ = try await settle(tabID: tab.id, timeout: nil, leaving: .blankPage) }
         return tab
     }
 
@@ -537,12 +586,23 @@ public final class BrowserDriver: Sendable {
     }
 
     /// Loads `url` in the tab and waits for it to settle.
+    ///
+    /// Some backends return before the navigation commits (the extension's `chrome.tabs.update`
+    /// replies as soon as it starts), so the page being left is marked first: until the probe
+    /// sees a different document (or address), the old page doesn't count as loaded. Except
+    /// when the address only adds or repeats a #fragment of the page that's showing: that's a
+    /// same-page jump and the marked page stays (any change of address is noticed anyway).
     public func navigate(tabID: String, url: String) async throws -> BrowserActionOutcome {
         let target = try Self.checkedURL(url)
+        let mark = UUID().uuidString
+        let markedURL = try? await evaluate(tabID: tabID, Self.markDocumentScript(mark), timeout: 3).stringValue
         try await withDeadline(30, BrowserError.timeout("opening \(target)")) { [backend] in
             try await backend.navigate(tabID: tabID, url: target)
         }
-        let settled = try await waitForSettle(tabID: tabID)
+        let leaving: PageBeingLeft? = markedURL.flatMap { current in
+            Self.isFragmentJump(from: current, to: target) ? nil : .document(mark: mark, url: current)
+        }
+        let settled = try await settle(tabID: tabID, timeout: nil, leaving: leaving)
         let notes = await dialogNotes(tabID: tabID)
         return BrowserActionOutcome(settled: settled, notes: notes)
     }
@@ -617,6 +677,35 @@ public final class BrowserDriver: Sendable {
     /// Pages that never go fully quiet (polling, tickers) count as settled once they've been
     /// loaded for a few seconds. Never sleeps longer than one 100 ms poll at a time.
     public func waitForSettle(tabID: String, timeout: TimeInterval? = nil) async throws -> Bool {
+        try await settle(tabID: tabID, timeout: timeout, leaving: nil)
+    }
+
+    /// The page a navigation is replacing, which must not be mistaken for the new one.
+    enum PageBeingLeft {
+        /// The document `markDocumentScript` stamped, while it still shows `url` (a change of
+        /// address alone means a same-page navigation happened).
+        case document(mark: String, url: String)
+        /// A new tab's initial empty page.
+        case blankPage
+    }
+
+    /// How long a page that never went away still counts as "not there yet". A navigation that
+    /// doesn't replace the page (a download, an empty response) ends up settling on it.
+    static let leftPageGrace: Duration = .seconds(10)
+
+    /// True when loading `target` in a tab showing `current` keeps the document: `target` has a
+    /// #fragment and is otherwise the same address (browsers scroll to the fragment instead of
+    /// loading the page again, even when the whole address is unchanged).
+    static func isFragmentJump(from current: String, to target: String) -> Bool {
+        guard target.contains("#"), let a = URLComponents(string: current), let b = URLComponents(string: target) else { return false }
+        func page(_ c: URLComponents) -> String {
+            let path = c.percentEncodedPath.isEmpty && c.host != nil ? "/" : c.percentEncodedPath
+            return [c.scheme?.lowercased() ?? "", c.host?.lowercased() ?? "", c.port.map(String.init) ?? "", path, c.percentEncodedQuery ?? ""].joined(separator: "|")
+        }
+        return page(a) == page(b)
+    }
+
+    private func settle(tabID: String, timeout: TimeInterval?, leaving: PageBeingLeft?) async throws -> Bool {
         let limit = Duration.milliseconds(Int((timeout ?? settleTimeout) * 1000))
         let observer = backend as? any BrowserPageObserving
         let start = ContinuousClock.now
@@ -639,7 +728,14 @@ public final class BrowserDriver: Sendable {
                     countChangedAt = now
                 }
                 let navigating = navAge >= 0 && navAge < 10_000
-                let complete = readyState == "complete" && !navigating
+                var stillOldPage = false
+                switch leaving {
+                case .document(let mark, let markedURL)?: stillOldPage = probe["m"]?.stringValue == mark && url == markedURL
+                case .blankPage?: stillOldPage = url.isEmpty || url == "about:blank"
+                case nil: break
+                }
+                if stillOldPage, now - start >= Self.leftPageGrace { stillOldPage = false }
+                let complete = readyState == "complete" && !navigating && !stillOldPage
                 var activity: BrowserNetworkActivity?
                 if let observer { activity = await observer.networkActivity(tabID: tabID) }
                 let stableFor = now - countChangedAt
@@ -1590,10 +1686,17 @@ extension BrowserDriver {
     /// Cheap state probe for settle detection.
     static let probeScript = #"""
     (() => { let n = 0; try { n = document.getElementsByTagName('*').length; } catch (e) {}
-      return { rs: document.readyState, n: n, nav: window.__glideNavAt ? Date.now() - window.__glideNavAt : -1, u: location.href }; })()
+      return { rs: document.readyState, n: n, nav: window.__glideNavAt ? Date.now() - window.__glideNavAt : -1, u: location.href,
+        m: window.__glideDocMark || '' }; })()
     """#
 
     /// Marks the page so a navigation that starts after an action is noticed even before the
     /// new document arrives (see `waitForSettle`).
     static let armNavigationScript = "(() => {\n\(library)\nG.armNav(); return true;\n})()"
+
+    /// Arms the navigation hook and stamps the current document with `mark` (a UUID, so it's
+    /// safe inside the quotes). Returns the page's address.
+    static func markDocumentScript(_ mark: String) -> String {
+        "(() => {\n\(library)\nG.armNav(); window.__glideDocMark = '\(mark)'; return location.href;\n})()"
+    }
 }

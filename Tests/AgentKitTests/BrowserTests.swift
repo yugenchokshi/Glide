@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import Network
+import Synchronization
 @testable import AgentKit
 @testable import AutomationKit
 
@@ -184,6 +185,18 @@ enum Fixtures {
         case "/": return (200, home)
         case "/second": return (200, "<!doctype html><title>Second</title><h1>Second page</h1><a href=\"/\">Home</a>")
         case "/popup": return (200, "<!doctype html><title>Popup</title><h1>Popup page</h1>")
+        case "/slow":
+            // A server that takes a while to answer: the old page is still showing meanwhile.
+            Thread.sleep(forTimeInterval: 1)
+            return (200, "<!doctype html><title>Slow</title><h1>Slow page</h1>")
+        case "/delayed-confirm":
+            return (200, "<!doctype html><title>Delayed</title><script>setTimeout(function () { document.title = confirm('Leave this alone?') ? 'yes' : 'no'; }, 2800)</script>")
+        case "/leave":
+            // A form with unsaved input: Chrome asks "Leave site?" before the page goes away.
+            return (200, """
+                <!doctype html><title>Leave</title><input id="note" aria-label="Note"> <a href="/second">Second page</a>
+                <script>addEventListener('beforeunload', function (e) { e.preventDefault(); e.returnValue = ''; });</script>
+                """)
         case "/frame": return (200, "<!doctype html><body><button onclick=\"this.textContent='Frame clicked'\">Frame button</button></body>")
         case "/result":
             let q = (query["q"] ?? "").replacingOccurrences(of: "<", with: "&lt;")
@@ -234,6 +247,16 @@ enum ChromeHarness {
 
 extension PageSnapshot {
     func named(_ name: String) -> Element? { elements.first { $0.name == name } }
+}
+
+/// The message of the error `body` throws, or nil when it doesn't throw.
+func errorText(_ body: () async throws -> Void) async -> String? {
+    do {
+        try await body()
+        return nil
+    } catch {
+        return error.localizedDescription
+    }
 }
 
 // MARK: - CDP client
@@ -381,6 +404,47 @@ struct BrowserLogicTests {
         #expect(try BrowserDriver.checkedURL("example.com") == "https://example.com")
     }
 
+    @Test func fragmentJumpsKeepTheDocument() {
+        // The same address with a #fragment (again, or added) scrolls the page Chrome already shows.
+        #expect(BrowserDriver.isFragmentJump(from: "https://site.test/docs#install", to: "https://site.test/docs#install"))
+        #expect(BrowserDriver.isFragmentJump(from: "https://site.test/docs", to: "https://site.test/docs#install"))
+        #expect(BrowserDriver.isFragmentJump(from: "https://Site.test/#a", to: "https://site.test#b"))
+        #expect(BrowserDriver.isFragmentJump(from: "https://site.test/d?q=1#a", to: "https://site.test/d?q=1#a"))
+        // Anything else loads a document: no fragment (a reload), or another page or query.
+        #expect(!BrowserDriver.isFragmentJump(from: "https://site.test/docs#install", to: "https://site.test/docs"))
+        #expect(!BrowserDriver.isFragmentJump(from: "https://site.test/docs", to: "https://site.test/docs"))
+        #expect(!BrowserDriver.isFragmentJump(from: "https://site.test/docs", to: "https://site.test/other#x"))
+        #expect(!BrowserDriver.isFragmentJump(from: "https://site.test/d?q=1", to: "https://site.test/d?q=2#x"))
+        #expect(!BrowserDriver.isFragmentJump(from: "http://site.test/d", to: "https://site.test/d#x"))
+    }
+
+    @Test func dialogRulesMatchTheExtension() {
+        // Actions are what a person does to a page; reading it isn't one.
+        #expect(BrowserDialogPolicy.isAction(method: "Input.dispatchMouseEvent", params: nil))
+        #expect(BrowserDialogPolicy.isAction(method: "Input.insertText", params: ["text": "x"]))
+        #expect(BrowserDialogPolicy.isAction(method: "Page.navigateToHistoryEntry", params: ["entryId": 3]))
+        #expect(BrowserDialogPolicy.isAction(method: "Runtime.evaluate", params: ["expression": "x", "userGesture": true]))
+        #expect(!BrowserDialogPolicy.isAction(method: "Runtime.evaluate", params: ["expression": "x", "userGesture": false]))
+        #expect(!BrowserDialogPolicy.isAction(method: "Runtime.evaluate", params: ["expression": "x"]))
+        #expect(!BrowserDialogPolicy.isAction(method: "Page.captureScreenshot", params: nil))
+        #expect(!BrowserDialogPolicy.isAction(method: "Page.close", params: nil))
+        // Glide's own tabs: every dialog is answered.
+        for type in ["alert", "confirm", "prompt", "beforeunload"] {
+            #expect(BrowserDialogPolicy.answers(type: type, ownedByGlide: true, driving: false, acting: false))
+        }
+        // The user's tabs: only while Glide works there, and "Leave site?" only after its actions.
+        #expect(BrowserDialogPolicy.answers(type: "confirm", ownedByGlide: false, driving: true, acting: false))
+        #expect(!BrowserDialogPolicy.answers(type: "confirm", ownedByGlide: false, driving: false, acting: false))
+        #expect(!BrowserDialogPolicy.answers(type: "beforeunload", ownedByGlide: false, driving: true, acting: false))
+        #expect(BrowserDialogPolicy.answers(type: "beforeunload", ownedByGlide: false, driving: true, acting: true))
+        #expect(BrowserDialogPolicy.accepts(type: "alert") && BrowserDialogPolicy.accepts(type: "beforeunload"))
+        #expect(!BrowserDialogPolicy.accepts(type: "confirm") && !BrowserDialogPolicy.accepts(type: "prompt"))
+        let waiting = BrowserDialogPolicy.waitingMessage(BrowserDialog(type: "beforeunload", message: "", accepted: false))
+        #expect(waiting == "This tab is showing a “Leave site?” prompt. Answer it in Chrome, then try again.")
+        #expect(BrowserDialogPolicy.waitingMessage(BrowserDialog(type: "confirm", message: "Delete it?", accepted: false))
+            == "This tab is showing a confirmation dialog (“Delete it?”). Answer it in Chrome, then try again.")
+    }
+
     static func sample() -> PageSnapshot {
         PageSnapshot(tabID: "T1", url: "https://shop.example.com/cart", title: "Your cart", viewportWidth: 1200, viewportHeight: 800,
                      scrollY: 0, pageHeight: 2400, elements: [
@@ -489,6 +553,49 @@ struct BrowserRiskTests {
 
 // MARK: - Sessions and hub
 
+/// A backend that only records which tabs it was asked to close.
+final class RecordingBackend: BrowserBackend {
+    let kind: BrowserBackendKind = .glideChrome
+    private let closedTabs = Mutex<[String]>([])
+    var closed: [String] { closedTabs.withLock { $0 } }
+
+    func isConnected() async -> Bool { true }
+    func connect() async throws {}
+    func tabs() async throws -> [BrowserTab] { [] }
+    func openTab(url: String, background: Bool) async throws -> BrowserTab { throw BrowserError.cdp("not in this test") }
+    func navigate(tabID: String, url: String) async throws {}
+    func closeTab(_ tabID: String) async throws { closedTabs.withLock { $0.append(tabID) } }
+    func activateTab(_ tabID: String) async throws {}
+    func cdp(tabID: String, method: String, params: JSONValue?) async throws -> JSONValue { .object([:]) }
+}
+
+/// Glide's Chrome, but navigating the way the extension does: the call returns before the new
+/// page commits, and the old page stays live a while longer (as it does after
+/// `chrome.tabs.update` while Chrome waits for the server).
+final class EarlyReturningBackend: BrowserBackend {
+    let inner: GlideChromeBackend
+    var kind: BrowserBackendKind { inner.kind }
+
+    init(_ inner: GlideChromeBackend) { self.inner = inner }
+
+    func isConnected() async -> Bool { await inner.isConnected() }
+    func connect() async throws { try await inner.connect() }
+    func tabs() async throws -> [BrowserTab] { try await inner.tabs() }
+    func openTab(url: String, background: Bool) async throws -> BrowserTab {
+        var tab = try await inner.openTab(url: "about:blank", background: background)
+        try await navigate(tabID: tab.id, url: url)
+        tab.url = url
+        return tab
+    }
+    func navigate(tabID: String, url: String) async throws {
+        let script = "setTimeout(() => { location.href = \(JSONValue.string(url).jsonString()) }, 600); true"
+        _ = try await inner.cdp(tabID: tabID, method: "Runtime.evaluate", params: ["expression": .string(script)])
+    }
+    func closeTab(_ tabID: String) async throws { try await inner.closeTab(tabID) }
+    func activateTab(_ tabID: String) async throws { try await inner.activateTab(tabID) }
+    func cdp(tabID: String, method: String, params: JSONValue?) async throws -> JSONValue { try await inner.cdp(tabID: tabID, method: method, params: params) }
+}
+
 @Suite("Browser sessions and hub")
 struct BrowserSessionTests {
     @Test func keysSeparateItemsJobsAndQuickTasks() {
@@ -497,20 +604,84 @@ struct BrowserSessionTests {
         #expect(BrowserSessions.key(jobID: nil, itemID: nil) == "default")
     }
 
-    @Test func recyclesLeastRecentlyUsedGlideTabsPerJob() {
+    @Test func recyclesOnlyGlideTabsNobodyIsWorkingIn() {
         let s = BrowserSessions(maxTabsPerJob: 2, maxTabs: 10)
         #expect(s.adopt(key: "job:j/item:1", backend: .glideChrome, tabID: "t1", jobID: "j", openedByGlide: true).isEmpty)
         #expect(s.adopt(key: "job:j/item:2", backend: .glideChrome, tabID: "t2", jobID: "j", openedByGlide: true).isEmpty)
+        // Item 1 follows a popup. The tab it left stays behind, spared for now.
+        #expect(s.adopt(key: "job:j/item:1", backend: .glideChrome, tabID: "t1b", jobID: "j", openedByGlide: true).isEmpty)
         s.touch("job:j/item:1")
+        // Item 3 opens a tab: the leftover goes, never item 2's page, though item 2 (busy
+        // thinking) hasn't touched it for longest.
         let evicted = s.adopt(key: "job:j/item:3", backend: .glideChrome, tabID: "t3", jobID: "j", openedByGlide: true)
-        #expect(evicted.map(\.tabID) == ["t2"])
-        #expect(s.session("job:j/item:2") == nil)
-        #expect(s.session("job:j/item:1")?.tabID == "t1")
+        #expect(evicted.map(\.tabID) == ["t1"])
+        #expect(s.session("job:j/item:1")?.tabID == "t1b")
+        #expect(s.session("job:j/item:2")?.tabID == "t2")
+        // With every Glide tab in use, the job goes over its cap instead of closing someone's page.
+        #expect(s.adopt(key: "job:j/item:4", backend: .glideChrome, tabID: "t4", jobID: "j", openedByGlide: true).isEmpty)
+        #expect(s.session("job:j/item:2")?.tabID == "t2")
         // The user's own tabs are never recycled.
-        #expect(s.adopt(key: "job:j/item:4", backend: .glideChrome, tabID: "mine", jobID: "j", openedByGlide: false).isEmpty)
+        #expect(s.adopt(key: "job:j/item:5", backend: .glideChrome, tabID: "mine", jobID: "j", openedByGlide: false).isEmpty)
         #expect(!s.isGlideTab(backend: .glideChrome, tabID: "mine"))
+        #expect(s.isTracked(backend: .glideChrome, tabID: "mine") && s.isTracked(backend: .glideChrome, tabID: "t4"))
+        #expect(!s.isTracked(backend: .glideChrome, tabID: "t1"), "evicted")
         // Another job has its own budget.
         #expect(s.adopt(key: "job:k/item:1", backend: .glideChrome, tabID: "k1", jobID: "k", openedByGlide: true).isEmpty)
+    }
+
+    @Test func releasingAnItemClosesTheTabsItLeftBehind() async {
+        let backend = RecordingBackend()
+        let hub = BrowserHub()
+        hub.register(backend)
+        let s = BrowserSessions()
+        s.adopt(key: "job:j/item:1", backend: .glideChrome, tabID: "a1", jobID: "j", openedByGlide: true)
+        s.adopt(key: "job:j/item:1", backend: .glideChrome, tabID: "a2", jobID: "j", openedByGlide: true) // a popup
+        s.adopt(key: "job:j/item:2", backend: .glideChrome, tabID: "b1", jobID: "j", openedByGlide: true)
+        s.adopt(key: "job:j/item:3", backend: .glideChrome, tabID: "a1", jobID: "j", openedByGlide: false) // switch_tab
+        s.adopt(key: "job:j/item:2", backend: .glideChrome, tabID: "mine", jobID: "j", openedByGlide: false)
+        await s.release(jobID: "j", itemID: "1", hub: hub)
+        #expect(backend.closed == ["a2"], "a1 is item 3's page now")
+        await s.release(jobID: "j", itemID: "2", hub: hub)
+        #expect(Set(backend.closed) == ["a2", "b1"], "the user's tab stays open")
+        await s.release(jobID: "j", itemID: "3", hub: hub)
+        #expect(Set(backend.closed) == ["a2", "b1", "a1"])
+    }
+
+    @Test func aCancellationNobodyAskedForIsAnOrdinaryFailure() async throws {
+        let hub = BrowserHub()
+        hub.register(RecordingBackend())
+        var settings = AppSettings()
+        settings.browser.backend = .glideChrome
+        let rt = BrowserRuntime(hub: hub, sessions: BrowserSessions())
+        // Something shared (Glide's Chrome launch) was cancelled under this call: it isn't a Stop.
+        let output = try await rt.perform(ToolContext(settings: settings, gate: ExecutionGate())) { _ in throw CancellationError() }
+        #expect(!output.ok && output.text.contains("Try again"))
+        // The call's own Stop still stops.
+        let gate = ExecutionGate()
+        let stopped = Task {
+            try await rt.perform(ToolContext(settings: settings, gate: gate)) { _ in
+                gate.stop()
+                throw CancellationError()
+            }
+        }
+        await #expect(throws: AutomationError.stopped) { _ = try await stopped.value }
+    }
+
+    @Test func aClickAdoptsOnlyThePopupItOpened() {
+        let before: Set<String> = ["A", "B", "U"]
+        let after = [
+            BrowserTab(id: "A", url: "https://a.test/", title: "", active: false, ownedByGlide: true),
+            BrowserTab(id: "u2", url: "https://mail.test/", title: "", active: true, ownedByGlide: false), // the user (or another app) opened it
+            BrowserTab(id: "b2", url: "https://b.test/pop", title: "", active: false, ownedByGlide: false, openerID: "B"), // a parallel item's popup
+            BrowserTab(id: "u3", url: "https://u.test/x", title: "", active: false, ownedByGlide: false, openerID: "U"), // from the user's tab
+            BrowserTab(id: "nt", url: "chrome://newtab/", title: "", active: false, ownedByGlide: false),
+            BrowserTab(id: "a2", url: "https://a.test/pop", title: "", active: false, ownedByGlide: false, openerID: "A"),
+        ]
+        #expect(BrowserClickTool.popup(openedFrom: "A", before: before, after: after, isTracked: { _ in false })?.id == "a2")
+        #expect(BrowserClickTool.popup(openedFrom: "A", before: before, after: after, isTracked: { $0 == "a2" }) == nil,
+                "a tab another task already adopted isn't taken twice")
+        #expect(BrowserClickTool.popup(openedFrom: "Z", before: before, after: after, isTracked: { _ in false }) == nil)
+        #expect(BrowserClickTool.unexplainedNewTabs(before: before, after: after, isTracked: { _ in false }).map(\.id) == ["u2"])
     }
 
     @Test func statusExplainsTheFallback() async {
@@ -680,6 +851,115 @@ struct BrowserDriverChromeTests {
         }
     }
 
+    @Test func answersDialogsOnlyInTabsGlideIsWorkingIn() async throws {
+        try await ChromeHarness.run { backend, driver, server in
+            // Chrome's start tab isn't Glide's: Glide loads a page there once and moves on.
+            let start = try #require(try await driver.tabs().first { !$0.ownedByGlide })
+            _ = try await driver.navigate(tabID: start.id, url: server.url("/delayed-confirm"))
+            let mine = try await driver.openTab(url: server.url("/delayed-confirm"), background: true)
+            // Both pages call confirm() about 3 s after loading, when Glide isn't sending them anything.
+            try await Task.sleep(for: .milliseconds(4500))
+            // Glide's own tab: answered (declined) as always, so nothing stalls there.
+            #expect(await backend.takeHandledDialogs(tabID: mine.id).map(\.type) == ["confirm"])
+            #expect(try await driver.evaluate(tabID: mine.id, "document.title") == "no")
+            // The other tab's dialog is left for the person: still open, its page waiting. Glide's
+            // commands there say so at once instead of hanging until their deadline.
+            #expect(await backend.takeHandledDialogs(tabID: start.id).isEmpty)
+            let started = ContinuousClock.now
+            let blocked = await errorText { _ = try await driver.evaluate(tabID: start.id, "document.title", timeout: 10) }
+            #expect(blocked?.contains("confirmation dialog (“Leave this alone?”). Answer it in Chrome") == true, "\(blocked ?? "no error")")
+            #expect(ContinuousClock.now - started < .seconds(2))
+            _ = try await backend.cdp(tabID: start.id, method: "Page.handleJavaScriptDialog", params: ["accept": true])
+            #expect(try await driver.evaluate(tabID: start.id, "document.title") == "yes", "the person's answer counts")
+        }
+    }
+
+    @Test func leavePromptsInTheUsersTabsAreAcceptedOnlyForGlidesActions() async throws {
+        try await ChromeHarness.run { backend, driver, server in
+            // A tab the person opened in Glide's window, on a form with unsaved input.
+            let start = try #require(try await driver.tabs().first { !$0.ownedByGlide })
+            _ = try await driver.navigate(tabID: start.id, url: server.url("/leave"))
+            let form = try await driver.snapshot(tabID: start.id)
+            // Glide clicks its link: leaving is Glide's own doing, so "Leave site?" is accepted.
+            let left = try await driver.click(tabID: start.id, ref: try #require(form.named("Second page")).ref)
+            #expect(left.notes.contains { $0.contains("confirm leaving") }, "\(left.notes)")
+            #expect(try await driver.snapshot(tabID: start.id).title == "Second")
+
+            _ = try await driver.navigate(tabID: start.id, url: server.url("/leave"))
+            let again = try await driver.snapshot(tabID: start.id)
+            // Chrome only asks on pages someone has used; then Glide moves on.
+            _ = try await driver.click(tabID: start.id, ref: try #require(again.named("Note")).ref)
+            try await Task.sleep(for: .milliseconds(2300))
+            // Glide is only reading the tab when the person closes it: the prompt is theirs.
+            let closing = Task { try? await driver.send(tabID: start.id, "Page.close", nil, timeout: 20) }
+            var blocked: String?
+            for _ in 0..<40 where !(blocked?.contains("Answer it in Chrome") ?? false) {
+                blocked = await errorText { _ = try await driver.evaluate(tabID: start.id, "document.title", timeout: 0.5) }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            #expect(blocked?.contains("“Leave site?” prompt") == true, "\(blocked ?? "no error")")
+            #expect(await backend.takeHandledDialogs(tabID: start.id).isEmpty, "Glide didn't answer it")
+            // They choose to stay, and the page is still there with its input.
+            _ = try await backend.cdp(tabID: start.id, method: "Page.handleJavaScriptDialog", params: ["accept": false])
+            _ = await closing.value
+            #expect(try await driver.evaluate(tabID: start.id, "document.title") == "Leave")
+            #expect(try await driver.tabs().contains { $0.id == start.id })
+        }
+    }
+
+    @Test func navigationsThatReturnEarlyStillWaitForTheNewPage() async throws {
+        try await ChromeHarness.run { backend, _, server in
+            // Like the extension's chrome.tabs.update/create, these return before the page commits.
+            let driver = BrowserDriver(backend: EarlyReturningBackend(backend))
+            let tab = try await driver.openTab(url: server.url("/slow"), background: true)
+            #expect(try await driver.snapshot(tabID: tab.id).title == "Slow", "not the new tab's empty first page")
+            _ = try await driver.navigate(tabID: tab.id, url: server.url("/"))
+            #expect(try await driver.snapshot(tabID: tab.id).title == "Glide Fixture")
+            let outcome = try await driver.navigate(tabID: tab.id, url: server.url("/slow?again=1"))
+            #expect(outcome.settled)
+            #expect(try await driver.snapshot(tabID: tab.id).title == "Slow", "not the page being left")
+            // A same-page navigation (only the fragment changes) doesn't wait for a new document,
+            // nor does opening the very address the tab shows when it has a fragment.
+            for _ in 0..<2 {
+                let started = ContinuousClock.now
+                _ = try await driver.navigate(tabID: tab.id, url: server.url("/slow?again=1#part"))
+                #expect(ContinuousClock.now - started < .seconds(5))
+            }
+            #expect(try await driver.snapshot(tabID: tab.id).url.hasSuffix("/slow?again=1#part"))
+        }
+    }
+
+    @Test func openingTheAddressATabShowsWithAFragmentIsQuick() async throws {
+        try await ChromeHarness.run { _, driver, server in
+            let (tab, _) = try await ChromeHarness.openHome(driver, server, path: "/second#top")
+            // Chrome scrolls to the fragment and keeps the page; there's no new page to wait for.
+            let started = ContinuousClock.now
+            let outcome = try await driver.navigate(tabID: tab, url: server.url("/second#top"))
+            #expect(outcome.settled)
+            #expect(ContinuousClock.now - started < .seconds(5))
+            #expect(try await driver.snapshot(tabID: tab).title == "Second")
+        }
+    }
+
+    @Test func cancellingOneCallerKeepsTheSharedLaunchForTheOthers() async throws {
+        let profile = FileManager.default.temporaryDirectory.appendingPathComponent("glide-chrome-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: profile) }
+        let backend = GlideChromeBackend(configuration: .init(userDataDirectory: profile, headless: true, extraArguments: GlideChromeBackend.quietArguments))
+        // Two jobs need the browser at once; one of them is stopped while Chrome starts.
+        let stopped = Task { try await backend.connect() }
+        let other = Task { try await backend.connect() }
+        try await Task.sleep(for: .milliseconds(40))
+        stopped.cancel()
+        let cancelledAt = Date()
+        do { try await stopped.value } catch is CancellationError {} // or already connected on a fast machine
+        #expect(Date().timeIntervalSince(cancelledAt) < 1, "the stopped caller stops waiting at once")
+        try await other.value
+        #expect(await backend.isConnected(), "the other caller still gets Chrome")
+        #expect(await backend.launchedProcessID != nil)
+        await backend.shutdown()
+        #expect(Self.processes(using: profile) == 0)
+    }
+
     @Test func managesTwoTabsIncludingBackgroundOnes() async throws {
         try await ChromeHarness.run { backend, driver, server in
             let first = try await driver.openTab(url: server.url("/"), background: true)
@@ -819,6 +1099,7 @@ struct BrowserToolChromeTests {
         try await ChromeHarness.run { backend, _, server in
             let (tools, ctx, sessions) = setUp(backend)
             let opened = try await tools.tool(named: "browser.open")!.run(["url": .string(server.url("/"))], context: ctx)
+            let home = try #require(sessions.session("default")?.tabID)
             let popup = try #require(ref(opened, named: "Open popup"))
             let clicked = try await tools.tool(named: "browser.click")!.run(["ref": .string(popup)], context: ctx)
             #expect(clicked.ok)
@@ -827,6 +1108,8 @@ struct BrowserToolChromeTests {
             let list = try await tools.tool(named: "browser.tabs")!.run([:], context: ctx)
             #expect(list.ok && list.text.contains("[opened by Glide]") && list.text.contains("* "))
             let current = try #require(sessions.session("default")?.tabID)
+            #expect(current != home)
+            #expect(try await backend.tabs().first { $0.id == current }?.openerID == home, "Chrome reports which tab opened the popup")
             let close = try #require(tools.tool(named: "browser.close_tab"))
             #expect(close.assess([:], context: ctx).risk == .low, "Glide opened this tab")
             let closed = try await close.run([:], context: ctx)
@@ -881,6 +1164,135 @@ struct BrowserToolChromeTests {
             await #expect(throws: AutomationError.stopped) { _ = try await waiting.value }
             #expect(Date().timeIntervalSince(started) < 2)
             await #expect(throws: AutomationError.stopped) { _ = try await open.run(["url": .string(server.url("/"))], context: stoppable) }
+        }
+    }
+}
+
+// MARK: - The real extension (Chrome for Testing)
+
+/// Chrome for Testing, which unlike Google Chrome still loads an unpacked extension from the
+/// command line. Found through `GLIDE_TEST_CHROME_FOR_TESTING`, /Applications, or Playwright's
+/// download cache; the tests that need it are skipped without it.
+enum ChromeForTesting {
+    static let executable: String? = {
+        let fm = FileManager.default
+        if let path = ProcessInfo.processInfo.environment["GLIDE_TEST_CHROME_FOR_TESTING"], fm.isExecutableFile(atPath: path) { return path }
+        let binary = "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+        var candidates = ["/Applications/" + binary, NSHomeDirectory() + "/Applications/" + binary]
+        let cache = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Caches/ms-playwright")
+        let builds = ((try? fm.contentsOfDirectory(atPath: cache.path)) ?? []).filter { $0.hasPrefix("chromium-") }.sorted().reversed()
+        for build in builds {
+            for platform in ["chrome-mac-arm64", "chrome-mac-x64", "chrome-mac"] {
+                candidates.append(cache.appendingPathComponent("\(build)/\(platform)/\(binary)").path)
+            }
+        }
+        return candidates.first { fm.isExecutableFile(atPath: $0) }
+    }()
+
+    static var installed: Bool { executable != nil }
+
+    static let extensionFolder = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().appendingPathComponent("Extensions/chrome", isDirectory: true)
+
+    /// Starts Glide's bridge, launches headless Chrome for Testing with the extension on a
+    /// throwaway profile, pairs the two through the extension's own pairing page (by clicking
+    /// Pair, as the person would), serves the fixture site and runs `body`. `chrome` is the same
+    /// browser seen over its debugging port, for setting the scene. Always cleans up.
+    static func run(_ body: (_ backend: ExtensionBackend, _ chrome: GlideChromeBackend, _ server: FixtureServer) async throws -> Void) async throws {
+        let executable = try #require(executable)
+        let server = try await FixtureServer.start(Fixtures.route)
+        let token = BridgeAuth.mintToken()
+        let bridge = ExtensionBridge()
+        bridge.start(port: 0, store: InMemoryExtensionBridgeStore(token: token))
+        let profile = FileManager.default.temporaryDirectory.appendingPathComponent("glide-cft-test-\(UUID().uuidString)", isDirectory: true)
+        let folder = extensionFolder.path
+        let arguments = ["--load-extension=\(folder)", "--disable-extensions-except=\(folder)"]
+            + GlideChromeBackend.quietArguments.filter { $0 != "--disable-extensions" }
+        let chrome = GlideChromeBackend(configuration: .init(chromePath: executable, userDataDirectory: profile, headless: true, extraArguments: arguments))
+        func cleanUp() async {
+            bridge.stop()
+            await chrome.shutdown()
+            server.stop()
+            var goneChecks = 0
+            for _ in 0..<40 where goneChecks < 4 {
+                try? FileManager.default.removeItem(at: profile)
+                goneChecks = FileManager.default.fileExists(atPath: profile.path) ? 0 : goneChecks + 1
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
+        do {
+            let port = try await bridge.waitUntilListening(timeout: 5)
+            try await chrome.connect()
+            let pairing = try #require(ExtensionBridge.pairingURL(token: token, port: port))
+            // The page Settings › Browser › Pair opens. It may take a moment for Chrome to load
+            // the extension, so it's opened again until it asks for confirmation.
+            var paired = false
+            for _ in 0..<20 where !paired {
+                let page = try await chrome.openTab(url: pairing.absoluteString, background: false)
+                let click = "(() => { const c = document.getElementById('confirm'); if (!c || c.hidden) return false; document.getElementById('pair').click(); return true; })()"
+                for _ in 0..<20 where !paired {
+                    let r = try? await chrome.cdp(tabID: page.id, method: "Runtime.evaluate", params: ["expression": .string(click), "returnByValue": true])
+                    paired = r?["result"]?["value"]?.boolValue == true
+                    if !paired { try await Task.sleep(for: .milliseconds(100)) }
+                }
+                try? await chrome.closeTab(page.id)
+            }
+            try #require(paired, "the pairing page asked to pair")
+            try #require(await bridge.waitForConnection(timeout: 20), "the extension connected after Pair was clicked")
+            try await body(ExtensionBackend(bridge: bridge, connectTimeout: 5), chrome, server)
+        } catch {
+            await cleanUp()
+            throw error
+        }
+        await cleanUp()
+    }
+}
+
+@Suite("Browser tools through the real extension (Chrome for Testing)", .serialized,
+       .enabled(if: ChromeForTesting.installed, "Chrome for Testing isn't installed; skipping the real-extension tests."))
+struct BrowserExtensionChromeTests {
+    func ref(_ output: ToolOutput, named name: String) -> String? {
+        output.data?["elements"]?.arrayValue?.first { $0["name"]?.stringValue == name }?["ref"]?.stringValue
+    }
+
+    @Test func aClickInABackgroundTabFollowsItsPopupAndKeepsThePersonsTabInFront() async throws {
+        try await ChromeForTesting.run { backend, chrome, server in
+            // The person's own tab, in front.
+            _ = try await chrome.openTab(url: server.url("/second"), background: false)
+            let hub = BrowserHub()
+            hub.register(backend)
+            var settings = AppSettings()
+            settings.browser.backend = .extensionBridge
+            let sessions = BrowserSessions()
+            let tools = ToolRegistry(BrowserTools.make(hub: hub, sessions: sessions))
+            var ctx = ToolContext(settings: settings, gate: ExecutionGate())
+            ctx.jobID = "job1"
+            ctx.itemID = "1"
+
+            let opened = try await tools.tool(named: "browser.open")!.run(["url": .string(server.url("/"))], context: ctx)
+            #expect(opened.ok && opened.text.contains("background tab"), "\(opened.text)")
+            let home = try #require(sessions.session("job:job1/item:1")?.tabID)
+            let person = try #require(try await backend.tabs().first { $0.active })
+            #expect(person.id != home && !person.ownedByGlide && person.url.hasSuffix("/second"), "\(person)")
+
+            // A target=_blank link: Chrome opens it in front, naming the person's tab as its
+            // openerTabId. Glide still recognizes it as its click's popup and works there.
+            let link = try #require(ref(opened, named: "Open popup"))
+            let clicked = try await tools.tool(named: "browser.click")!.run(["ref": .string(link)], context: ctx)
+            #expect(clicked.ok && clicked.text.contains("opened a new tab") && clicked.text.contains("Popup page"), "\(clicked.text)")
+            let popup = try #require(sessions.session("job:job1/item:1")?.tabID)
+            #expect(popup != home)
+            let tabs = try await backend.tabs()
+            let info = try #require(tabs.first { $0.id == popup })
+            #expect(info.openerID == home && info.ownedByGlide, "\(info)")
+            #expect(!info.active && tabs.first { $0.id == person.id }?.active == true, "the person's tab is back in front: \(tabs)")
+            let close = try #require(tools.tool(named: "browser.close_tab"))
+            #expect(close.assess([:], context: ctx).risk == .low, "Glide opened the popup")
+
+            // When the item is done Glide closes what it opened; the person's tab stays.
+            await sessions.releaseJob("job1", hub: hub)
+            let remaining = try await backend.tabs().map(\.id)
+            #expect(!remaining.contains(popup) && !remaining.contains(home) && remaining.contains(person.id), "\(remaining)")
         }
     }
 }

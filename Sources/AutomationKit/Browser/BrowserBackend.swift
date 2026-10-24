@@ -29,13 +29,17 @@ public struct BrowserTab: Codable, Sendable, Hashable, Identifiable {
     public var active: Bool
     /// Opened by Glide (only these are closed automatically).
     public var ownedByGlide: Bool
+    /// The tab this one was opened from (a link with target=_blank, a script popup), when the
+    /// backend knows it. It's how a click's popup is told apart from tabs that opened meanwhile.
+    public var openerID: String?
 
-    public init(id: String, url: String, title: String, active: Bool, ownedByGlide: Bool) {
+    public init(id: String, url: String, title: String, active: Bool, ownedByGlide: Bool, openerID: String? = nil) {
         self.id = id
         self.url = url
         self.title = title
         self.active = active
         self.ownedByGlide = ownedByGlide
+        self.openerID = openerID
     }
 }
 

@@ -12,10 +12,27 @@
         <img src="icons/icon48.png" alt="" />
         <h1>Pair with Glide</h1>
       </header>
-      <div class="status" role="status" aria-live="polite">
+      <section id="confirm" hidden>
+        <p class="lead">Let Glide use this Chrome?</p>
+        <p>Glide will be able to open, read and act in your tabs, signed in as you.</p>
+        <div class="status">
+          <div>
+            <div class="meta">Connects to</div>
+            <div id="target"></div>
+          </div>
+        </div>
+        <div id="portWarning" class="notice" hidden></div>
+        <p id="replaceNote" class="meta" hidden>This replaces the pairing this Chrome has now.</p>
+        <p class="meta">Only continue if you just clicked Pair in Glide's Settings › Browser.</p>
+        <div class="row">
+          <button id="pair" class="primary">Pair</button>
+          <button id="cancel">Cancel</button>
+        </div>
+      </section>
+      <div id="state" class="status" role="status" aria-live="polite" hidden>
         <span id="dot" class="dot"></span>
         <div>
-          <div id="detail">Pairing…</div>
+          <div id="detail"></div>
           <div id="meta" class="meta"></div>
         </div>
       </div>
