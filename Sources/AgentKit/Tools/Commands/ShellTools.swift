@@ -8,7 +8,7 @@ enum ConcealedClipboardGuard {
     static let message = "The clipboard holds a concealed item (likely a password from a password manager), so Glide won't run something that reads it."
 
     static func check(_ pasteboardName: NSPasteboard.Name?) async throws {
-        if case .concealed = await Clipboard.read(pasteboardName) { throw ToolError.blocked(message) }
+        if await Clipboard.holdsConcealedItem(pasteboardName) { throw ToolError.blocked(message) }
     }
 }
 

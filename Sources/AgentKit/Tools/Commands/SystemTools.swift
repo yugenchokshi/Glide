@@ -149,6 +149,12 @@ enum Clipboard {
         }
     }
 
+    /// Whether the clipboard holds a concealed item. Looks only at the item's types, never its
+    /// contents, so checking doesn't read the user's clipboard (or trigger macOS's paste prompt).
+    static func holdsConcealedItem(_ name: NSPasteboard.Name?) async -> Bool {
+        await MainActor.run { pasteboard(name).types?.contains(concealedType) ?? false }
+    }
+
     static func write(_ text: String, _ name: NSPasteboard.Name?) async -> Bool {
         await MainActor.run {
             let pb = pasteboard(name)
