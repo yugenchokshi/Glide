@@ -233,6 +233,94 @@ public struct MCPServerConfig: Codable, Sendable, Hashable, Identifiable {
     }
 }
 
+/// Whether the planner prefers direct tools (commands, DOM-level browser) or visible UI work.
+public enum ExecutionPreference: String, Codable, Sendable, CaseIterable {
+    /// Use commands, files, the browser extension and web fetches wherever possible.
+    case fastest
+    /// Prefer driving apps on screen so you can watch every step.
+    case showMe
+
+    public var title: String {
+        switch self {
+        case .fastest: return "Fastest"
+        case .showMe: return "Show me"
+        }
+    }
+}
+
+public enum CommandAccess: String, Codable, Sendable, CaseIterable {
+    case off
+    /// Only commands that can't change anything (ls, cat, mdfind, git status…).
+    case readOnly
+    /// Any command; changes follow your approval settings, dangerous ones are blocked.
+    case full
+
+    public var title: String {
+        switch self {
+        case .off: return "Off"
+        case .readOnly: return "Read-only"
+        case .full: return "Full (with approvals)"
+        }
+    }
+}
+
+public struct ToolSettings: Codable, Sendable, Hashable {
+    public var executionPreference: ExecutionPreference = .fastest
+    public var commandAccess: CommandAccess = .full
+    public var allowAppleScript = true
+    public var allowShortcuts = true
+    /// Let the action model return several actions per call.
+    public var batchActions = true
+    public var maxBatch = 6
+    public init() {}
+}
+
+public struct BrowserSettings: Codable, Sendable, Hashable {
+    public var backend: BrowserBackendKind = .extensionBridge
+    /// Localhost port the Glide extension connects to.
+    public var bridgePort = 47823
+    /// Optional custom Chrome executable.
+    public var chromePath: String?
+    /// Work in background tabs so the browser doesn't jump to the front.
+    public var useBackgroundTabs = true
+    /// Fall back to Glide's own Chrome window when the extension isn't connected.
+    public var fallbackToGlideChrome = true
+    public init() {}
+}
+
+public enum ScreenUse: String, Codable, Sendable, CaseIterable {
+    /// Background jobs may take over the cursor any time.
+    case always
+    /// Only after you've been idle for `idleSeconds`.
+    case whenIdle
+    /// Never; on-screen steps pause the job and ask.
+    case never
+
+    public var title: String {
+        switch self {
+        case .always: return "Any time"
+        case .whenIdle: return "Only when I'm idle"
+        case .never: return "Never — ask me"
+        }
+    }
+}
+
+public struct JobSettings: Codable, Sendable, Hashable {
+    public var maxConcurrentJobs = 2
+    public var screenUse: ScreenUse = .whenIdle
+    public var idleSeconds: Double = 30
+    /// Continue interrupted jobs automatically when Glide starts.
+    public var autoResume = true
+    /// Ask before starting jobs estimated above these.
+    public var confirmAboveCostUSD: Double = 1
+    public var confirmAboveMinutes: Double = 15
+    public var defaultBudget = JobBudget()
+    /// Prevent idle sleep while a job runs.
+    public var keepAwake = true
+    public var notifications = true
+    public init() {}
+}
+
 public struct AppSettings: Codable, Sendable, Hashable {
     public var providers: [ProviderConfig] = [.anthropicDefault, .openAIDefault]
     public var routing = RoutingSettings()
@@ -247,8 +335,40 @@ public struct AppSettings: Codable, Sendable, Hashable {
     public var debugScreenshots = false
     public var onboardingComplete = false
     public var enableVoiceInput = false
+    public var tools = ToolSettings()
+    public var browser = BrowserSettings()
+    public var jobs = JobSettings()
 
     public init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case providers, routing, safety, limits, hotkeys, composio, mcpServers, cursorMode, completedDismissSeconds
+        case keepHistory, debugScreenshots, onboardingComplete, enableVoiceInput, tools, browser, jobs
+    }
+
+    /// Tolerant decoding: any missing or unreadable field keeps its default, so settings saved
+    /// by older builds load instead of resetting.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func v<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T { ((try? c.decodeIfPresent(T.self, forKey: key)) ?? nil) ?? fallback }
+        let d = AppSettings()
+        providers = v(.providers, d.providers)
+        routing = v(.routing, d.routing)
+        safety = v(.safety, d.safety)
+        limits = v(.limits, d.limits)
+        hotkeys = v(.hotkeys, d.hotkeys)
+        composio = v(.composio, d.composio)
+        mcpServers = v(.mcpServers, d.mcpServers)
+        cursorMode = v(.cursorMode, d.cursorMode)
+        completedDismissSeconds = v(.completedDismissSeconds, d.completedDismissSeconds)
+        keepHistory = v(.keepHistory, d.keepHistory)
+        debugScreenshots = v(.debugScreenshots, d.debugScreenshots)
+        onboardingComplete = v(.onboardingComplete, d.onboardingComplete)
+        enableVoiceInput = v(.enableVoiceInput, d.enableVoiceInput)
+        tools = v(.tools, d.tools)
+        browser = v(.browser, d.browser)
+        jobs = v(.jobs, d.jobs)
+    }
 
     public func provider(_ id: String) -> ProviderConfig? { providers.first { $0.id == id } }
 }

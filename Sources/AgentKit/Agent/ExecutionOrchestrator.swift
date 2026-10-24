@@ -266,6 +266,9 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
             return .taskDone(message)
         case .gui, .native:
             return try await runGUIStep(step, plan: plan)
+        case .command, .browser, .web, .data:
+            // Wired to ToolStepRunner during integration.
+            return .failed("The \(step.route.rawValue) route isn't available yet.")
         }
     }
 

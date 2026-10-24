@@ -11,6 +11,10 @@ public enum RiskLevel: String, Codable, Sendable, Comparable, CaseIterable {
 public enum ExecutionRoute: String, Codable, Sendable, CaseIterable {
     case gui        // accessibility-driven UI action (vision as fallback)
     case native     // OS operation: open URL, launch app
+    case command    // shell, AppleScript/JXA, Shortcuts, file operations — no UI
+    case browser    // DOM-level Chrome control via the Glide extension, in a background tab
+    case web        // search and fetch over HTTP, no browser
+    case data       // spreadsheets and tables (CSV/XLSX)
     case composio   // Composio tool call
     case mcp        // MCP tool call
     case answer     // no action: the agent writes the result/summary itself
