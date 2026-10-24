@@ -73,6 +73,8 @@ public final class JobCenter {
     @ObservationIgnored private var pendingDeletion: Set<String> = []
     /// Running jobs asked to pause; they finish the items in flight first.
     @ObservationIgnored private var pausing: Set<String> = []
+    /// Jobs interrupted by the emergency stop; they end as `.paused` (resumable), not `.stopped`.
+    @ObservationIgnored private var halting: Set<String> = []
     @ObservationIgnored private var scheduler: JobScheduler?
     @ObservationIgnored private var launched = false
     @ObservationIgnored private var previewItems: [String: [JobItem]]?
@@ -82,6 +84,14 @@ public final class JobCenter {
 
     init(environment: Environment) {
         self.environment = environment
+    }
+
+    /// A center that uses `settings` instead of the saved settings (glidectl uses this to run
+    /// with a different model provider without touching what the app has saved).
+    public convenience init(settingsOverride settings: AppSettings) {
+        var env = Environment.production()
+        env.settings = { settings }
+        self.init(environment: env)
     }
 
     private var env: Environment {
@@ -100,6 +110,10 @@ public final class JobCenter {
 
     /// Whether a runner is still attached to the job (it may be unwinding after its last update).
     func hasRunner(_ id: String) -> Bool { runners[id] != nil }
+
+    /// Whether a runner is still working on the job in this process (it may finish its last
+    /// update a moment after the status changes).
+    public func isRunnerActive(_ id: String) -> Bool { runners[id] != nil }
 
     /// Call once at app launch: loads jobs, resumes interrupted ones (per settings) and
     /// schedules waiting ones.
@@ -282,6 +296,20 @@ public final class JobCenter {
         log(id, ActivityEntry(kind: .info, title: "Stopped by you"))
         onJobFinished?(r)
         reschedule()
+    }
+
+    /// Emergency stop: cancels every running job's step in flight immediately (the same way
+    /// Stop does, so commands and browser actions end now), but leaves the jobs paused so they
+    /// can be resumed. Waiting and queued jobs are paused too.
+    public func haltAll() {
+        for (id, handle) in runners {
+            halting.insert(id)
+            resolveApprovals(id, with: .stop)
+            handle.runner.stop()
+            handle.task.cancel()
+        }
+        for id in queue { pause(id) }
+        for job in jobs where job.status == .waiting && runners[job.id] == nil { pause(job.id) }
     }
 
     /// Re-queues failed items of a finished or paused job and resumes it.
@@ -482,6 +510,13 @@ public final class JobCenter {
         runners[id] = nil
         pausing.remove(id)
         resolveApprovals(id, with: .stop)
+        var final = final
+        if halting.remove(id) != nil, final.status == .stopped {
+            final.status = .paused
+            final.statusLine = "Halted by the emergency stop — resume to continue"
+            save(final)
+            log(id, ActivityEntry(kind: .info, title: "Halted by the emergency stop"))
+        }
         if pendingDeletion.contains(id) {
             performDeletion(id)
         } else {

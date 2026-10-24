@@ -8,11 +8,14 @@ import AutomationKit
 public struct StepRouter: StepExecuting {
     let gui: any StepExecuting
     let tools: any StepExecuting
+    /// The shared input gate GUI steps use (nil for routers built from explicit executors).
+    let sharedGate: ExecutionGate?
 
     /// Routes to explicit executors (tests, or custom runners).
     public init(gui: any StepExecuting, tools: any StepExecuting) {
         self.gui = gui
         self.tools = tools
+        self.sharedGate = nil
     }
 
     /// The production router: the GUI loop on `runtime`, the tool loop over `tools`, models
@@ -22,10 +25,15 @@ public struct StepRouter: StepExecuting {
         self.gui = GUIStepRunner(settings: settings, runtime: runtime, router: router)
         self.tools = ToolStepRunner(settings: settings, runtime: runtime, tools: tools, models: .router(router),
                                     integrations: .standard(settings: settings))
+        self.sharedGate = runtime.gate
     }
 
     public func execute(_ request: StepRequest, callbacks: AgentCallbacks) async throws -> StepResult {
         if request.step.route.needsScreen {
+            // A job reaches its on-screen steps only while holding the screen lease, so no quick
+            // task is running: clear a Stop or pause left on the shared input gate by an earlier
+            // task (or the emergency stop) so a resumed job can use the screen again.
+            if request.jobID != nil, let gate = sharedGate, gate.current != .running { gate.reset() }
             return try await gui.execute(request, callbacks: callbacks)
         }
         return try await tools.execute(request, callbacks: callbacks)

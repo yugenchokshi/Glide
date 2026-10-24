@@ -81,6 +81,27 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   onDebuggerDetach(source, reason).catch((e) => console.warn("Glide: detach handling failed", e));
 });
 
+// JavaScript dialogs freeze the page's scripts until answered, which would stall every
+// automation command on the tab. Answer them the way Glide's own Chrome does — dismiss alerts,
+// let navigation leave the page, decline confirm()/prompt() — and tell Glide what happened.
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (method !== "Page.javascriptDialogOpening" || typeof source.tabId !== "number") return;
+  const type = (params && params.type) || "alert";
+  const accept = type === "alert" || type === "beforeunload";
+  chrome.debugger
+    .sendCommand({ tabId: source.tabId }, "Page.handleJavaScriptDialog", { accept })
+    .catch((e) => console.warn("Glide: couldn't answer a dialog", e));
+  if (session && session.verified) {
+    send(session, {
+      event: "dialog",
+      tabId: source.tabId,
+      type,
+      message: String((params && params.message) || "").slice(0, 500),
+      accepted: accept,
+    });
+  }
+});
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   attached.delete(tabId);
   forgetGlideTab(tabId).catch(() => {});
@@ -440,6 +461,12 @@ function ensureAttached(tabId, tab) {
       } else {
         throw bridgeError("cdp", message);
       }
+    }
+    // Page events are needed to see (and answer) JavaScript dialogs.
+    try {
+      await chrome.debugger.sendCommand({ tabId }, "Page.enable");
+    } catch (e) {
+      console.warn("Glide: Page.enable failed", e);
     }
     attached.add(tabId);
   })().finally(() => attaching.delete(tabId));

@@ -35,7 +35,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             switch action {
             case .open: self.toggleNotch()
             case .pauseResume: self.controller.togglePause()
-            case .stop: self.controller.stop()
+            case .stop:
+                // The emergency stop halts everything: the quick task and every background job.
+                self.controller.stop()
+                JobCenter.shared.haltAll()
             }
         }
         hotkeys.apply(store.settings.hotkeys)
@@ -54,15 +57,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    /// Launch hook for the agent's subsystems, called before any UI or job runs so the first
-    /// task already sees every tool. Integration adds the call sites here:
-    /// - the tool families: `CommandTools.install()`, `BrowserTools.install()`,
-    ///   `DataTools.install()`, `WebTools.install()`, `WorkspaceTools.install()`
-    /// - the step runners: `StepRouter.install()` (fills `StepExecutorFactory.make`)
-    /// - the browser: `BrowserHub.shared.register(GlideChromeBackend(...))` and
-    ///   `ExtensionBridge.shared.start(settings: store.settings)`, which registers the
-    ///   extension backend and the pairing hooks Settings › Browser shows
-    private func installAgentSubsystems() {}
+    /// Installs the agent's subsystems before any UI or job runs, so the first task already sees
+    /// every tool: the tool families, the step router jobs execute with, Glide's own Chrome, and
+    /// the Chrome extension bridge (which registers the pairing hooks Settings › Browser shows).
+    private func installAgentSubsystems() {
+        AgentSetup.installAll(settings: store.settings, startBrowserBridge: true)
+        watchBridgePort()
+    }
+
+    /// Restarts the extension bridge when its port setting changes. (Observation fires on any
+    /// settings change, so compare against the port the bridge was started with.)
+    private func watchBridgePort() {
+        let startedPort = store.settings.browser.bridgePort
+        withObservationTracking {
+            _ = store.settings.browser.bridgePort
+        } onChange: { [weak self] in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if self.store.settings.browser.bridgePort != startedPort {
+                    ExtensionBridge.shared.start(settings: self.store.settings.browser)
+                }
+                self.watchBridgePort()
+            }
+        }
+    }
 
     /// Background jobs: route their attention requests to the notch (and to a notification
     /// when the notch is collapsed), then load and resume them. Callbacks are set before

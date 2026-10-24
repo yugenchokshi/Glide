@@ -13,10 +13,21 @@ public final class ExtensionBackend: BrowserBackend {
     let connectTimeout: TimeInterval
     /// Tabs opened through this backend (`BrowserTab.ownedByGlide`).
     private let ownedTabs = Mutex<Set<String>>([])
+    /// Dialogs the extension answered, per tab, until the driver collects them.
+    private let dialogs = Mutex<[String: [BrowserDialog]]>([:])
 
     public init(bridge: ExtensionBridge = .shared, connectTimeout: TimeInterval = 5) {
         self.bridge = bridge
         self.connectTimeout = connectTimeout
+        bridge.addEventHandler { [weak self] event in
+            if case .dialog(let tabID, let dialog) = event {
+                self?.dialogs.withLock { all in
+                    var list = all[tabID] ?? []
+                    list.append(dialog)
+                    all[tabID] = Array(list.suffix(20))
+                }
+            }
+        }
     }
 
     public func isConnected() async -> Bool { bridge.isConnected }
@@ -122,4 +133,17 @@ public enum ExtensionURLPolicy {
         if host == "chrome.google.com", components.path.hasPrefix("/webstore") { return true }
         return false
     }
+}
+
+// The driver uses these to report dialogs to the model and to describe the connection in
+// Settings › Browser. The extension doesn't stream network events, so the driver falls back to
+// watching the DOM settle.
+extension ExtensionBackend: BrowserPageObserving, BrowserStatusDescribing {
+    public func networkActivity(tabID: String) async -> BrowserNetworkActivity? { nil }
+
+    public func takeHandledDialogs(tabID: String) async -> [BrowserDialog] {
+        dialogs.withLock { $0.removeValue(forKey: tabID) ?? [] }
+    }
+
+    public func statusDetail() async -> String { bridge.status().detail }
 }

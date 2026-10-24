@@ -97,6 +97,9 @@ public enum ExtensionBridgeEvent: Sendable, Hashable {
     /// Chrome detached the debugger from a tab. `canceled_by_user` means the user dismissed
     /// Chrome's "started debugging this browser" bar; `target_closed` that the tab closed.
     case detached(tabID: String, reason: String)
+    /// The extension answered a JavaScript dialog on a tab (alerts dismissed, confirm/prompt
+    /// declined, leaving the page allowed).
+    case dialog(tabID: String, dialog: BrowserDialog)
 }
 
 /// The bridge's state for Settings › Browser and the notch.
@@ -852,6 +855,11 @@ extension ExtensionBridge {
             switch event {
             case "detached":
                 emit(.detached(tabID: object["tabId"]?.stringValue ?? "", reason: object["reason"]?.stringValue ?? "unknown"))
+            case "dialog":
+                let dialog = BrowserDialog(type: object["type"]?.stringValue ?? "alert",
+                                           message: String((object["message"]?.stringValue ?? "").prefix(500)),
+                                           accepted: object["accepted"]?.boolValue ?? false)
+                emit(.dialog(tabID: object["tabId"]?.stringValue ?? "", dialog: dialog))
             default:
                 break // "keepalive" (already counted by touch()) and future events.
             }

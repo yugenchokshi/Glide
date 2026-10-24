@@ -13,6 +13,11 @@ import AgentKit
 //   glidectl bench [--only 1,2] [--json out.json]   run the 12-scenario benchmark
 //   glidectl run "<task>" [--mock-url URL] [--yes]  run the full agent with configured providers
 //   glidectl permissions               show permission status
+//   glidectl tool list [--category browser]       list the agent's tools
+//   glidectl tool run <name> '<json args>' [--yes] [--headless]   run one tool (safety-checked)
+//   glidectl browser status                       which Chrome backend is available
+//   glidectl job run "<task>" [--mock-url URL] [--yes]   plan and run a long-running job here
+//   glidectl job list | job show <id> | job resume <id> [--yes]
 
 setvbuf(stdout, nil, _IOLBF, 0)
 let args = Array(CommandLine.arguments.dropFirst())
@@ -26,7 +31,7 @@ var positional: [String] {
     var skip = false
     for a in args.dropFirst() {
         if skip { skip = false; continue }
-        if ["--app", "--only", "--json", "--mock-url", "--model", "--provider"].contains(a) { skip = true; continue }
+        if ["--app", "--only", "--json", "--mock-url", "--model", "--provider", "--category"].contains(a) { skip = true; continue }
         if a.hasPrefix("--") { continue }
         out.append(a)
     }
@@ -34,6 +39,8 @@ var positional: [String] {
 }
 
 let runtime = AutomationRuntime.shared
+/// The throwaway headless Chrome started by `--headless` (shut down before exiting).
+nonisolated(unsafe) var cliHeadless: (backend: GlideChromeBackend, profile: URL)?
 let fixtureURL = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("NBFixtureApp")
 
 @MainActor
@@ -42,10 +49,23 @@ func main() async -> Int32 {
         print("usage: glidectl inspect|click|type|key|menu|workflow|bench|run|permissions …")
         return 2
     }
-    if command != "permissions" && !AccessibilityEngine.isTrusted {
+    // Tools, jobs and the browser don't need Accessibility; driving the UI does.
+    let needsAccessibility = !["permissions", "tool", "job", "browser"].contains(command)
+    if needsAccessibility && !AccessibilityEngine.isTrusted {
         print("✗ Accessibility permission is not granted to this process.")
         return 1
     }
+    if flag("--headless") {
+        // A throwaway headless Chrome profile, so CLI runs never touch Glide's real one.
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("glidectl-chrome-\(ProcessInfo.processInfo.processIdentifier)")
+        let backend = GlideChromeBackend(configuration: .init(userDataDirectory: dir, headless: true))
+        BrowserHub.shared.register(backend)
+        cliHeadless = (backend, dir)
+    }
+    // The app owns the extension bridge's port, so the CLI uses Glide's own Chrome window.
+    var cliSettings = SettingsStore.loadSnapshot()
+    cliSettings.browser.backend = .glideChrome
+    AgentSetup.installAll(settings: cliSettings, startBrowserBridge: false)
     let runner = ScriptRunner(runtime: runtime)
     func targetApp() throws -> AppInfo {
         if let name = option("--app") {
@@ -147,6 +167,16 @@ func main() async -> Int32 {
             print("duration \(Int(result.durationMs))ms · actions \(m.actions) (\(m.deterministicActions) deterministic) · model calls \(m.modelCalls) · vision \(m.visionCalls) · tokens \(m.inputTokens)/\(m.outputTokens) · recoveries \(m.recoveries)" + (m.estimatedCost.map { String(format: " · ~$%.4f", $0) } ?? ""))
             return result.status == .completed ? 0 : 1
 
+        case "tool":
+            return try await toolCommand(settings: cliSettings)
+
+        case "browser":
+            let status = await BrowserHub.shared.status(settings: cliSettings.browser)
+            print("backend: \(status.backend.title)\nconnected: \(status.connected)\nchrome installed: \(status.chromeInstalled)\n\(status.detail)")
+
+        case "job":
+            return await jobCommand(settings: cliSettings)
+
         default:
             print("unknown command \(command)")
             return 2
@@ -156,6 +186,161 @@ func main() async -> Int32 {
         return 1
     }
     return 0
+}
+
+/// Applies `--mock-url` (an OpenAI-compatible endpoint) to a settings copy.
+func applyMock(_ settings: inout AppSettings) {
+    guard let mock = option("--mock-url") else { return }
+    var p = ProviderConfig(id: "mock", kind: .openaiCompatible, name: "Mock", baseURL: mock, requiresKey: false, models: [option("--model") ?? "mock"])
+    p.enabled = true
+    settings.providers = [p]
+    settings.routing = RoutingSettings()
+    settings.routing.preferredProviderID = "mock"
+}
+
+func askApproval(_ title: String, risk: RiskLevel, reasons: [String]) async -> ApprovalDecision {
+    print("⚠︎ Approval needed (\(risk.rawValue)): \(title)\(reasons.isEmpty ? "" : " — " + reasons.joined(separator: ", "))")
+    if flag("--yes") { print("  auto-approved (--yes)"); return .approve }
+    print("  approve? [y/N/s(top)] ", terminator: "")
+    let answer = await Task.detached { readLine() ?? "" }.value.lowercased()
+    return answer == "y" ? .approve : (answer == "s" ? .stop : .reject)
+}
+
+@MainActor
+func toolCommand(settings: AppSettings) async throws -> Int32 {
+    let registry = ToolRegistry.standard(settings: settings)
+    switch positional.first {
+    case "list":
+        let category = option("--category").flatMap(ToolCategory.init(rawValue:))
+        for s in registry.specs(in: category.map { [$0] }) {
+            print("\(s.name.padding(toLength: 22, withPad: " ", startingAt: 0)) \(s.category.rawValue.padding(toLength: 10, withPad: " ", startingAt: 0)) \(s.readOnly ? "read-only " : "          ")\(s.summary)")
+        }
+        return 0
+    case "run":
+        let rest = Array(positional.dropFirst())
+        guard let name = rest.first else { print("glidectl tool run <name> '<json args>'"); return 2 }
+        guard let tool = registry.tool(named: name) else { throw ToolError.unknownTool(name) }
+        let arguments = rest.count > 1 ? try JSONValue.parse(rest[1]) : [:]
+        let gate = ExecutionGate()
+        let context = ToolContext(settings: settings, gate: gate, log: { e in print("  · \(e.title)") })
+        let verdict = tool.assess(arguments, context: context)
+        print("◆ \(verdict.summary) — risk \(verdict.risk.rawValue)")
+        if let blocked = verdict.blocked { print("✗ blocked: \(blocked)"); return 1 }
+        if SafetyPolicy(settings: settings.safety).needsApproval(verdict.safetyVerdict) {
+            guard await askApproval(verdict.summary, risk: verdict.risk, reasons: verdict.reasons) == .approve else { print("declined"); return 1 }
+        }
+        signal(SIGINT, SIG_IGN)
+        let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        sig.setEventHandler { print("\n■ stop requested"); gate.stop() }
+        sig.resume()
+        let t = Date()
+        let output = try await tool.run(arguments, context: context)
+        print(output.text)
+        if let data = output.data, flag("--json") { print(data.jsonString(pretty: true)) }
+        print("\(output.ok ? "✓ ok" : "✗ failed") in \(Int(Date().timeIntervalSince(t) * 1000))ms")
+        return output.ok ? 0 : 1
+    default:
+        print("glidectl tool list | tool run <name> '<json>'")
+        return 2
+    }
+}
+
+@MainActor
+func jobCommand(settings base: AppSettings) async -> Int32 {
+    var settings = base
+    applyMock(&settings)
+    settings.safety.pauseOnUserInput = false
+    let center = JobCenter(settingsOverride: settings)
+    center.reload()
+    switch positional.first {
+    case "list":
+        for j in center.jobs.prefix(30) {
+            print("\(j.id.prefix(8))  \(j.status.rawValue.padding(toLength: 20, withPad: " ", startingAt: 0)) \(j.title)  · \(j.statusLine)")
+        }
+        return 0
+    case "show":
+        guard let prefix = positional.dropFirst().first, let j = center.jobs.first(where: { $0.id.hasPrefix(prefix) }) else { print("job not found"); return 1 }
+        printJob(j, center: center)
+        return 0
+    case "run", "resume":
+        let id: String
+        if positional.first == "run" {
+            guard let text = positional.dropFirst().first else { print("glidectl job run \"<task>\""); return 2 }
+            print("◆ planning…")
+            let job = await center.create(instruction: text, autoStartIfSmall: false)
+            if let plan = job.plan { printPlan(plan) }
+            guard job.status == .awaitingConfirmation || job.status == .running else {
+                print("✗ \(job.statusLine) \(job.lastError ?? "")")
+                return 1
+            }
+            if job.status == .awaitingConfirmation {
+                if let e = job.plan?.estimate {
+                    print("Estimate: \(e.items) items · ~\(e.modelCalls) model calls · ~\(Int(e.minutes.rounded())) min" + (e.costUSD.map { String(format: " · ~$%.2f", $0) } ?? ""))
+                }
+                if !flag("--yes") {
+                    print("Start? [y/N] ", terminator: "")
+                    guard (await Task.detached { readLine() ?? "" }.value.lowercased()) == "y" else { center.stop(job.id); return 1 }
+                }
+                center.start(job.id)
+            }
+            id = job.id
+        } else {
+            guard let prefix = positional.dropFirst().first, let j = center.jobs.first(where: { $0.id.hasPrefix(prefix) }) else { print("job not found"); return 1 }
+            id = j.id
+            center.resume(id)
+        }
+        signal(SIGINT, SIG_IGN)
+        let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        sig.setEventHandler { print("\n■ stopping job"); center.stop(id) }
+        sig.resume()
+        // Follow the job: print new log lines, answer approvals, stop when it settles.
+        var seen = Set<UUID>()
+        var lastLine = ""
+        while true {
+            for e in center.events(id, limit: 50).reversed() where !seen.contains(e.id) {
+                seen.insert(e.id)
+                let mark = e.success.map { $0 ? "✓" : "✗" } ?? "·"
+                print("  \(mark) \(e.kind.rawValue): \(e.title)\(e.detail.map { " — " + $0.replacingOccurrences(of: "\n", with: " | ").prefix(200) } ?? "")")
+            }
+            if let req = center.pendingApprovals[id] {
+                center.respond(jobID: id, decision: await askApproval(req.title, risk: req.risk, reasons: req.reasons))
+            }
+            guard let j = center.job(id) else { break }
+            if j.statusLine != lastLine { lastLine = j.statusLine; print("◆ [\(j.status.rawValue)] \(j.statusLine)") }
+            if [.completed, .failed, .stopped, .needsInput, .paused, .waiting].contains(j.status), !center.isRunnerActive(id) {
+                printJob(j, center: center)
+                return j.status == .completed ? 0 : 1
+            }
+            try? await Task.sleep(for: .milliseconds(400))
+        }
+        return 1
+    default:
+        print("glidectl job run \"<task>\" | job list | job show <id> | job resume <id>")
+        return 2
+    }
+}
+
+func printPlan(_ plan: JobPlan) {
+    print("Plan: \(plan.goal)")
+    for m in plan.milestones {
+        print("  ▸ \(m.title)\(m.requiresApproval ? " (asks first)" : "")")
+        for s in m.steps {
+            switch s.kind {
+            case .action(let r): print("      · \(s.title) [\(r.route.rawValue)]")
+            case .forEach(let f): print("      · \(s.title) — for each \(f.itemLabel) ×\(f.parallelism) [\(f.recipe.map(\.route.rawValue).joined(separator: ","))] → \(f.outputTable)")
+            case .wait(let w): print("      · \(s.title) — wait \(w)")
+            }
+        }
+    }
+}
+
+@MainActor
+func printJob(_ j: JobRecord, center: JobCenter) {
+    let u = j.usage
+    print("\n\(j.status.rawValue.uppercased()): \(j.title)\n\(j.statusLine)\(j.lastError.map { "\n" + $0 } ?? "")")
+    print("items \(u.itemsDone)/\(u.itemsTotal) done, \(u.itemsFailed) failed · model calls \(u.modelCalls) · tool calls \(u.toolCalls) · tokens \(u.inputTokens)/\(u.outputTokens) · active \(Int(u.activeSeconds))s" + (u.costKnown ? String(format: " · ~$%.4f", u.costUSD) : ""))
+    if let summary = j.summary { print("\n\(summary)") }
+    print("folder: \(j.folder)")
 }
 
 @MainActor
@@ -199,4 +384,8 @@ func printTable(_ results: [BenchmarkSuite.Result]) {
 }
 
 let code = await main()
+if let headless = cliHeadless {
+    await headless.backend.shutdown()
+    try? FileManager.default.removeItem(at: headless.profile)
+}
 exit(code)

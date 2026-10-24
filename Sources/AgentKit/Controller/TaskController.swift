@@ -101,6 +101,24 @@ public final class TaskController {
                 self?.task = nil
                 return
             }
+            // Quick tasks are interactive: they take the screen ahead of background jobs. A job's
+            // on-screen step that is already running finishes first; jobs' other work continues.
+            let leaseOwner = "task:\(id)"
+            if await ScreenLease.shared.currentHolder != nil {
+                self.update(phase: .planning, status: "Waiting for a background job to finish its on-screen step…", run: id)
+            }
+            do {
+                try await ScreenLease.shared.acquire(owner: leaseOwner, priority: true)
+            } catch {
+                self.task = nil
+                self.finish(TaskResult(status: .stopped, summary: "Stopped", error: nil, plan: nil, metrics: await TaskMetrics().snapshot(), durationMs: 0), run: id)
+                return
+            }
+            guard !Task.isCancelled, self.runID == id, !self.runtime.gate.isStopped else {
+                await ScreenLease.shared.release(owner: leaseOwner)
+                self.task = nil
+                return
+            }
             let orchestrator = ExecutionOrchestrator(instruction: trimmed, settings: SettingsStore.shared.settings, runtime: self.runtime,
                                                      callbacks: callbacks, composio: composio, jobHandoff: handoff)
             self.orchestrator = orchestrator
@@ -108,6 +126,7 @@ public final class TaskController {
             let run = Task.detached(priority: .userInitiated) { await orchestrator.run() }
             self.runTask = run
             let result = await run.value
+            await ScreenLease.shared.release(owner: leaseOwner)
             self.runTask = nil
             self.task = nil
             self.orchestrator = nil

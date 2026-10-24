@@ -172,6 +172,7 @@ public actor JobRunner {
             }
         }
         await lease.release(owner: leaseOwner)
+        if record.status.isFinished { await BrowserSessions.shared.releaseJob(jobID) }
         persist()
         return record
     }
@@ -660,6 +661,10 @@ public actor JobRunner {
             throw error
         }
         let ms = Self.seconds(clock.now - started) * 1000
+        // The item's browser tab (if it used one) is no longer needed.
+        if spec.recipe.contains(where: { $0.route == .browser }) {
+            await BrowserSessions.shared.release(jobID: jobID, itemID: item.id)
+        }
         if let failure {
             item.status = .failed
             item.error = String(failure.prefix(1000))
