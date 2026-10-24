@@ -32,7 +32,7 @@ public struct StepRouter: StepExecuting {
         if request.step.route.needsScreen {
             // A job reaches its on-screen steps only while holding the screen lease, so no quick
             // task is running: clear a Stop or pause left on the shared input gate by an earlier
-            // task (or the emergency stop) so a resumed job can use the screen again.
+            // task, a stopped job step or the emergency stop, so a resumed job can use the screen.
             if request.jobID != nil, let gate = sharedGate, gate.current != .running { gate.reset() }
             return try await gui.execute(request, callbacks: callbacks)
         }
@@ -58,15 +58,24 @@ final class TaskSession: @unchecked Sendable {
     private var _actions = 0
     private var _screenshotConsent = false
     private var _currentApp: AppInfo?
+    private var _deadline: Date
 
-    let deadline: Date
     let maxTotalActions: Int
     private let timeoutMinutes: Int
 
     init(deadline: Date, maxTotalActions: Int) {
-        self.deadline = deadline
+        self._deadline = deadline
         self.maxTotalActions = maxTotalActions
         self.timeoutMinutes = max(1, Int((deadline.timeIntervalSinceNow / 60).rounded()))
+    }
+
+    var deadline: Date { lock.withLock { _deadline } }
+
+    /// Pushes the deadline out by time the run spent waiting for the user (a job step paused
+    /// while they used the Mac), so waiting never times the step out.
+    func extendDeadline(by seconds: TimeInterval) {
+        guard seconds > 0 else { return }
+        lock.withLock { _deadline = _deadline.addingTimeInterval(seconds) }
     }
 
     /// A session bounded by the task limits in settings, starting now.
@@ -125,6 +134,27 @@ extension StepResult {
     /// Output fields missing from `fields`.
     static func missingFields(_ fields: [String: JSONValue]?, required: [String]) -> [String] {
         required.filter { fields?[$0] == nil }
+    }
+
+    /// Reads a reply's `result_fields_json`. Strict structured output sends a JSON object
+    /// string, but in the prompt-only fallbacks (OpenAI-compatible servers such as Ollama or
+    /// LM Studio, or a provider that rejected the schema) models often send the object itself;
+    /// both are accepted. `unreadable` means something other than null was sent that isn't an
+    /// object, so the model can be asked to send it again.
+    static func decodeResultFields(_ value: JSONValue?) -> (fields: [String: JSONValue]?, unreadable: Bool) {
+        switch value {
+        case nil, .null?:
+            return (nil, false)
+        case .object(let object)?:
+            return (object, false)
+        case .string(let text)?:
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed == "null" { return (nil, false) }
+            let fields = JSONValue.extractObject(from: trimmed)?.objectValue
+            return (fields, fields == nil)
+        default:
+            return (nil, true)
+        }
     }
 }
 

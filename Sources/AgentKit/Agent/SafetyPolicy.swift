@@ -80,13 +80,61 @@ public struct SafetyPolicy: Sendable {
         return Verdict(risk: risk, reasons: reasons, blocked: nil)
     }
 
+    /// Judges a tool by the words in its name. Names come in every style (`delete_file`,
+    /// `API-delete-a-block`, `deleteRecord`, `gmail.send`), so they're split into words first.
     public func assessTool(name: String, risk modelRisk: RiskLevel) -> Verdict {
-        let n = name.lowercased().replacingOccurrences(of: "_", with: " ")
+        let n = Self.toolNameWords(name)
         var risk = modelRisk
         var reasons: [String] = []
-        if Self.matches(n, Self.highRiskWords) { risk = .high; reasons.append("tool \(name)") }
+        if Self.matches(n, Self.highRiskWords) || Self.matches(n, Self.highRiskToolWords) { risk = .high; reasons.append("tool \(name)") }
         else if Self.matches(n, Self.mediumRiskWords) { risk = max(risk, .medium) }
         return Verdict(risk: risk, reasons: reasons, blocked: nil)
+    }
+
+    /// Integration tools (MCP servers, Composio) run code Glide knows nothing about, and their
+    /// name is the only signal, so they never rate below medium. An HTTP DELETE passed to a
+    /// generic request tool is high, whatever the tool is called.
+    public func assessIntegrationTool(name: String, arguments: JSONValue) -> Verdict {
+        var v = assessTool(name: name, risk: .medium)
+        if v.risk < .high, Self.httpMethod(in: arguments) == "DELETE" {
+            v.risk = .high
+            v.reasons.append("HTTP DELETE")
+        }
+        return v
+    }
+
+    /// Risky verbs judged only in tool names: as button labels ("Forward", "Reply", "Drop")
+    /// they usually just navigate or open a draft.
+    static let highRiskToolWords = ["destroy", "drop", "purge", "wipe", "terminate", "kill", "charge", "refund", "reply", "forward", "invite"]
+
+    /// A tool name as lowercase words: camelCase is split, and `_ - . / :` are separators.
+    /// "API-delete-a-block" → "api delete a block", "sendHTTPRequest" → "send http request".
+    static func toolNameWords(_ name: String) -> String {
+        let chars = Array(name)
+        var out = ""
+        for (i, c) in chars.enumerated() {
+            if c == "_" || c == "-" || c == "." || c == "/" || c == ":" || c.isWhitespace {
+                out.append(" ")
+                continue
+            }
+            if c.isUppercase, i > 0 {
+                let prev = chars[i - 1]
+                let nextIsLower = i + 1 < chars.count && chars[i + 1].isLowercase
+                // deleteRecord → delete Record; HTTPRequest → HTTP Request.
+                if prev.isLowercase || prev.isNumber || (prev.isUppercase && nextIsLower) { out.append(" ") }
+            }
+            out.append(c)
+        }
+        return out.lowercased().split(separator: " ").joined(separator: " ")
+    }
+
+    /// The HTTP method an integration call asks for, upper-cased, when its arguments name one.
+    static func httpMethod(in arguments: JSONValue) -> String? {
+        guard let object = arguments.objectValue else { return nil }
+        for (key, value) in object where ["method", "httpmethod", "http_method"].contains(key.lowercased()) {
+            if let method = value.stringValue?.trimmingCharacters(in: .whitespaces).uppercased(), !method.isEmpty { return method }
+        }
+        return nil
     }
 
     public func needsApproval(_ verdict: Verdict) -> Bool {

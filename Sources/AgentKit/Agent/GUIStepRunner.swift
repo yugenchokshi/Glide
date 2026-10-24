@@ -46,9 +46,12 @@ public struct GUIStepRunner: StepExecuting {
         var outputFields: [String] = []
         /// Model turns allowed for this step (the orchestrator relies on the action limits instead).
         var maxTurns: Int = .max
-        /// Job steps never stop the shared input gate themselves: that would also stop the user's
-        /// quick tasks. Stopping a job is the job runner's business (it cancels the step).
+        /// Job steps never stop the shared input gate on their own decisions (an approval's
+        /// Stop): stopping a job is the job runner's business, and it cancels the step.
         var isJob = false
+        /// Job steps: pauses the step while the user is using the Mac (nil for quick tasks,
+        /// which the orchestrator's own monitor pauses, or when the setting is off).
+        var takeover: UserTakeoverWatch? = nil
     }
 
     struct Outcome: Sendable {
@@ -69,12 +72,29 @@ public struct GUIStepRunner: StepExecuting {
         let session = TaskSession(limits: settings.limits)
         if !request.context.isEmpty { session.appendNote(request.context) }
         let step = request.step.asPlanStep
+        let takeover = UserTakeoverWatch.forStep(request, settings: settings)
+        takeover?.start()
+        defer { takeover?.stop() }
         let run = Run(instruction: request.goal, plan: Plan(goal: request.goal, steps: [step], clarification: nil), session: session,
                       metrics: metrics, callbacks: callbacks, workspace: request.workspace, itemID: request.itemID,
-                      outputFields: request.step.outputFields, maxTurns: max(1, request.maxTurns), isJob: request.jobID != nil)
+                      outputFields: request.step.outputFields, maxTurns: max(1, request.maxTurns), isJob: request.jobID != nil,
+                      takeover: takeover)
         let outcome: Outcome
         do {
-            outcome = try await self.run(step, run)
+            if request.jobID != nil {
+                // A job's on-screen step holds the screen lease, so it is the only one using the
+                // shared gate. When the job is stopped or halted (its task cancelled), stop the
+                // gate too, so input already being posted (a long text being typed) ends at
+                // once, as it does for a quick task's Stop. Whoever takes the lease next resets it.
+                let gate = runtime.gate
+                outcome = try await withTaskCancellationHandler {
+                    try await self.run(step, run)
+                } onCancel: {
+                    gate.stop()
+                }
+            } else {
+                outcome = try await self.run(step, run)
+            }
         } catch is CancellationError {
             throw AutomationError.stopped
         }
@@ -113,6 +133,8 @@ public struct GUIStepRunner: StepExecuting {
         }
 
         // Bring the step's app forward first if it's already running (cheap, deterministic).
+        // Switching apps takes focus from the user, so a job waits until they're idle first.
+        try await waitForUser(step, r)
         if let appName = step.app, step.hint?.action != "launch_app",
            let running = runtime.executor.apps.runningApp(named: appName),
            running.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier {
@@ -126,6 +148,9 @@ public struct GUIStepRunner: StepExecuting {
         while true {
             try await runtime.gate.checkpoint()
             try r.session.checkLimits(gate: runtime.gate)
+            // Below, the screen is observed afresh, so after waiting for the user the step
+            // carries on from whatever they left on screen.
+            try await waitForUser(step, r)
             guard actionsInStep < settings.limits.maxActionsPerStep else {
                 return outcome(.failed("Too many actions without finishing this step (\(actionsInStep))."))
             }
@@ -148,12 +173,13 @@ public struct GUIStepRunner: StepExecuting {
                     let target = Self.targetNode(action, obs: obs)
                     let result = try await perform(action, target: target, obs: obs, modelRisk: step.risk, step: step, expect: nil,
                                                    deterministic: true, history: &history, r)
-                    actionsInStep += 1
+                    if result.ran { actionsInStep += 1 }
                     switch result {
                     case .ok(let verification): noEffectStreak = verification == .passed ? 0 : noEffectStreak + 1
                     case .rejected: rejections += 1
                     case .blocked(let m): return outcome(.blocked(m))
                     case .error: errors += 1
+                    case .skipped: hintTried = false // try the hint again on the fresh screen
                     }
                     // Native single-action steps (launch / open URL) finish when verified.
                     if step.route == .native, case .ok(.passed) = result, Self.isTerminalNative(action) { return outcome(.done) }
@@ -213,7 +239,7 @@ public struct GUIStepRunner: StepExecuting {
             case .needVision:
                 let result = try await groundAndAct(description: decision.targetDescription ?? "the target", kind: decision.action ?? "click",
                                                     decision: decision, obs: obs, step: step, history: &history, r)
-                actionsInStep += 1
+                if result.ran { actionsInStep += 1 }
                 if case .blocked(let m) = result { return outcome(.blocked(m)) }
                 if case .error = result { errors += 1 }
             case .act:
@@ -227,7 +253,7 @@ public struct GUIStepRunner: StepExecuting {
                     }
                     let result = try await perform(action, target: target, obs: obs, modelRisk: decision.risk, step: step,
                                                    expect: decision.expect, deterministic: false, history: &history, r)
-                    actionsInStep += 1
+                    if result.ran { actionsInStep += 1 }
                     switch result {
                     case .ok(let verification): noEffectStreak = verification == .passed ? 0 : noEffectStreak + 1
                     case .rejected:
@@ -235,6 +261,7 @@ public struct GUIStepRunner: StepExecuting {
                         if rejections >= 2 { return outcome(.blocked("You declined the proposed action. Tell me how you'd like to proceed.")) }
                     case .blocked(let m): return outcome(.blocked(m))
                     case .error: errors += 1
+                    case .skipped: signatures[sig, default: 1] -= 1 // it never ran, so proposing it again isn't a repeat
                     }
 
                     // 3. Batched follow-ups, while the screen is still the one the model planned against.
@@ -270,7 +297,7 @@ public struct GUIStepRunner: StepExecuting {
                         }
                         let nextResult = try await perform(next, target: nextTarget, obs: fresh, modelRisk: followUp.risk, step: step,
                                                            expect: followUp.expect, deterministic: false, history: &history, r)
-                        actionsInStep += 1
+                        if nextResult.ran { actionsInStep += 1 }
                         switch nextResult {
                         case .ok(let verification):
                             noEffectStreak = verification == .passed ? 0 : noEffectStreak + 1
@@ -288,11 +315,14 @@ public struct GUIStepRunner: StepExecuting {
                         case .error:
                             errors += 1
                             break batch
+                        case .skipped:
+                            signatures[nextSig, default: 1] -= 1
+                            break batch
                         }
                     }
                 case .needsGrounding(let description, let kind, let d):
                     let result = try await groundAndAct(description: description, kind: kind, decision: d, obs: obs, step: step, history: &history, r)
-                    actionsInStep += 1
+                    if result.ran { actionsInStep += 1 }
                     if case .blocked(let m) = result { return outcome(.blocked(m)) }
                     if case .error = result { errors += 1 }
                 case .tool:
@@ -367,6 +397,30 @@ public struct GUIStepRunner: StepExecuting {
         case rejected
         case blocked(String)
         case error
+        /// Not run: the user started using the Mac during a job step. The loop waits for them
+        /// and looks at the screen again.
+        case skipped
+
+        /// Whether it counts as an action taken.
+        var ran: Bool {
+            if case .skipped = self { return false }
+            return true
+        }
+    }
+
+    /// Job steps: while the user is using the Mac, waits in place (holding the screen) until
+    /// they've been idle long enough, and says so in the job's log. The wait doesn't count
+    /// toward the step's time limit.
+    private func waitForUser(_ step: PlanStep, _ r: Run) async throws {
+        guard let watch = r.takeover else { return }
+        let idle = Int(watch.waitSeconds.rounded())
+        let waited = try await watch.waitWhileUserActive(gate: runtime.gate) {
+            r.callbacks.log(ActivityEntry(kind: .info, title: "Paused because you used the mouse",
+                                          detail: "This step continues by itself once you've been idle for \(idle) seconds.", stepID: step.id))
+        }
+        guard let waited else { return }
+        r.session.extendDeadline(by: waited)
+        r.callbacks.log(ActivityEntry(kind: .info, title: "Continuing after you've been idle", stepID: step.id))
     }
 
     /// Safety check → approval → execute → verify → record.
@@ -385,6 +439,8 @@ public struct GUIStepRunner: StepExecuting {
                                       detail: step.instruction, appName: app?.name, risk: verdict.risk, reasons: verdict.reasons)
             switch await r.callbacks.approve(req) {
             case .approve:
+                // Answering moved the mouse; that's consent to this action, not a takeover.
+                r.takeover?.clear()
                 r.callbacks.log(ActivityEntry(kind: .approval, title: "You approved: \(action.humanDescription)\(label)", success: true, stepID: step.id))
                 r.callbacks.phase(.executing, step.title + "…")
             case .reject:
@@ -396,6 +452,12 @@ public struct GUIStepRunner: StepExecuting {
                 if !r.isJob { runtime.gate.stop() }
                 throw AutomationError.stopped
             }
+        }
+        if let watch = r.takeover, watch.userTookOver {
+            // The user came back after the screen was read (often during the model call): don't
+            // act on their screen; the loop waits for them and looks again.
+            history.append("- \(action.humanDescription)\(label) → not done: the user was using the Mac; look at the screen again")
+            return .skipped
         }
         r.callbacks.phase(.executing, action.humanDescription + label)
         try r.session.checkLimits(gate: runtime.gate)
@@ -460,7 +522,9 @@ public struct GUIStepRunner: StepExecuting {
                                           detail: "“\(description)” isn't exposed to accessibility. A redacted capture of this window (password fields blacked out) will be sent to your configured vision provider.",
                                           appName: obs.app.name, risk: .medium, reasons: ["screenshot leaves your Mac"])
                 switch await r.callbacks.approve(req) {
-                case .approve: r.session.screenshotConsentGiven = true
+                case .approve:
+                    r.session.screenshotConsentGiven = true
+                    r.takeover?.clear()
                 case .reject:
                     history.append("- the user declined sending a screenshot; find another way")
                     return .rejected
@@ -495,5 +559,81 @@ public struct GUIStepRunner: StepExecuting {
         }
         return try await perform(action, target: pseudo, obs: obs, modelRisk: decision?.risk ?? step.risk, step: step,
                                  expect: decision?.expect, deterministic: false, history: &history, r)
+    }
+}
+
+// MARK: - The user taking over during a job step
+
+/// The user-input monitor a job's on-screen step runs; a protocol so tests can drive it.
+protocol UserInputMonitoring: AnyObject, Sendable {
+    func start(onUserInput: @escaping @Sendable () -> Void)
+    func stop()
+}
+
+extension UserInterferenceMonitor: UserInputMonitoring {}
+
+/// Pauses a background job's on-screen step while the user is using the Mac
+/// (`SafetySettings.pauseOnUserInput`). A quick task pauses until the user presses Resume; a
+/// job has nobody to press it, so its step waits in place, still holding the screen, until the
+/// user has been idle for the jobs' idle threshold (`JobSettings.idleSeconds`), then looks at
+/// the screen again and carries on. The item isn't failed for it.
+///
+/// Any real mouse input during the step counts (Glide's own events carry its tag and are
+/// ignored), not only input that collides with the agent's as for quick tasks: a job uses the
+/// screen because the user is away, so input means they're back. Each step gets its own
+/// monitor, so it never touches the quick task's (`AutomationRuntime.interference`).
+final class UserTakeoverWatch: @unchecked Sendable {
+    /// Shortest wait, so an idle setting of 0 doesn't resume while the user is mid-gesture.
+    static let minimumIdleSeconds: Double = 3
+
+    private let lock = NSLock()
+    private var tookOver = false
+    private let monitor: any UserInputMonitoring
+    private let idleProbe: ScreenLease.IdleProbe
+    private let pollInterval: Double
+    /// How long the user must leave the Mac alone before the step continues.
+    let waitSeconds: Double
+
+    init(monitor: any UserInputMonitoring = UserInterferenceMonitor(), idleSeconds: Double,
+         idleProbe: @escaping ScreenLease.IdleProbe = ScreenLease.systemIdleSeconds, pollInterval: Double = 0.5) {
+        self.monitor = monitor
+        self.waitSeconds = max(idleSeconds, Self.minimumIdleSeconds)
+        self.idleProbe = idleProbe
+        self.pollInterval = max(0.01, pollInterval)
+    }
+
+    /// The watch for one step, or nil: quick tasks are watched by the orchestrator, and the
+    /// user may have turned the setting off.
+    static func forStep(_ request: StepRequest, settings: AppSettings) -> UserTakeoverWatch? {
+        guard request.jobID != nil, settings.safety.pauseOnUserInput else { return nil }
+        return UserTakeoverWatch(idleSeconds: settings.jobs.idleSeconds)
+    }
+
+    func start() { monitor.start { [weak self] in self?.noteUserInput() } }
+    func stop() { monitor.stop() }
+
+    func noteUserInput() { lock.withLock { tookOver = true } }
+    var userTookOver: Bool { lock.withLock { tookOver } }
+    /// Forgets input so far (answering an approval moves the mouse too).
+    func clear() { lock.withLock { tookOver = false } }
+
+    /// If the user took over since the last wait, calls `onPause`, waits until they've been
+    /// idle for `waitSeconds` and returns how long that took; returns nil at once otherwise.
+    /// Cancellation and a stopped `gate` end the wait with `AutomationError.stopped`.
+    func waitWhileUserActive(gate: ExecutionGate?, onPause: () -> Void) async throws -> TimeInterval? {
+        guard userTookOver else { return nil }
+        onPause()
+        let start = Date()
+        while true {
+            if Task.isCancelled || gate?.isStopped == true { throw AutomationError.stopped }
+            if idleProbe() >= waitSeconds { break }
+            do {
+                try await Task.sleep(for: .seconds(pollInterval))
+            } catch {
+                throw AutomationError.stopped
+            }
+        }
+        clear()
+        return Date().timeIntervalSince(start)
     }
 }

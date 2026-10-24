@@ -33,19 +33,39 @@ public final class TaskController {
     /// handed off (nil = `JobCenter.shared`), so creating a controller doesn't start the job engine.
     private let jobCenterOverride: JobCenter?
     private var jobCenter: JobCenter { jobCenterOverride ?? .shared }
+    private let screenLease: ScreenLease
     private var task: Task<Void, Never>?
     private var runTask: Task<TaskResult, Never>?
     private var orchestrator: ExecutionOrchestrator?
     private var approvalContinuation: CheckedContinuation<ApprovalDecision, Never>?
     private var runID = 0
+    /// True while this run holds the screen lease. Until then the shared input gate belongs to
+    /// whoever does hold it — possibly a background job's on-screen step — so Stop and Pause
+    /// must leave the gate alone and only act on this run.
+    private var holdsLease = false
+    /// Pause pressed before the lease was granted; applied to the gate once this run holds it.
+    private var pendingPause = false
+    /// What the notch showed before a pause pressed while waiting for the lease.
+    private var statusBeforePause = ""
 
-    public init(runtime: AutomationRuntime = .shared, settingsStore: SettingsStore = .shared, jobCenter: JobCenter? = nil) {
+    static let waitingForScreenStatus = "Waiting for a background job to finish its on-screen step…"
+
+    private let credentials: CredentialStore
+
+    public init(runtime: AutomationRuntime = .shared, settingsStore: SettingsStore = .shared, jobCenter: JobCenter? = nil,
+                screenLease: ScreenLease = .shared, credentials: CredentialStore = .shared) {
         self.runtime = runtime
         self.settingsStore = settingsStore
         self.jobCenterOverride = jobCenter
+        self.screenLease = screenLease
+        self.credentials = credentials
     }
 
-    public var isConfigured: Bool { ModelRouter(settings: settingsStore.settings).isConfigured }
+    /// Paused as far as this run is concerned: the gate once this run holds the lease, the
+    /// pending pause before that.
+    private var isPaused: Bool { holdsLease ? runtime.gate.isPaused : pendingPause }
+
+    public var isConfigured: Bool { ModelRouter(settings: settingsStore.settings, credentials: credentials).isConfigured }
 
     /// True while a previous run is still unwinding after Stop.
     public var isWindingDown: Bool { task != nil && !isRunning }
@@ -70,13 +90,16 @@ public final class TaskController {
         phase = .planning
         status = "Understanding your task…"
         let settings = settingsStore.settings
-        guard ModelRouter(settings: settings).isConfigured else {
+        guard ModelRouter(settings: settings, credentials: credentials).isConfigured else {
             phase = .failed
             status = "Add an AI provider key in Settings to get started."
             onAttentionNeeded?()
             return
         }
-        runtime.gate.reset()
+        // The gate is reset once this run holds the screen lease (`takeInputGate`), not here: a
+        // background job's on-screen step may be using it until then.
+        holdsLease = false
+        pendingPause = false
         // Every callback carries the run id; anything from an older run is dropped.
         let callbacks = AgentCallbacks(
             phase: { [weak self] p, s in Task { @MainActor in self?.update(phase: p, status: s, run: id) } },
@@ -97,41 +120,64 @@ public final class TaskController {
             if settings.composio.enabled {
                 composio = try? await ComposioSessionStore.ensureSession()
             }
-            guard let self, !Task.isCancelled, self.runID == id, !self.runtime.gate.isStopped else {
-                self?.task = nil
+            // Before this run holds the lease, Stop cancels this task (the gate isn't its yet).
+            guard let self, !Task.isCancelled, self.runID == id else {
+                await self?.endStopped(run: id)
                 return
             }
             // Quick tasks are interactive: they take the screen ahead of background jobs. A job's
             // on-screen step that is already running finishes first; jobs' other work continues.
             let leaseOwner = "task:\(id)"
-            if await ScreenLease.shared.currentHolder != nil {
-                self.update(phase: .planning, status: "Waiting for a background job to finish its on-screen step…", run: id)
+            let lease = self.screenLease
+            if await lease.currentHolder != nil {
+                self.update(phase: .planning, status: Self.waitingForScreenStatus, run: id)
             }
             do {
-                try await ScreenLease.shared.acquire(owner: leaseOwner, priority: true)
+                try await lease.acquire(owner: leaseOwner, priority: true)
             } catch {
-                self.task = nil
-                self.finish(TaskResult(status: .stopped, summary: "Stopped", error: nil, plan: nil, metrics: await TaskMetrics().snapshot(), durationMs: 0), run: id)
+                await self.endStopped(run: id)
                 return
             }
-            guard !Task.isCancelled, self.runID == id, !self.runtime.gate.isStopped else {
-                await ScreenLease.shared.release(owner: leaseOwner)
-                self.task = nil
+            guard !Task.isCancelled, self.runID == id else {
+                await lease.release(owner: leaseOwner)
+                await self.endStopped(run: id)
                 return
             }
+            self.takeInputGate()
             let orchestrator = ExecutionOrchestrator(instruction: trimmed, settings: SettingsStore.shared.settings, runtime: self.runtime,
-                                                     callbacks: callbacks, composio: composio, jobHandoff: handoff)
+                                                     callbacks: callbacks, credentials: self.credentials, composio: composio, jobHandoff: handoff)
             self.orchestrator = orchestrator
             self.lastTaskID = orchestrator.taskID
             let run = Task.detached(priority: .userInitiated) { await orchestrator.run() }
             self.runTask = run
             let result = await run.value
-            await ScreenLease.shared.release(owner: leaseOwner)
+            // Let go of the gate before the lease: once released, a job's on-screen step may
+            // start, and a Stop pressed after that must not reach it.
+            self.holdsLease = false
             self.runTask = nil
-            self.task = nil
             self.orchestrator = nil
+            await lease.release(owner: leaseOwner)
+            self.task = nil
             self.finish(result, run: id)
         }
+    }
+
+    /// Called once this run holds the screen lease: from here the shared input gate is this
+    /// run's. Clears a Stop or pause an earlier task or job left on it, then applies a pause
+    /// pressed while waiting.
+    func takeInputGate() {
+        holdsLease = true
+        runtime.gate.reset()
+        if pendingPause {
+            pendingPause = false
+            runtime.gate.pause()
+        }
+    }
+
+    /// Ends a run that was stopped before it started working.
+    private func endStopped(run: Int) async {
+        task = nil
+        finish(TaskResult(status: .stopped, summary: "Stopped", error: nil, plan: nil, metrics: await TaskMetrics().snapshot(), durationMs: 0), run: run)
     }
 
     /// Plans the request as a background job. Nil when this run was stopped or replaced while
@@ -151,7 +197,11 @@ public final class TaskController {
     private func update(phase p: AgentPhase, status s: String, run: Int) {
         guard run == runID, isRunning else { return }
         // While paused, progress messages from in-flight work mustn't un-pause the UI.
-        if runtime.gate.isPaused && p != .paused && p != .awaitingApproval { return }
+        if isPaused && p != .paused && p != .awaitingApproval {
+            // Still waiting for the screen: show the latest of these again on resume.
+            if !holdsLease { statusBeforePause = s }
+            return
+        }
         phase = p
         status = s
     }
@@ -193,18 +243,30 @@ public final class TaskController {
         pendingApproval = nil
         approvalContinuation?.resume(returning: decision)
         approvalContinuation = nil
-        if decision == .stop { stop() } else if runtime.gate.isPaused { phase = .paused } else { phase = .executing }
+        if decision == .stop { stop() } else if isPaused { phase = .paused } else { phase = .executing }
     }
 
     public func pause() {
         guard phase == .executing || phase == .planning else { return }
-        runtime.gate.pause()
+        if holdsLease {
+            runtime.gate.pause()
+        } else {
+            // Still waiting for the screen: the gate may be driving a job's on-screen step.
+            pendingPause = true
+            statusBeforePause = status
+        }
         phase = .paused
         status = "Paused"
     }
 
     public func resume() {
         guard phase == .paused else { return }
+        guard holdsLease else {
+            pendingPause = false
+            phase = .planning
+            status = statusBeforePause.isEmpty ? "Understanding your task…" : statusBeforePause
+            return
+        }
         runtime.gate.resume()
         phase = .executing
         status = plan.map { currentStepIndex < $0.steps.count ? $0.steps[currentStepIndex].title + "…" : "Resuming…" } ?? "Resuming…"
@@ -214,10 +276,17 @@ public final class TaskController {
         if phase == .paused { resume() } else { pause() }
     }
 
-    /// Emergency stop: no further input is injected after this returns.
+    /// Stops the quick task; once it holds the screen, no further input is injected after this
+    /// returns. While it's still waiting for the screen, cancelling the wait is all it takes:
+    /// the shared gate then belongs to whoever holds the lease, and stopping it would stop a
+    /// background job's on-screen step instead (the emergency stop halts jobs separately,
+    /// through `JobCenter.haltAll`).
     public func stop() {
-        runtime.gate.stop()
-        orchestrator?.stop()
+        if holdsLease {
+            runtime.gate.stop()
+            orchestrator?.stop()
+        }
+        pendingPause = false
         runTask?.cancel()
         task?.cancel()
         approvalContinuation?.resume(returning: .stop)
