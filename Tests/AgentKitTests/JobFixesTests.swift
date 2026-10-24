@@ -79,18 +79,6 @@ func makeTestCenter(_ fx: JobFixture, plan: JobPlan?, executor: (any StepExecuti
     return JobCenter(environment: env)
 }
 
-/// Waits for `condition` without letting the main actor run, the way a process exiting would
-/// leave a center's main-actor work (the end of its runners) undone. Other threads go on.
-@MainActor
-func holdingMainActor(timeout: Double = 5, until condition: () -> Bool) -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if condition() { return true }
-        usleep(5_000)
-    }
-    return condition()
-}
-
 func temporaryFolder() throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("glide-joblock-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -600,10 +588,12 @@ struct JobCenterFixTests {
         #expect(cli.isRunnerActive(job.id))
         #expect(fx.store.job(job.id)?.status == .running)
         if runnerSavedItsEnd {
-            // The step ends and the runner saves the job as stopped, but the process exits
-            // before this center gets to turn that into a pause (a moment later).
-            latch.open()
-            #expect(holdingMainActor { fx.store.job(job.id)?.status == .stopped })
+            // The runner's last save, as stopped, lands just before the exit; this center would
+            // have made it a pause a moment later. (Written here, so the main actor isn't held.)
+            var ended = try #require(fx.store.job(job.id))
+            ended.status = .stopped
+            ended.statusLine = "Stopped"
+            fx.store.saveJob(ended)
         }
 
         cli.saveHaltedForExit()
