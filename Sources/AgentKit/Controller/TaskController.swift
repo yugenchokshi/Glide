@@ -179,8 +179,11 @@ public final class TaskController {
 
     /// Ends a run that was stopped before it started working.
     private func endStopped(run: Int) async {
+        // Snapshot first: clearing `task` and recording the result must happen without a
+        // suspension in between, or the run briefly looks finished with no result.
+        let metrics = await TaskMetrics().snapshot()
         task = nil
-        finish(TaskResult(status: .stopped, summary: "Stopped", error: nil, plan: nil, metrics: await TaskMetrics().snapshot(), durationMs: 0), run: run)
+        finish(TaskResult(status: .stopped, summary: "Stopped", error: nil, plan: nil, metrics: metrics, durationMs: 0), run: run)
     }
 
     /// Plans the request as a background job. Nil when this run was stopped or replaced while
