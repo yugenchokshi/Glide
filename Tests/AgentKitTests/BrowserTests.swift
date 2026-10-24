@@ -778,6 +778,21 @@ struct BrowserDriverChromeTests {
             let password = try #require(snap.elements.first { $0.secure }).ref
             await #expect(throws: BrowserActionError.self) { _ = try await driver.type(tabID: tab, ref: password, text: "secret") }
 
+            // Keys go to whatever has focus, so press checks the focused field itself: no typing
+            // or pasting into a password or card field, but Enter and Tab still work there.
+            _ = try await driver.evaluate(tabID: tab, "document.querySelector('input[type=password]').focus(); true")
+            for keys in ["s e c r e t", "Shift+A", "Space", "Meta+V"] {
+                await #expect(throws: BrowserActionError.self, "\(keys)") { _ = try await driver.press(tabID: tab, keys: keys) }
+            }
+            #expect(try await driver.evaluate(tabID: tab, "document.querySelector('input[type=password]').value") == "hunter2")
+            _ = try await driver.press(tabID: tab, keys: "Tab")
+            _ = try await driver.evaluate(tabID: tab, """
+                const i = document.createElement('input'); i.setAttribute('autocomplete', 'section-pay billing cc-number');
+                document.body.appendChild(i); i.focus(); true
+                """)
+            await #expect(throws: BrowserActionError.self) { _ = try await driver.press(tabID: tab, keys: "4 2 4 2") }
+            _ = try await driver.evaluate(tabID: tab, "document.activeElement.blur(); true")
+
             _ = try await driver.type(tabID: tab, ref: query, text: "glide rocks", submit: true)
             let result = try await driver.snapshot(tabID: tab)
             #expect(result.title == "Results")

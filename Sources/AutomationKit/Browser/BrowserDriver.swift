@@ -561,6 +561,16 @@ public final class BrowserDriver: Sendable {
     /// several separated by spaces ("Tab Tab Enter").
     public func press(tabID: String, keys: String) async throws -> BrowserActionOutcome {
         let strokes = try BrowserKeys.parse(keys)
+        // The risk check judged the last snapshot, which can be stale (focus moves). Right before
+        // keys that put text in, look at the field that actually has focus.
+        if BrowserKeys.insertsText(strokes) {
+            let field = try await evaluate(tabID: tabID, Self.call(Self.focusedFieldFunction, .null))
+            switch field["kind"]?.stringValue {
+            case "password": throw BrowserActionError("The focused field is a password field. Glide never types passwords; please enter it yourself.")
+            case "card": throw BrowserActionError("The focused field is a payment card field. Glide never enters card details; please enter them yourself.")
+            default: break
+            }
+        }
         _ = try? await evaluate(tabID: tabID, Self.armNavigationScript)
         try await pressStrokes(tabID: tabID, strokes)
         let settled = try await waitForSettle(tabID: tabID)
@@ -1030,6 +1040,16 @@ enum BrowserKeys {
     static let macCommands: [String: String] = [
         "a": "selectAll", "c": "copy", "x": "cut", "v": "paste", "z": "undo",
     ]
+
+    /// Whether the strokes put text into the focused element: a printable character, or paste.
+    /// Enter, Tab and plain navigation keys don't, so a login form can still be submitted.
+    static func insertsText(_ strokes: [Stroke]) -> Bool {
+        strokes.contains { s in
+            if s.commands.contains("paste") { return true }
+            guard let text = s.text else { return false }
+            return text.unicodeScalars.contains { !CharacterSet.controlCharacters.contains($0) }
+        }
+    }
 
     static func parse(_ description: String) throws -> [Stroke] {
         let combos = description.split(whereSeparator: \.isWhitespace).map(String.init)
@@ -1583,6 +1603,19 @@ extension BrowserDriver {
       el.dispatchEvent(new w.Event('input', { bubbles: true }));
       el.dispatchEvent(new w.Event('change', { bubbles: true }));
       return { selected: label(opt), value: opt.value };
+    }
+    """#
+
+    /// What kind of field has focus (walking open shadow roots and same-origin frames):
+    /// "password", "card" (autocomplete cc-number, cc-csc or cc-exp*), "other" or "none".
+    static let focusedFieldFunction = #"""
+    function () {
+      const el = G.deepActive();
+      if (!el || el === el.ownerDocument.body) return { kind: 'none' };
+      if (el.tagName === 'INPUT' && String(el.type).toLowerCase() === 'password') return { kind: 'password' };
+      const ac = String((el.getAttribute && el.getAttribute('autocomplete')) || '').toLowerCase();
+      if (/(^|\s)cc-(number|csc|exp|exp-month|exp-year)(\s|$)/.test(ac)) return { kind: 'card' };
+      return { kind: 'other' };
     }
     """#
 
