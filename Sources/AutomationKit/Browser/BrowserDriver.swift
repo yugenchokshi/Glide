@@ -561,18 +561,8 @@ public final class BrowserDriver: Sendable {
     /// several separated by spaces ("Tab Tab Enter").
     public func press(tabID: String, keys: String) async throws -> BrowserActionOutcome {
         let strokes = try BrowserKeys.parse(keys)
-        // The risk check judged the last snapshot, which can be stale (focus moves). Right before
-        // keys that put text in, look at the field that actually has focus.
-        if BrowserKeys.insertsText(strokes) {
-            let field = try await evaluate(tabID: tabID, Self.call(Self.focusedFieldFunction, .null))
-            switch field["kind"]?.stringValue {
-            case "password": throw BrowserActionError("The focused field is a password field. Glide never types passwords; please enter it yourself.")
-            case "card": throw BrowserActionError("The focused field is a payment card field. Glide never enters card details; please enter them yourself.")
-            default: break
-            }
-        }
         _ = try? await evaluate(tabID: tabID, Self.armNavigationScript)
-        try await pressStrokes(tabID: tabID, strokes)
+        try await pressStrokes(tabID: tabID, strokes, guardFields: true)
         let settled = try await waitForSettle(tabID: tabID)
         let notes = await dialogNotes(tabID: tabID)
         return BrowserActionOutcome(settled: settled, notes: notes)
@@ -799,8 +789,19 @@ public final class BrowserDriver: Sendable {
         _ = try await send(tabID: tabID, "Input.dispatchMouseEvent", event("mouseReleased", ["button": "left", "buttons": 0, "clickCount": 1]), timeout: 10)
     }
 
-    private func pressStrokes(tabID: String, _ strokes: [BrowserKeys.Stroke]) async throws {
+    /// With `guardFields`, every key that puts text in is preceded by a look at the field that
+    /// has focus right then. The risk check judged the last snapshot, and focus moves: an earlier
+    /// Tab in the same call, or the page itself (code fields that jump to the next box).
+    private func pressStrokes(tabID: String, _ strokes: [BrowserKeys.Stroke], guardFields: Bool = false) async throws {
         for stroke in strokes {
+            if guardFields, BrowserKeys.insertsText([stroke]) {
+                let field = try await evaluate(tabID: tabID, Self.call(Self.focusedFieldFunction, .null))
+                switch field["kind"]?.stringValue {
+                case "password": throw BrowserActionError("The focused field is a password field. Glide never types passwords; please enter it yourself.")
+                case "card": throw BrowserActionError("The focused field is a payment card field. Glide never enters card details; please enter them yourself.")
+                default: break
+                }
+            }
             for event in stroke.events() {
                 _ = try await send(tabID: tabID, "Input.dispatchKeyEvent", event, timeout: 10)
             }

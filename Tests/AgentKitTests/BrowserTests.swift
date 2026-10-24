@@ -791,6 +791,14 @@ struct BrowserDriverChromeTests {
                 document.body.appendChild(i); i.focus(); true
                 """)
             await #expect(throws: BrowserActionError.self) { _ = try await driver.press(tabID: tab, keys: "4 2 4 2") }
+            // Focus that moves during one call is caught too: here Tab in the query box jumps to
+            // the password field before the letters are typed.
+            _ = try await driver.evaluate(tabID: tab, """
+                const q = document.querySelector('input[name=q]'); const p = document.querySelector('input[type=password]');
+                q.addEventListener('keydown', e => { if (e.key === 'Tab') { e.preventDefault(); p.focus(); } }); q.focus(); true
+                """)
+            await #expect(throws: BrowserActionError.self) { _ = try await driver.press(tabID: tab, keys: "Tab x y z") }
+            #expect(try await driver.evaluate(tabID: tab, "document.querySelector('input[type=password]').value") == "hunter2")
             _ = try await driver.evaluate(tabID: tab, "document.activeElement.blur(); true")
 
             _ = try await driver.type(tabID: tab, ref: query, text: "glide rocks", submit: true)
