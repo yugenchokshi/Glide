@@ -892,6 +892,7 @@ extension ExtensionBridge {
         case "tab_not_found": return .tabNotFound(text(error["tabId"]) ?? "")
         case "canceled_by_user", "not_authenticated", "not_paired": return .notConnected(message)
         case "timeout": return .timeout(message)
+        case "dialog_open": return .dialogOpen(message)
         default: return .cdp(message)
         }
     }

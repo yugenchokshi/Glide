@@ -418,7 +418,7 @@ public actor GlideChromeBackend: BrowserBackend, BrowserPageObserving, BrowserSt
         // The page is frozen until the user answers its dialog: say so now instead of at the
         // command's deadline. Answering it is the one thing that still goes through.
         if let waiting = waitingDialogs[tabID], method != "Page.handleJavaScriptDialog" {
-            throw BrowserError.cdp(BrowserDialogPolicy.waitingMessage(waiting))
+            throw BrowserError.dialogOpen(BrowserDialogPolicy.waitingMessage(waiting))
         }
         let action = BrowserDialogPolicy.isAction(method: method, params: params)
         activity[tabID, default: TabActivity()].inflight += 1

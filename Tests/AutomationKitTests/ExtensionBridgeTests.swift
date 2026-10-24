@@ -564,6 +564,11 @@ struct ExtensionBridgeHandshakeTests {
         #expect(ExtensionBridge.mapExtensionError(["code": "tab_not_found", "message": "m", "tabId": "7"], method: "cdp.send") == .tabNotFound("7"))
         #expect(ExtensionBridge.mapExtensionError(["code": "canceled_by_user", "message": "Stopped"], method: "cdp.send") == .notConnected("Stopped"))
         #expect(ExtensionBridge.mapExtensionError(["code": "cdp", "message": "Boom"], method: "cdp.send") == .cdp("Boom"))
+        // A dialog left for the user ends any wait at once, with the extension's own words.
+        let waiting = ExtensionBridge.mapExtensionError(["code": "dialog_open", "message": "This tab is showing an alert. Answer it in Chrome, then try again."], method: "cdp.send")
+        #expect(waiting == .dialogOpen("This tab is showing an alert. Answer it in Chrome, then try again."))
+        #expect(waiting.errorDescription == "This tab is showing an alert. Answer it in Chrome, then try again.")
+        #expect(BrowserDriver.isFatal(waiting))
         #expect(ExtensionBridge.mapExtensionError(["message": ""], method: "tabs.list") == .cdp("Chrome couldn't run “tabs.list”."))
         #expect(ExtensionBridge.mapExtensionError("plain", method: "x") == .cdp("plain"))
     }
@@ -1312,11 +1317,14 @@ enum NodeTool {
 ///                           Chrome, the new tab comes to the front and its openerTabId is the
 ///                           tab that was in front; only webNavigation names the real source
 ///   open <url>              another app opens a link in Chrome (no opener at all)
-///   dirty <tabId>           the page has unsaved input: closing it asks "Leave site?"
+///   dirty <tabId>           the page has unsaved input: closing it or loading another address
+///                           there asks "Leave site?"
 /// A command whose params include `testDialog: "<type>"` opens that dialog while it's still
 /// running (a click whose handler calls confirm(), the user closing the tab during a read); the
 /// CDP method `Test.openDialog` does the same with `type`. `idleDetachMs` shortens the
-/// extension's idle detach delay.
+/// extension's idle detach delay. `storageDelayMs` makes chrome.storage answer that much later,
+/// as it can over Chrome's IPC, so overlapping reads and writes interleave (each still applied in
+/// the order it was made). Every write of the list of Glide's tabs prints GLIDE_TABS [ids].
 final class NodeHarness {
     let process = Process()
     private let input = Pipe()
@@ -1324,7 +1332,7 @@ final class NodeHarness {
     private let outputURL: URL
     private let errorURL: URL
 
-    init(port: Int, token: String?, origin: String = ExtensionBridge.extensionOrigin, idleDetachMs: Int? = nil) throws {
+    init(port: Int, token: String?, origin: String = ExtensionBridge.extensionOrigin, idleDetachMs: Int? = nil, storageDelayMs: Int? = nil) throws {
         // Writing to a pipe whose reader has exited must not kill the test runner.
         signal(SIGPIPE, SIG_IGN)
         let fm = FileManager.default
@@ -1338,7 +1346,8 @@ final class NodeHarness {
         fm.createFile(atPath: errorURL.path, contents: nil)
         guard let node = NodeTool.path else { throw TestTimeout(what: "node (not installed)") }
         process.executableURL = URL(fileURLWithPath: node)
-        process.arguments = [script.path, ExtensionFixtures.folder.path, String(port), token ?? "-", origin, idleDetachMs.map(String.init) ?? "-"]
+        process.arguments = [script.path, ExtensionFixtures.folder.path, String(port), token ?? "-", origin, idleDetachMs.map(String.init) ?? "-",
+                             storageDelayMs.map(String.init) ?? "-"]
         process.standardOutput = try FileHandle(forWritingTo: outputURL)
         process.standardError = try FileHandle(forWritingTo: errorURL)
         process.standardInput = input
@@ -1368,7 +1377,11 @@ final class NodeHarness {
         if process.isRunning {
             try? input.fileHandleForWriting.close()
             process.terminate()
-            process.waitUntilExit()
+            // Not waitUntilExit(): on another thread than the one that started node (a test can
+            // resume on any thread) it once missed the exit and hung the whole test run.
+            let deadline = Date().addingTimeInterval(5)
+            while process.isRunning, Date() < deadline { usleep(10_000) }
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
         }
         try? FileManager.default.removeItem(at: directory)
     }
@@ -1382,7 +1395,7 @@ final class NodeHarness {
     const vm = require("vm");
     const readline = require("readline");
 
-    const [extDir, port, token, origin, idleDetachMs] = process.argv.slice(2);
+    const [extDir, port, token, origin, idleDetachMs, storageDelayMs] = process.argv.slice(2);
     const out = (line) => process.stdout.write(line + "\n");
 
     // The extension waits IDLE_DETACH_MS (45 s) before letting go of the user's tabs; tests
@@ -1391,6 +1404,9 @@ final class NodeHarness {
     if (idleDetachMs !== "-") {
       globalThis.setTimeout = (fn, ms, ...rest) => realSetTimeout(fn, ms === 45000 ? Number(idleDetachMs) : ms, ...rest);
     }
+    // Storage calls all take the same time, so they're still applied in the order they were made.
+    const storageDelay = storageDelayMs && storageDelayMs !== "-" ? Number(storageDelayMs) : 0;
+    const storageAnswers = () => (storageDelay ? new Promise((resolve) => realSetTimeout(resolve, storageDelay)) : Promise.resolve());
 
     function makeEvent() {
       const listeners = [];
@@ -1406,13 +1422,19 @@ final class NodeHarness {
       const data = {};
       const keysOf = (keys) => keys == null ? Object.keys(data) : Array.isArray(keys) ? keys : typeof keys === "string" ? [keys] : Object.keys(keys);
       return {
-        async get(keys) { const r = {}; for (const k of keysOf(keys)) if (k in data) r[k] = structuredClone(data[k]); return r; },
+        async get(keys) {
+          await storageAnswers();
+          const r = {}; for (const k of keysOf(keys)) if (k in data) r[k] = structuredClone(data[k]); return r;
+        },
         async set(items) {
+          items = structuredClone(items);
+          await storageAnswers();
           const changes = {};
           for (const [k, v] of Object.entries(items)) {
             changes[k] = { oldValue: data[k], newValue: v };
             data[k] = structuredClone(v);
             if (name === "session" && k === "glideStatus") out("STATUS " + v.state);
+            if (name === "session" && k === "glideTabs") out("GLIDE_TABS " + JSON.stringify(v));
           }
           storageChanged.emit(changes, name);
         },
@@ -1502,7 +1524,16 @@ final class NodeHarness {
           const { url, active, ...rest } = props;
           Object.assign(tab, rest);
           if (active === true) activate(tab);
-          if (url !== undefined) startNavigation(tab, url);
+          if (url !== undefined) {
+            // A page with unsaved input asks "Leave site?" first: through the debugger when it's
+            // attached (the extension answers), otherwise with Chrome's own prompt to the user.
+            if (!dirtyTabs.has(id)) startNavigation(tab, url);
+            else if (!attachedTabs.has(id)) out(`LEAVE_PROMPT ${id}`);
+            else {
+              leavePrompts.set(id, () => { dirtyTabs.delete(id); startNavigation(tab, url); });
+              onEvent.emit({ tabId: id }, "Page.javascriptDialogOpening", { type: "beforeunload", message: "" });
+            }
+          }
           out(`UPDATE ${id} ${JSON.stringify(props)}`);
           return { ...tab };
         },
@@ -1977,5 +2008,98 @@ struct ExtensionBridgeEndToEndTests {
         #expect(pending?.isTimeout == true, "\(String(describing: pending))")
         #expect(await harness.waitFor("LEAVE_PROMPT 1"), "\(harness.log)")
         #expect(harness.count("DIALOG_ANSWERED 1 true") == 0, "\(harness.log)")
+    }
+
+    /// The extension's list of Glide's tabs decides whose a tab's dialogs and "Leave site?"
+    /// prompts are, so tabs opened (or closed) at the same moment must all be accounted for.
+    @Test(.enabled(if: NodeTool.supportsHarness, "Node 22+ isn't installed"))
+    func tabsOpenedAtTheSameMomentAreAllGlides() async throws {
+        let (bridge, port, token, _) = try await startTestBridge()
+        defer { bridge.stop() }
+        let harness = try NodeHarness(port: port, token: token, storageDelayMs: 30)
+        defer { harness.stop() }
+        #expect(await bridge.waitForConnection(timeout: 15), "\(harness.log)")
+        // Straight from the extension: ExtensionBackend would add the tabs it opened itself.
+        func glideTabs() async throws -> Set<Int> {
+            let list = try await bridge.call("tabs.list")
+            return Set((list.arrayValue ?? []).filter { $0["glide"]?.boolValue == true }.compactMap { $0["id"]?.intValue })
+        }
+        func saved() -> Set<Int>? {
+            guard let last = harness.values(of: "GLIDE_TABS").last, let ids = try? JSONValue.parse(last).arrayValue else { return nil }
+            return Set(ids.compactMap(\.intValue))
+        }
+
+        // Two parallel job items open their tabs at once.
+        async let a = bridge.call("tabs.create", params: ["url": "https://example.org/a", "active": false])
+        async let b = bridge.call("tabs.create", params: ["url": "https://example.org/b", "active": false])
+        let (createdA, createdB) = try await (a, b)
+        let first = try #require(createdA["id"]?.intValue), second = try #require(createdB["id"]?.intValue)
+        #expect(try await glideTabs() == [first, second], "\(harness.log)")
+
+        // One item's tab closes while another item opens one.
+        async let closing = bridge.call("tabs.remove", params: ["tabId": .number(Double(first))])
+        async let opening = bridge.call("tabs.create", params: ["url": "https://example.org/c", "active": false])
+        let (_, opened) = try await (closing, opening)
+        let third = try #require(opened["id"]?.intValue)
+        #expect(try await glideTabs() == [second, third], "\(harness.log)")
+        // Storage ends up with the same list, for when the service worker restarts.
+        #expect(await eventually(3) { saved() == [second, third] }, "\(harness.log)")
+    }
+
+    /// Chrome doesn't tell a new debugger session about a dialog that's already open, and the
+    /// page answers nothing until it's closed: so a tab whose dialog is left for the user stays
+    /// attached, and Glide's commands there keep failing at once with what's wrong.
+    @Test(.enabled(if: NodeTool.supportsHarness, "Node 22+ isn't installed"))
+    func aDialogLeftForTheUserKeepsItsTabAttachedUntilAnswered() async throws {
+        let (bridge, port, token, _) = try await startTestBridge()
+        defer { bridge.stop() }
+        let harness = try NodeHarness(port: port, token: token, idleDetachMs: 1500)
+        defer { harness.stop() }
+        #expect(await bridge.waitForConnection(timeout: 15), "\(harness.log)")
+        let backend = ExtensionBackend(bridge: bridge, connectTimeout: 3)
+
+        // Glide reads the user's tab and moves on; then the page opens confirm() by itself.
+        _ = try await backend.cdp(tabID: "1", method: "Runtime.evaluate", params: ["expression": "1+1"])
+        try await Task.sleep(for: .milliseconds(2300))
+        harness.send("dialog 1 confirm")
+        // (Any command sent before the page's dialog arrives would make it Glide's to answer.)
+        try await Task.sleep(for: .milliseconds(300))
+        let expected = BrowserError.dialogOpen("This tab is showing a confirmation dialog (“Sure (confirm)?”). Answer it in Chrome, then try again.")
+        let blocked = await browserError { _ = try await backend.cdp(tabID: "1", method: "Runtime.evaluate", params: ["expression": "1+1"]) }
+        #expect(blocked == expected, "\(String(describing: blocked))")
+
+        // The idle detach delay (1.5 s here) passes twice while the dialog is open.
+        try await Task.sleep(for: .milliseconds(3500))
+        #expect(harness.count("DETACH 1") == 0, "\(harness.log)")
+        let stillBlocked = await browserError { _ = try await backend.cdp(tabID: "1", method: "Runtime.evaluate", params: ["expression": "1+1"]) }
+        #expect(stillBlocked == expected, "\(String(describing: stillBlocked))")
+        #expect(harness.count("DIALOG_ANSWERED 1 false") == 0, "it's still the user's to answer: \(harness.log)")
+        #expect(harness.count("ATTACH 1 1.3") == 1, "\(harness.log)")
+
+        // Once the user has answered, the debugger lets go as usual.
+        harness.send("close_dialog 1")
+        #expect(await harness.waitFor("DETACH 1", timeout: 6), "\(harness.log)")
+    }
+
+    /// Loading an address is one of Glide's actions, as Page.navigate is in Glide's own Chrome:
+    /// the "Leave site?" it brings up is answered, not left for the user with the load stuck.
+    @Test(.enabled(if: NodeTool.supportsHarness, "Node 22+ isn't installed"))
+    func aLeavePromptFromGlidesOwnNavigationIsAnswered() async throws {
+        let (bridge, port, token, _) = try await startTestBridge()
+        defer { bridge.stop() }
+        let harness = try NodeHarness(port: port, token: token)
+        defer { harness.stop() }
+        #expect(await bridge.waitForConnection(timeout: 15), "\(harness.log)")
+        let backend = ExtensionBackend(bridge: bridge, connectTimeout: 3)
+
+        // A tab the extension doesn't count as Glide's, with a form that has unsaved input. Glide
+        // has only read it, so the navigation is the one action that can have caused the prompt.
+        _ = try await backend.cdp(tabID: "1", method: "Runtime.evaluate", params: ["expression": "1+1"])
+        harness.send("dirty 1")
+        try await Task.sleep(for: .milliseconds(100))
+        _ = try await bridge.call("tabs.update", params: ["tabId": 1, "url": "https://example.org/next"], timeout: 5)
+        #expect(harness.count("DIALOG_ANSWERED 1 true") == 1, "\(harness.log)")
+        #expect(harness.count("COMMITTED 1 https://example.org/next") == 1, "\(harness.log)")
+        #expect(harness.count("LEAVE_PROMPT 1") == 0, "\(harness.log)")
     }
 }

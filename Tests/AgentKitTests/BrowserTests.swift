@@ -382,6 +382,17 @@ struct BrowserLogicTests {
         #expect(enter[0].events().map { $0["type"]?.stringValue ?? "" } == ["rawKeyDown", "char", "keyUp"])
     }
 
+    /// browser.press looks at the focused field right before every stroke that puts text in.
+    @Test func knowsWhichKeysPutTextIn() throws {
+        // Shift+Insert is Chrome's own paste key on macOS too (it pastes without a command).
+        for keys in ["a", "Shift+A", "Space", "plus", "Meta+V", "Meta+Shift+V", "Shift+Insert", "Control+Shift+Insert", "Tab Shift+Insert"] {
+            #expect(BrowserKeys.insertsText(try BrowserKeys.parse(keys)), "\(keys)")
+        }
+        for keys in ["Insert", "Control+Insert", "Tab", "Enter", "Escape", "Backspace", "ArrowDown", "Meta+A", "Meta+C", "Control+V", "Control+Y", "F5"] {
+            #expect(!BrowserKeys.insertsText(try BrowserKeys.parse(keys)), "\(keys)")
+        }
+    }
+
     @Test func normalizesAndRestrictsURLs() throws {
         #expect(BrowserDriver.normalizeURL("example.com/a") == "https://example.com/a")
         #expect(BrowserDriver.normalizeURL("localhost:3000") == "http://localhost:3000")
@@ -781,7 +792,7 @@ struct BrowserDriverChromeTests {
             // Keys go to whatever has focus, so press checks the focused field itself: no typing
             // or pasting into a password or card field, but Enter and Tab still work there.
             _ = try await driver.evaluate(tabID: tab, "document.querySelector('input[type=password]').focus(); true")
-            for keys in ["s e c r e t", "Shift+A", "Space", "Meta+V"] {
+            for keys in ["s e c r e t", "Shift+A", "Space", "Meta+V", "Shift+Insert"] {
                 await #expect(throws: BrowserActionError.self, "\(keys)") { _ = try await driver.press(tabID: tab, keys: keys) }
             }
             #expect(try await driver.evaluate(tabID: tab, "document.querySelector('input[type=password]').value") == "hunter2")
@@ -798,6 +809,9 @@ struct BrowserDriverChromeTests {
                 q.addEventListener('keydown', e => { if (e.key === 'Tab') { e.preventDefault(); p.focus(); } }); q.focus(); true
                 """)
             await #expect(throws: BrowserActionError.self) { _ = try await driver.press(tabID: tab, keys: "Tab x y z") }
+            // Shift+Insert pastes in Chrome on macOS, so it's checked the same way.
+            _ = try await driver.evaluate(tabID: tab, "document.querySelector('input[name=q]').focus(); true")
+            await #expect(throws: BrowserActionError.self) { _ = try await driver.press(tabID: tab, keys: "Tab Shift+Insert") }
             #expect(try await driver.evaluate(tabID: tab, "document.querySelector('input[type=password]').value") == "hunter2")
             _ = try await driver.evaluate(tabID: tab, "document.activeElement.blur(); true")
 
@@ -892,6 +906,11 @@ struct BrowserDriverChromeTests {
             let blocked = await errorText { _ = try await driver.evaluate(tabID: start.id, "document.title", timeout: 10) }
             #expect(blocked?.contains("confirmation dialog (“Leave this alone?”). Answer it in Chrome") == true, "\(blocked ?? "no error")")
             #expect(ContinuousClock.now - started < .seconds(2))
+            // Waiting for the page stops at once as well: polling a frozen page can't help.
+            let waiting = BrowserError.dialogOpen("This tab is showing a confirmation dialog (“Leave this alone?”). Answer it in Chrome, then try again.")
+            await #expect(throws: waiting) { _ = try await driver.wait(tabID: start.id, for: .text("never there"), timeout: 10) }
+            await #expect(throws: waiting) { _ = try await driver.waitForSettle(tabID: start.id, timeout: 10) }
+            #expect(ContinuousClock.now - started < .seconds(4))
             _ = try await backend.cdp(tabID: start.id, method: "Page.handleJavaScriptDialog", params: ["accept": true])
             #expect(try await driver.evaluate(tabID: start.id, "document.title") == "yes", "the person's answer counts")
         }
@@ -1153,6 +1172,40 @@ struct BrowserToolChromeTests {
         }
     }
 
+    @Test func aPopupFromThePersonsOwnTabStaysTheirs() async throws {
+        try await ChromeHarness.run { backend, driver, server in
+            let (tools, base, sessions) = setUp(backend)
+            var ctx = base
+            ctx.jobID = "job1"
+            ctx.itemID = "1"
+            // Chrome's start tab is the person's. It shows the fixture site, and Glide is asked to
+            // work there.
+            let person = try #require(try await backend.tabs().first { !$0.ownedByGlide })
+            _ = try await driver.navigate(tabID: person.id, url: server.url("/"))
+            let switched = try await tools.tool(named: "browser.switch_tab")!.run(["tab_id": .string(person.id)], context: ctx)
+            #expect(switched.ok, "\(switched.text)")
+            let link = try #require(ref(switched, named: "Open popup"))
+            let clicked = try await tools.tool(named: "browser.click")!.run(["ref": .string(link)], context: ctx)
+            #expect(clicked.ok && clicked.text.contains("opened a new tab"), "\(clicked.text)")
+
+            // Glide follows the popup, but it's the person's, like the tab it came from: Chrome and
+            // Glide agree on that.
+            let popup = try #require(sessions.session("job:job1/item:1")?.tabID)
+            let info = try #require(try await backend.tabs().first { $0.id == popup })
+            #expect(popup != person.id && info.openerID == person.id && !info.ownedByGlide, "\(info)")
+            #expect(!sessions.isGlideTab(backend: .glideChrome, tabID: popup))
+            #expect(tools.tool(named: "browser.close_tab")!.assess([:], context: ctx).risk == .high, "closing it needs the person's approval")
+            let opened = try await tools.tool(named: "browser.open")!.run(["url": .string(server.url("/second"))], context: ctx)
+            #expect(opened.ok && opened.text.contains("new tab so the tab you were on stays"), "\(opened.text)")
+            let glides = try #require(sessions.session("job:job1/item:1")?.tabID)
+
+            // When the job is done Glide closes only the tab it opened.
+            await sessions.releaseJob("job1", hub: { let h = BrowserHub(); h.register(backend); return h }())
+            let remaining = try await backend.tabs().map(\.id)
+            #expect(remaining.contains(popup) && remaining.contains(person.id) && !remaining.contains(glides), "\(remaining)")
+        }
+    }
+
     @Test func separateItemsGetSeparateTabsAndStopIsImmediate() async throws {
         try await ChromeHarness.run { backend, _, server in
             let (tools, ctx, sessions) = setUp(backend)
@@ -1250,6 +1303,7 @@ enum ChromeForTesting {
             // The page Settings › Browser › Pair opens. It may take a moment for Chrome to load
             // the extension, so it's opened again until it asks for confirmation.
             var paired = false
+            var pairingPage: String?
             for _ in 0..<20 where !paired {
                 let page = try await chrome.openTab(url: pairing.absoluteString, background: false)
                 let click = "(() => { const c = document.getElementById('confirm'); if (!c || c.hidden) return false; document.getElementById('pair').click(); return true; })()"
@@ -1258,10 +1312,13 @@ enum ChromeForTesting {
                     paired = r?["result"]?["value"]?.boolValue == true
                     if !paired { try await Task.sleep(for: .milliseconds(100)) }
                 }
-                try? await chrome.closeTab(page.id)
+                // The page that was clicked stays open until the extension has connected: closed
+                // at once, its message to the service worker can be lost (on a busy Mac it was).
+                if paired { pairingPage = page.id } else { try? await chrome.closeTab(page.id) }
             }
             try #require(paired, "the pairing page asked to pair")
-            try #require(await bridge.waitForConnection(timeout: 20), "the extension connected after Pair was clicked")
+            try #require(await bridge.waitForConnection(timeout: 20), "the extension connected after Pair was clicked: \(bridge.status())")
+            if let pairingPage { try? await chrome.closeTab(pairingPage) }
             try await body(ExtensionBackend(bridge: bridge, connectTimeout: 5), chrome, server)
         } catch {
             await cleanUp()
@@ -1316,6 +1373,47 @@ struct BrowserExtensionChromeTests {
             await sessions.releaseJob("job1", hub: hub)
             let remaining = try await backend.tabs().map(\.id)
             #expect(!remaining.contains(popup) && !remaining.contains(home) && remaining.contains(person.id), "\(remaining)")
+        }
+    }
+
+    @Test func aPopupFromThePersonsOwnTabStaysTheirs() async throws {
+        try await ChromeForTesting.run { backend, chrome, server in
+            // The person's own tab, in front, on the fixture site. Glide is asked to work there.
+            _ = try await chrome.openTab(url: server.url("/"), background: false)
+            let hub = BrowserHub()
+            hub.register(backend)
+            var settings = AppSettings()
+            settings.browser.backend = .extensionBridge
+            let sessions = BrowserSessions()
+            let tools = ToolRegistry(BrowserTools.make(hub: hub, sessions: sessions))
+            var ctx = ToolContext(settings: settings, gate: ExecutionGate())
+            ctx.jobID = "job1"
+            ctx.itemID = "1"
+            var found: BrowserTab?
+            for _ in 0..<50 where found == nil {
+                found = try await backend.tabs().first { $0.url == server.url("/") }
+                if found == nil { try await Task.sleep(for: .milliseconds(100)) }
+            }
+            let person = try #require(found)
+            #expect(!person.ownedByGlide)
+            let switched = try await tools.tool(named: "browser.switch_tab")!.run(["tab_id": .string(person.id)], context: ctx)
+            #expect(switched.ok, "\(switched.text)")
+            let link = try #require(ref(switched, named: "Open popup"))
+            let clicked = try await tools.tool(named: "browser.click")!.run(["ref": .string(link)], context: ctx)
+            #expect(clicked.ok && clicked.text.contains("opened a new tab") && clicked.text.contains("Popup page"), "\(clicked.text)")
+
+            // Glide follows the popup, but it's the person's, like the tab it came from: the
+            // extension and Glide agree on that.
+            let popup = try #require(sessions.session("job:job1/item:1")?.tabID)
+            let info = try #require(try await backend.tabs().first { $0.id == popup })
+            #expect(popup != person.id && info.openerID == person.id && !info.ownedByGlide, "\(info)")
+            #expect(!sessions.isGlideTab(backend: .extensionBridge, tabID: popup))
+            #expect(tools.tool(named: "browser.close_tab")!.assess([:], context: ctx).risk == .high, "closing it needs the person's approval")
+
+            // Releasing the item never closes the person's tabs.
+            await sessions.release(jobID: "job1", itemID: "1", hub: hub)
+            let remaining = try await backend.tabs().map(\.id)
+            #expect(remaining.contains(popup) && remaining.contains(person.id), "\(remaining)")
         }
     }
 }
