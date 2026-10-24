@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Glide",
+  "short_name": "Glide",
+  "version": "1.0.0",
+  "description": "Lets the Glide Mac app work in your Chrome tabs, with your logins, in the background.",
+  "minimum_chrome_version": "118",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsimkJr7PZKoQfpa+rKjvX+rwfhd8y1HjRRAvnKT29onQH7ASeYqCrvGNshAOYJzIUQVHkxkLLUrEHo7Qn2532CXEFBZ/h0GudvKIDJGyX4hMObfbUbJgjRkiUfPr59ITSqHoeIOJtyhLi7b+TfBgdAb0lDpsJXe2vaorukW4AY9wM7jf9vp3o+saMH2LaQRsS9MWApf19KFkh4NnjK/9a7cuqxyp+Y52xO3aXTSZX2cR0dTsPHPt4mg+kcG3ood+dW2ViWzjlkZkFnTqQ2g7ix0GWNc+0Zi4ta8BayHXqhjMONrz3299ZReTaxzyj7gXZEo82zWsgJ/6c1Lr+CuozQIDAQAB",
+  "permissions": ["debugger", "tabs", "storage", "alarms", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_title": "Glide",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
