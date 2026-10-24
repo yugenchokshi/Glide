@@ -152,17 +152,61 @@ enum BrowserRisk {
         return ToolVerdict(risk: element == nil && (label ?? "").isEmpty ? .medium : .low, summary: summary)
     }
 
+    /// One `browser.press` combo, split the way `BrowserKeys.parseCombo` reads it:
+    /// lowercased modifiers and key, with "Control++" meaning Control and the plus key.
+    static func pressCombo(_ combo: Substring) -> (key: String, mods: Set<String>) {
+        var parts = combo.lowercased().split(separator: "+", omittingEmptySubsequences: false).map(String.init)
+        if combo.hasSuffix("++") { parts = Array(parts.dropLast(2)) + ["plus"] }
+        return (parts.last ?? "", Set(parts.dropLast()))
+    }
+
+    /// Characters a combo types into the focused field (nil when it types nothing): a single
+    /// character, Space or Plus with no Control, Alt or Meta held.
+    static func typedText(key: String, mods: Set<String>) -> String? {
+        guard mods.isDisjoint(with: ["meta", "cmd", "command", "super", "control", "ctrl", "alt", "option", "opt"]) else { return nil }
+        if key == "space" || key == "spacebar" { return " " }
+        if key == "plus" { return "+" }
+        return key.count == 1 ? (mods.contains("shift") ? key.uppercased() : key) : nil
+    }
+
     static func press(keys: String, page: PageSnapshot?) -> ToolVerdict {
         let summary = "Press \(PageSnapshot.clip(keys, 60))\(on(page))"
         let focused = page?.focusedElement
         let inTextField = focused.map { ["textbox", "searchbox", "combobox", "spinbutton"].contains($0.role) } ?? false
+        let combos = keys.split(whereSeparator: \.isWhitespace).map(pressCombo)
+
+        // Pressing keys one at a time types just like browser.type, so the same fields are off
+        // limits: password fields and payment card details, typed or pasted.
+        var typed = ""
+        var entersText = false
+        for c in combos {
+            if let t = typedText(key: c.key, mods: c.mods) { typed += t; entersText = true }
+            let command = !c.mods.isDisjoint(with: ["meta", "cmd", "command", "super", "control", "ctrl"])
+            if (command && c.key == "v") || (c.mods.contains("shift") && c.key == "insert") { entersText = true }
+        }
+        if entersText, let f = focused {
+            if f.secure || f.inputType == "password" {
+                return ToolVerdict(risk: .high, reasons: ["password field"], blocked: "Glide never types into password fields. Please enter it yourself.", summary: summary)
+            }
+            if matches(names(f, nil), cardFieldWords) {
+                return ToolVerdict(risk: .high, reasons: ["payment card details"], blocked: "Glide won't enter payment card details. Please enter them yourself.", summary: summary)
+            }
+        }
+        if SafetyPolicy.looksLikePaymentCard(typed) {
+            return ToolVerdict(risk: .high, reasons: ["payment card details"], blocked: "Glide won't enter payment card details. Please enter them yourself.", summary: summary)
+        }
+
         var risk = RiskLevel.low
         var reasons: [String] = []
-        for combo in keys.split(whereSeparator: \.isWhitespace) {
-            let parts = combo.lowercased().split(separator: "+").map(String.init)
-            guard let key = parts.last else { continue }
-            let mods = Set(parts.dropLast())
-            let command = !mods.isDisjoint(with: ["meta", "cmd", "command", "control", "ctrl"])
+        if entersText, focused == nil {
+            // Focus may be in a frame the snapshot can't see (sign-in and payment frames often are).
+            risk = .medium
+            reasons.append("types into an element Glide can't see")
+        }
+        for c in combos {
+            let key = c.key
+            let mods = c.mods
+            let command = !mods.isDisjoint(with: ["meta", "cmd", "command", "super", "control", "ctrl"])
             let isEnter = key == "enter" || key == "return"
             let isDelete = key == "backspace" || key == "delete" || key == "del"
             if isEnter, command {

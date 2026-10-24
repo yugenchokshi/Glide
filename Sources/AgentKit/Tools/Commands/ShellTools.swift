@@ -1,4 +1,16 @@
 import Foundation
+import AppKit
+
+/// Commands and scripts can read the clipboard without `clipboard.read`, so they follow its
+/// rule: an item a password manager marked as concealed is never read. That needs the
+/// pasteboard itself, so it's checked just before running rather than in `assess`.
+enum ConcealedClipboardGuard {
+    static let message = "The clipboard holds a concealed item (likely a password from a password manager), so Glide won't run something that reads it."
+
+    static func check(_ pasteboardName: NSPasteboard.Name?) async throws {
+        if case .concealed = await Clipboard.read(pasteboardName) { throw ToolError.blocked(message) }
+    }
+}
 
 // MARK: shell.run
 
@@ -7,6 +19,11 @@ import Foundation
 struct ShellRunTool: AgentTool {
     static let defaultTimeout: Double = 60
     static let maxTimeout: Double = 600
+    /// The pasteboard checked for concealed items before a command that reads the clipboard
+    /// runs; nil is the general clipboard (tests pass a private one).
+    let pasteboardName: NSPasteboard.Name?
+
+    init(pasteboardName: NSPasteboard.Name? = nil) { self.pasteboardName = pasteboardName }
 
     let spec = ToolSpec(
         name: "shell.run",
@@ -19,9 +36,13 @@ struct ShellRunTool: AgentTool {
         category: .command)
 
     func assess(_ arguments: JSONValue, context: ToolContext) -> ToolVerdict {
+        assessment(arguments, context: context).verdict
+    }
+
+    private func assessment(_ arguments: JSONValue, context: ToolContext) -> (verdict: ToolVerdict, readsClipboard: Bool) {
         let command = arguments.optionalString("command") ?? ""
         let cwd = ToolArgs.pathForAssessment(arguments.optionalString("cwd"), context)?.path ?? context.workingDirectory.path
-        let (verdict, programs) = CommandSafety.analyze(command, cwd: cwd)
+        let (verdict, programs, readsClipboard) = CommandSafety.analyze(command, cwd: cwd)
         var v = verdict
         // Turning AppleScript or Shortcuts off also covers reaching them through the shell.
         let settings = context.settings.tools
@@ -31,12 +52,14 @@ struct ShellRunTool: AgentTool {
         if !settings.allowShortcuts, programs.contains("shortcuts") || programs.contains("automator") {
             v.blocked = v.blocked ?? "Shortcuts are turned off, including the shortcuts command. You can allow them in Settings › Speed & Commands."
         }
-        return CommandFamilyGate.shell.apply(v, settings)
+        return (CommandFamilyGate.shell.apply(v, settings), readsClipboard)
     }
 
     func run(_ arguments: JSONValue, context: ToolContext) async throws -> ToolOutput {
         let command = try arguments.requiredString("command")
-        try CommandFamilyGate.enforce(assess(arguments, context: context))
+        let (verdict, readsClipboard) = assessment(arguments, context: context)
+        try CommandFamilyGate.enforce(verdict)
+        if readsClipboard { try await ConcealedClipboardGuard.check(pasteboardName) }
         try context.gate.checkStopped()
         let timeout = ToolArgs.seconds(arguments, "timeout_s", default: Self.defaultTimeout, max: Self.maxTimeout)
         let cwd = try arguments.optionalString("cwd").map { try ToolArgs.path($0, context) } ?? context.workingDirectory
@@ -83,11 +106,14 @@ enum CommandOutput {
 struct OSAScriptTool: AgentTool {
     let language: ScriptSafety.Language
     let spec: ToolSpec
+    /// Checked for concealed items before a script that reads the clipboard runs.
+    let pasteboardName: NSPasteboard.Name?
     static let defaultTimeout: Double = 30
 
-    init(language: ScriptSafety.Language) {
+    init(language: ScriptSafety.Language, pasteboardName: NSPasteboard.Name? = nil) {
         self.language = language
         self.spec = Self.makeSpec(language)
+        self.pasteboardName = pasteboardName
     }
 
     private static func makeSpec(_ language: ScriptSafety.Language) -> ToolSpec {
@@ -133,6 +159,7 @@ struct OSAScriptTool: AgentTool {
     func run(_ arguments: JSONValue, context: ToolContext) async throws -> ToolOutput {
         let script = try arguments.requiredString("script")
         try CommandFamilyGate.enforce(assess(arguments, context: context))
+        if ShellRiskChecker.mentionsClipboard(script) { try await ConcealedClipboardGuard.check(pasteboardName) }
         try context.gate.checkStopped()
         let timeout = ToolArgs.seconds(arguments, "timeout_s", default: Self.defaultTimeout, max: ShellRunTool.maxTimeout)
         let args = (language == .javaScript ? ["-l", "JavaScript"] : []) + ["-e", script]

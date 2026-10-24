@@ -822,6 +822,9 @@ struct DataWebToolsTests {
                 case "/json": return .init(headers: ["Content-Type": "application/json"], body: Data("{\"b\":[1,2],\"a\":{\"url\":\"http://x/y\"}}".utf8))
                 case "/big": return .init(headers: ["Content-Type": "text/plain"], body: Data(repeating: 0x61, count: 6 << 20))
                 case "/redirect": return .init(status: 302, headers: ["Location": "/page"])
+                // Redirects into this Mac a public page might send (never followed, so no DNS).
+                case "/to-mapped": return .init(status: 302, headers: ["Location": "http://[::ffff:7f00:1]/page"])
+                case "/to-name": return .init(status: 302, headers: ["Location": "http://rebind.example/page"])
                 case "/missing": return .init(status: 404, body: Data("<html><title>Gone</title><body><p>Nothing here</p></body></html>".utf8))
                 case "/latin1":
                     return .init(headers: ["Content-Type": "text/html; charset=iso-8859-1"],
@@ -937,12 +940,50 @@ struct DataWebToolsTests {
             #expect(WebFetchManyTool().assess(["urls": ["https://a.test", "file:///x"]], context: ctx).blocked != nil)
             #expect(WebSearchTool(backend: nil).assess(["query": "x"], context: ctx).risk == .low)
             for local in ["localhost", "127.0.0.1", "127.1", "2130706433", "0x7f000001", "10.2.3.4", "172.20.0.1", "192.168.0.10", "169.254.169.254",
-                          "::1", "[::1]", "fd00::1", "fe80::1", "::ffff:10.0.0.1", "printer.local", "router.lan", "0.0.0.0"] {
+                          "::1", "[::1]", "fd00::1", "fe80::1", "::ffff:10.0.0.1", "printer.local", "router.lan", "0.0.0.0",
+                          // IPv4 inside IPv6, in hex as well as dotted form.
+                          "::ffff:7f00:1", "[::ffff:7f00:1]", "::ffff:c0a8:101", "::ffff:0:7f00:1", "::7f00:1", "64:ff9b::7f00:1", "64:ff9b:1::a00:1",
+                          "2002:c0a8:101::1", "[fe80::1%en0]", "fec0::1", "ff02::1", "::", "192.0.0.8", "224.0.0.1", "255.255.255.255"] {
                 #expect(WebFetcher.isLocalHost(local), "\(local) should be local")
             }
-            for publicHost in ["example.com", "8.8.8.8", "172.32.0.1", "dead.be", "2001:4860:4860::8888", "fc.example.com"] {
+            for publicHost in ["example.com", "8.8.8.8", "172.32.0.1", "dead.be", "2001:4860:4860::8888", "fc.example.com",
+                               "::ffff:808:808", "64:ff9b::808:808", "2002:808:808::1"] {
                 #expect(!WebFetcher.isLocalHost(publicHost), "\(publicHost) should be public")
             }
+            #expect(WebFetchTool().assess(["url": "http://[::ffff:7f00:1]:9222/json/list"], context: ctx).risk == .medium)
+        }
+
+        /// Names are looked up too; these resolve without the network (numbers, the hosts file).
+        @Test func nameLookupsFindLocalAddresses() async {
+            #expect(WebFetcher.lookupIsLocal("127.0.0.1"))
+            #expect(WebFetcher.lookupIsLocal("::1"))
+            #expect(WebFetcher.lookupIsLocal("localhost"))
+            #expect(!WebFetcher.lookupIsLocal("8.8.8.8"))
+            #expect(await WebFetcher.resolvesToLocal("localhost"))
+            #expect(await !WebFetcher.resolvesToLocal("8.8.8.8"))
+        }
+
+        /// A page fetched from the internet can't hand back this Mac's or the local network's
+        /// content: not by redirecting to an address, nor to a name that points here, nor by
+        /// its own connection ending at a local address. The local test server stands in for
+        /// a public site by passing `originIsLocal: false`.
+        @Test func internetPagesCantReachThisMac() async throws {
+            let (server, base) = try await Self.server()
+            defer { server.stop() }
+            func fetch(_ path: String, originIsLocal: Bool = false) async throws -> FetchedResource {
+                let request = WebFetcher.makeRequest(base.appendingPathComponent(path))
+                return try await WebFetcher.perform(request, maxBytes: WebFetcher.maxBytes, originIsLocal: originIsLocal,
+                                                    resolvesToLocal: { $0 == "rebind.example" })
+            }
+            func refusal(_ path: String) async -> String? {
+                do { _ = try await fetch(path); return nil } catch { return error.localizedDescription }
+            }
+            #expect(await refusal("to-mapped") == FetchTask.localRedirect)
+            #expect(await refusal("to-name") == FetchTask.localRedirect)
+            #expect(await refusal("page") == FetchTask.localPeer)
+            // A local page may still redirect within the local network.
+            let local = try await fetch("redirect", originIsLocal: true)
+            #expect(local.status == 200 && local.finalURL.path == "/page")
         }
 
         @Test func installRegistersWebTools() {

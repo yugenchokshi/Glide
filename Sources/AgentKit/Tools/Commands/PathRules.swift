@@ -64,6 +64,9 @@ public enum PathRules {
         }
         if p == "~" || p.hasPrefix("~/") {
             p = home + p.dropFirst(1)
+        } else if !literalDollar, isDirectoryStackTilde(p) {
+            // zsh's ~+ (current folder), ~- (previous folder), ~2 or ~[name]: only the shell knows.
+            return nil
         } else if p.hasPrefix("~") {
             // ~name → that user's home folder (macOS keeps them under /Users).
             let rest = p.dropFirst()
@@ -77,6 +80,29 @@ public enum PathRules {
         }
         if !p.hasPrefix("/") { p = (cwd ?? home) + "/" + p }
         return normalize(p)
+    }
+
+    /// `~+`, `~-`, `~3`, `~+2`, `~[name]`: zsh expands these from the folder stack or a
+    /// dynamic directory name rather than from a user's home folder.
+    static func isDirectoryStackTilde(_ p: String) -> Bool {
+        guard p.hasPrefix("~") else { return false }
+        let rest = p.dropFirst()
+        let name = rest.prefix { $0 != "/" }
+        if name.hasPrefix("[") { return true }
+        let digits = (name.first == "+" || name.first == "-") ? name.dropFirst() : name[...]
+        return (name == "+" || name == "-") || (!digits.isEmpty && digits.allSatisfy(\.isNumber))
+    }
+
+    /// Preference domains Glide (and glidectl) keep their settings in. The app kept its earlier
+    /// NotchBuddy bundle identifier, so these are what `defaults` and the plist file use.
+    static let glidePreferenceDomainPrefixes = ["dev.notchbuddy"]
+
+    /// True when `domain` (a `defaults` domain or a plist file name, with or without
+    /// `.plist`) names Glide's own settings.
+    static func isGlidePreferenceDomain(_ domain: String) -> Bool {
+        var d = domain.lowercased()
+        if d.hasSuffix(".plist") { d.removeLast(6) }
+        return glidePreferenceDomainPrefixes.contains { d == $0 || d.hasPrefix($0 + ".") }
     }
 
     /// True when `path` is `dir` or inside it (case-insensitive).
@@ -95,11 +121,23 @@ public enum PathRules {
     }
 
     /// Files that decide what runs at login or how the shell starts, and Glide's own settings
-    /// (an agent must not be able to switch off its own safety settings).
+    /// (an agent must not be able to switch off its own safety settings). Per-host preferences
+    /// (`ByHost/<domain>.<UUID>.plist`) are covered by their whole folder, since their names
+    /// can't be listed in advance.
     static func persistenceRoots(home: String) -> [String] {
         [".zshrc", ".zprofile", ".zshenv", ".zlogin", ".zlogout", ".bashrc", ".bash_profile", ".bash_login", ".profile",
-         "Library/LaunchAgents", "Library/Preferences/dev.notchbuddy.app.plist", ".config/fish/config.fish"]
+         "Library/LaunchAgents", "Library/Preferences/ByHost", ".config/fish/config.fish"]
             .map { home + "/" + $0 }
+            + glidePreferenceDomainPrefixes.map { home + "/Library/Preferences/" + $0 + ".app.plist" }
+    }
+
+    /// True for a file in the Preferences folder that holds Glide's settings, however the
+    /// domain is spelled (`dev.notchbuddy.app.plist`, `DEV.NotchBuddy.App.plist`, …).
+    static func isGlidePreferenceFile(_ path: String, home: String) -> Bool {
+        let p = normalize(path)
+        let dir = (p as NSString).deletingLastPathComponent
+        guard dir.lowercased() == (home + "/Library/Preferences").lowercased() else { return false }
+        return isGlidePreferenceDomain((p as NSString).lastPathComponent)
     }
 
     /// True for paths whose contents are private keys or credentials. Public keys are fine.
@@ -111,7 +149,7 @@ public enum PathRules {
     public static func writeZone(_ path: String, home: String = PathRules.home) -> WriteZone {
         let p = normalize(path)
         if discardPaths.contains(p.lowercased()) || p.lowercased().hasPrefix("/dev/fd/") { return .discard }
-        if isSecret(p, home: home) || persistenceRoots(home: home).contains(where: { isInside(p, $0) }) { return .sensitive }
+        if isSecret(p, home: home) || persistenceRoots(home: home).contains(where: { isInside(p, $0) }) || isGlidePreferenceFile(p, home: home) { return .sensitive }
         if isInside(p, home) { return .allowed }
         if tempRoots.contains(where: { isInside(p, $0) }) { return .allowed }
         return .outside

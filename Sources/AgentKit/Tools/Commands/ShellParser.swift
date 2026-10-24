@@ -16,6 +16,13 @@ struct ShellWord: Sendable, Hashable {
     var substitutions: [ShellList] = []
     /// True when any part of the word was quoted (so it can't be an operator or keyword).
     var quoted = false
+    /// An unquoted glob character (`*`, `?`, `[`, `{`, zsh's `(…)`, `^`, `#`) is in the word,
+    /// so the shell may turn it into other names at run time. The safety checks then match it
+    /// as a pattern instead of comparing its text.
+    var globbed = false
+    /// Raw text of zsh `(…)` groups written right after a word (`*(e:'cmd':)`, `*.(a|b)`):
+    /// glob qualifiers or alternatives, never a subshell. Qualifiers can run code.
+    var qualifiers: [String] = []
 }
 
 struct ShellRedirect: Sendable, Hashable {
@@ -43,8 +50,11 @@ struct ShellCommand: Sendable, Hashable {
     var heredoc: String?
     /// Here-string (`<<< text`), if any.
     var hereString: ShellWord?
+    /// The command is `(( … ))`, which evaluates arithmetic (and, through array subscripts,
+    /// can run command text stored in a variable).
+    var arithmetic = false
 
-    var isEmpty: Bool { words.isEmpty && redirects.isEmpty && groups.isEmpty && hereString == nil }
+    var isEmpty: Bool { words.isEmpty && redirects.isEmpty && groups.isEmpty && hereString == nil && !arithmetic }
 }
 
 struct ShellPipeline: Sendable, Hashable {
@@ -153,7 +163,9 @@ final class ShellParser {
                 endPipeline(); i += 1
                 readHeredocBodies()
             case "#" where !buf.started:
-                while i < c.count, c[i] != "\n" { i += 1 }
+                // Inside parentheses a `#` may be glob text (zsh's `ls (#x|*)`), not a
+                // comment, so stop at `)` rather than hide what follows on the line.
+                while i < c.count, c[i] != "\n", !(close == ")" && c[i] == ")") { i += 1 }
             case ";":
                 endPipeline(); i += 1
                 if let n = peek(), n == ";" || n == "&" || n == "|" { i += 1 } // ;; ;& ;| in case
@@ -176,10 +188,32 @@ final class ShellParser {
                 readRedirect(&buf, &pendingOp)
             case "(":
                 if buf.started {
+                    if buf.word.text == "=" && !buf.word.quoted {
+                        // zsh's =(list): runs the list and passes a temporary file of its output.
+                        i += 1
+                        let inner = nested { parseList(until: ")") }
+                        buf.append("(…)")
+                        if let inner { buf.word.substitutions.append(inner) }
+                        continue
+                    }
                     if buf.word.text.hasSuffix("=") {
                         // Array assignment a=( … ): keep as text, but still find substitutions.
+                        // Step past "(" first, or the rest of the line would be swallowed.
+                        i += 1
                         let inner = readBalanced(open: "(", close: ")")
                         buf.append("(" + inner + ")")
+                        buf.word.substitutions += scanSubstitutions(inner)
+                        continue
+                    }
+                    if peek(1) != ")", !cmd.words.isEmpty || buf.word.globbed {
+                        // Parentheses glued to an argument are part of a zsh glob pattern
+                        // (`*.(jpg|png)`, `*(.)`, `*(e:'cmd':)`), not a subshell; bash rejects
+                        // them. Keep them in the word and let the checker read the qualifiers.
+                        i += 1
+                        let inner = readBalanced(open: "(", close: ")")
+                        buf.append("(" + inner + ")")
+                        buf.word.globbed = true
+                        buf.word.qualifiers.append(inner)
                         buf.word.substitutions += scanSubstitutions(inner)
                         continue
                     }
@@ -192,6 +226,7 @@ final class ShellParser {
                     i += 2
                     let inner = readBalanced(open: "(", close: ")")
                     if peek() == ")" { i += 1 }
+                    cmd.arithmetic = true
                     let subs = scanSubstitutions(inner)
                     if !subs.isEmpty { cmd.words.append(ShellWord(text: "", substitutions: subs)) }
                     continue
@@ -218,6 +253,7 @@ final class ShellParser {
             case "$":
                 readDollar(&buf)
             default:
+                if "*?[{^#".contains(ch) { buf.word.globbed = true }
                 buf.append(ch); i += 1
             }
         }
@@ -376,7 +412,7 @@ final class ShellParser {
     /// Finds command substitutions inside text that is otherwise not a command (the inside of
     /// `${…}`, arithmetic, array literals) by reading it like a double-quoted string.
     private func scanSubstitutions(_ text: String) -> [ShellList] {
-        guard text.contains("$(") || text.contains("`") || text.contains("<(") || text.contains(">(") else { return [] }
+        guard text.contains("$(") || text.contains("`") || text.contains("<(") || text.contains(">(") || text.contains("=(") else { return [] }
         if depth >= Self.maxDepth { tooComplex = true; return [] }
         let p = makeChild(text)
         var buf = WordBuffer()
@@ -385,6 +421,8 @@ final class ShellParser {
             if ch == "$" { p.readDollar(&buf) }
             else if ch == "`" { p.readBacktick(&buf) }
             else if (ch == "<" || ch == ">") && p.peek(1) == "(" { p.readProcessSubstitution(&buf, prefix: String(ch) + "(") }
+            // zsh's =(list) at the start of an array element runs the list too.
+            else if ch == "=" && p.peek(1) == "(" && (p.i == 0 || " \t\n(".contains(p.c[p.i - 1])) { p.readProcessSubstitution(&buf, prefix: "=(") }
             else if ch == "\\" { p.i += 2 }
             else { p.i += 1 }
         }
