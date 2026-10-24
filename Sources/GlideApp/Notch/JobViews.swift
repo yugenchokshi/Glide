@@ -34,6 +34,10 @@ protocol JobsSource: AnyObject {
     /// Another process (glidectl, or a second copy of Glide) is running the job, so this one
     /// only shows it.
     func isRunningElsewhere(_ id: String) -> Bool
+    /// Waiting for a free slot (Settings › Jobs limits how many run at once), not for a time.
+    /// JobCenter starts it by itself when another job finishes. The record can't tell: a wait
+    /// that came due keeps its wake time while the job is queued.
+    func isQueued(_ id: String) -> Bool
     /// Re-reads jobs from disk, picking up ones glidectl created or changed.
     func reload()
 }
@@ -71,6 +75,17 @@ extension JobsSource {
         jobs.filter { !$0.status.isFinished }.sorted {
             $0.status.isActive != $1.status.isActive ? $0.status.isActive : $0.updatedAt > $1.updatedAt
         }
+    }
+
+    /// "Resume" / "Run now" does something. A queued job can't jump the queue (`JobCenter.resume`
+    /// ignores it), so it offers neither.
+    func canResume(_ job: JobRecord) -> Bool { job.status.isResumable && !isQueued(job.id) }
+
+    /// When a sleeping job continues, or nil when it isn't sleeping (a queued job is waiting for
+    /// a slot, even with a wake time that already came due).
+    func wakeTime(_ job: JobRecord) -> Date? {
+        guard job.status == .waiting, !isQueued(job.id) else { return nil }
+        return job.nextWakeAt
     }
 }
 
@@ -127,14 +142,6 @@ extension JobRecord {
     var canRetryFailed: Bool {
         usage.itemsFailed > 0 && (status.isFinished || status == .paused || status == .needsInput)
     }
-
-    /// Waiting for a free slot (Settings › Jobs limits how many run at once), not for a time.
-    /// JobCenter starts it by itself when another job finishes.
-    var isQueued: Bool { status == .waiting && nextWakeAt == nil }
-
-    /// "Resume" / "Run now" does something. A queued job can't jump the queue (`JobCenter.resume`
-    /// ignores it), so it offers neither.
-    var canResume: Bool { status.isResumable && !isQueued }
 }
 
 enum JobFormat {
@@ -297,7 +304,7 @@ struct NotchJobRow: View {
             BKIconButton(systemName: "play.fill", help: "Start job") { model.userDecision { jobs.start(id) } }
         } else if job.status.canPause {
             BKIconButton(systemName: "pause.fill", help: "Pause job") { model.userDecision { jobs.pause(id) } }
-        } else if job.canResume {
+        } else if jobs.canResume(job) {
             BKIconButton(systemName: "play.fill", help: job.status == .waiting ? "Run now" : "Resume job") { model.userDecision { jobs.resume(id) } }
         }
         if mine, !job.status.isFinished {

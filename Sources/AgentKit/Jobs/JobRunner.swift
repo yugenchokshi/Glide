@@ -79,6 +79,9 @@ public actor JobRunner {
     /// This job's own stop/pause switch, so controlling one job never affects another.
     private nonisolated let gate = ExecutionGate()
     private nonisolated let work = Mutex<Task<JobRecord, Never>?>(nil)
+    /// Set by `detachFromStore()`. Each save of the record checks it under this lock, so none
+    /// can land after the owner's own save of the job.
+    private nonisolated let detached = Mutex(false)
     private var leaseOwner: String { "job:\(jobID)" }
 
     // Per-run bookkeeping (a resumed job starts these fresh).
@@ -127,6 +130,12 @@ public actor JobRunner {
     public nonisolated func pause() { gate.pause() }
 
     public nonisolated var isStopRequested: Bool { gate.isStopped }
+
+    /// Stops this runner from saving the job's record again. Used when the process is about to
+    /// exit before a halted runner has unwound (`JobCenter.saveHaltedForExit`): the owner saves
+    /// the record itself, and a late save from here (still running, or stopped) would undo
+    /// that. When this returns, no save of the runner's is in progress.
+    nonisolated func detachFromStore() { detached.withLock { $0 = true } }
 
     /// Runs until the job finishes, waits, pauses, needs input or is stopped, and returns the
     /// final record (also persisted). Cancelling the calling task stops the job.
@@ -390,7 +399,7 @@ public actor JobRunner {
     // MARK: - Executing steps
 
     private func makeAgentCallbacks() -> AgentCallbacks {
-        let store = self.store, jobID = self.jobID, sink = callbacks
+        let store = self.store, jobID = self.jobID, sink = callbacks, gate = self.gate
         return AgentCallbacks(
             phase: { _, _ in },
             log: { entry in
@@ -401,7 +410,34 @@ public actor JobRunner {
             approve: { [weak self] request in
                 guard let self else { return .stop }
                 return await self.requestApproval(request)
-            })
+            },
+            waitingForUser: { [weak self] waiting in await self?.userWaitChanged(waiting) },
+            // A paused job's step must not take the screen back when the user walks away.
+            jobInterrupted: { gate.current != .running })
+    }
+
+    /// The status line shown while a step on the screen waits for the user, and the one it replaced.
+    private var userWaitLine: (shown: String, previous: String)?
+
+    /// A step on the screen gave it up to wait for the user to leave the Mac alone (true), or
+    /// carries on (false). Like an approval, that wait isn't work, and it can last as long as
+    /// the user keeps working, so it's left out of the time budget; the status line says why
+    /// nothing moves meanwhile.
+    private func userWaitChanged(_ waiting: Bool) {
+        if waiting {
+            waitBegan()
+            let shown = settings.jobs.screenUse == .whenIdle ? "Waiting until you're idle to use the screen…" : "Waiting for you to let go of the mouse…"
+            userWaitLine = (shown, record.statusLine)
+            record.statusLine = shown
+            callbacks.update(record)
+        } else {
+            waitEnded()
+            guard let line = userWaitLine else { return }
+            userWaitLine = nil
+            // Only undo our own text.
+            if record.statusLine == line.shown { record.statusLine = line.previous }
+            callbacks.update(record)
+        }
     }
 
     /// Runs one step through the executor: takes the screen lease for on-screen routes, counts
@@ -423,6 +459,8 @@ public actor JobRunner {
             }
             waitEnded()
             record.statusLine = line
+            // Back to the progress line while the step runs (the wait line was never saved).
+            callbacks.update(record)
         }
         callsWithoutProgress += 1
         let result: StepResult
@@ -431,7 +469,11 @@ public actor JobRunner {
         } catch {
             if needsScreen { await lease.release(owner: leaseOwner) }
             if gate.isStopped || Task.isCancelled || error is CancellationError { throw Interrupt.stopped }
-            if let e = error as? AutomationError, e == .stopped { throw Interrupt.paused("Paused because Glide's Stop was pressed. Resume to continue.") }
+            if let e = error as? AutomationError, e == .stopped {
+                // A step waiting for the user ends its wait this way once the job is paused.
+                if gate.isPaused { throw Interrupt.paused("Paused") }
+                throw Interrupt.paused("Paused because Glide's Stop was pressed. Resume to continue.")
+            }
             if let i = error as? Interrupt { throw i }
             if let e = error as? LLMError {
                 switch e {
@@ -1237,8 +1279,13 @@ public actor JobRunner {
     private func persist() {
         tick()
         record.updatedAt = config.now()
-        store.saveJob(record)
-        callbacks.update(record)
+        let r = record
+        let store = self.store
+        let saved = detached.withLock { detached -> Bool in
+            if !detached { store.saveJob(r) }
+            return !detached
+        }
+        if saved { callbacks.update(r) }
     }
 
     private func log(_ entry: ActivityEntry) {

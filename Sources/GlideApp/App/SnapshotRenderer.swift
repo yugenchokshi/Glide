@@ -151,6 +151,8 @@ final class PreviewJobs: JobsSource {
         throw CocoaError(.featureUnsupported, userInfo: [NSLocalizedDescriptionKey: "Export isn't available in previews."])
     }
     func isRunningElsewhere(_ id: String) -> Bool { false }
+    /// Previews have no concurrency limit, so nothing is queued.
+    func isQueued(_ id: String) -> Bool { false }
     func reload() {}
 
     struct Demo {

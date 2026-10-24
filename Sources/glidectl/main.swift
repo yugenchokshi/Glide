@@ -302,6 +302,14 @@ func jobCommand(settings base: AppSettings) async -> Int32 {
                     guard (await Task.detached { readLine() ?? "" }.value.lowercased()) == "y" else { center.stop(job.id); return 1 }
                 }
                 center.start(job.id)
+                // Nothing holds the job while the prompt waits, so the app may have stopped,
+                // deleted, started or finished it meanwhile.
+                if !center.isRunnerActive(job.id), !center.isRunningElsewhere(job.id) {
+                    guard let j = center.job(job.id) else { print("✗ The job was deleted in Glide meanwhile."); return 1 }
+                    print("✗ The job was changed in Glide meanwhile (it's \(j.status.rawValue) now).")
+                    printJob(j, center: center)
+                    return j.status == .completed ? 0 : 1
+                }
             }
             id = job.id
         } else {
@@ -316,8 +324,34 @@ func jobCommand(settings base: AppSettings) async -> Int32 {
         }
         signal(SIGINT, SIG_IGN)
         let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        // Like the emergency stop: end the step in flight now, keep the job paused and resumable.
-        sig.setEventHandler { print("\n■ halting — resume with: glidectl job resume \(id.prefix(8))"); center.haltAll() }
+        var interrupts = 0
+        sig.setEventHandler {
+            interrupts += 1
+            switch interrupts {
+            case 1 where center.isRunnerActive(id):
+                // Like the emergency stop: end the step in flight now, keep the job paused and resumable.
+                print("\n■ halting — resume with: glidectl job resume \(id.prefix(8)) (Ctrl-C again to quit)")
+                center.haltAll()
+            case 2 where center.isRunnerActive(id):
+                // The halted step is still unwinding (a command being ended, a browser call), and
+                // until it has, the job is saved as running. Quitting drops its lock, so the app
+                // would continue it as a job whose process quit. Give the step a moment to end
+                // the job as paused; if it hasn't by then, save it as paused here.
+                print("\n■ quitting once the step has stopped (Ctrl-C again to quit right away)")
+                Task { @MainActor in
+                    let deadline = Date().addingTimeInterval(3)
+                    while center.isRunnerActive(id), Date() < deadline { try? await Task.sleep(for: .milliseconds(50)) }
+                    center.saveHaltedForExit()
+                    quitNow(130)
+                }
+            default:
+                // Nothing here to halt (the job runs in another process, or nothing runs it any
+                // more), or Ctrl-C a third time: save what still unwinds as paused, and quit.
+                print("\n■ quitting")
+                center.saveHaltedForExit()
+                quitNow(130, force: interrupts > 2)
+            }
+        }
         sig.resume()
         // Follow the job: print new log lines, answer approvals, stop when it settles.
         var seen = Set<UUID>()
@@ -331,9 +365,11 @@ func jobCommand(settings base: AppSettings) async -> Int32 {
             if let req = center.pendingApprovals[id] {
                 center.respond(jobID: id, decision: await askApproval(req.title, risk: req.risk, reasons: req.reasons))
             }
-            guard let j = center.job(id) else { break }
+            guard let j = center.job(id) else { print("✗ The job was deleted."); break }
             if j.statusLine != lastLine { lastLine = j.statusLine; print("◆ [\(j.status.rawValue)] \(j.statusLine)") }
-            if [.completed, .failed, .stopped, .needsInput, .paused, .waiting].contains(j.status), !center.isRunnerActive(id) {
+            // Settled, or nothing works on it any more (here or in another process), whatever
+            // its record still says.
+            if !center.isRunnerActive(id), !center.isRunningElsewhere(id) || [.completed, .failed, .stopped, .needsInput, .paused, .waiting].contains(j.status) {
                 printJob(j, center: center)
                 return j.status == .completed ? 0 : 1
             }
@@ -347,6 +383,18 @@ func jobCommand(settings base: AppSettings) async -> Int32 {
 }
 
 let runningElsewhereMessage = "✗ Glide is already running this job in another process (the app, or another glidectl). Pause or stop it there first."
+
+/// Exits now (Ctrl-C with nothing left to halt), shutting the throwaway headless Chrome down
+/// the way a normal exit does. `force` skips that, for when the shutdown itself is stuck.
+@MainActor
+func quitNow(_ code: Int32, force: Bool = false) {
+    guard !force, let headless = cliHeadless else { exit(code) }
+    Task { @MainActor in
+        await headless.backend.shutdown()
+        try? FileManager.default.removeItem(at: headless.profile)
+        exit(code)
+    }
+}
 
 func printPlan(_ plan: JobPlan) {
     print("Plan: \(plan.goal)")

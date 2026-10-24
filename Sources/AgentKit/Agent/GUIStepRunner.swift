@@ -419,14 +419,15 @@ public struct GUIStepRunner: StepExecuting {
     /// Job steps: once the user has started using the Mac, waits until they leave it alone
     /// (giving the screen to a quick task meanwhile) and says so in the job's log. Returns
     /// whether it waited. The wait doesn't count toward the step's time limit, and is reported
-    /// through `waitingForUser` so the job's time budget can leave it out too.
+    /// through `waitingForUser` so the job's time budget can leave it out too. Pausing or
+    /// stopping the job ends the wait (`AutomationError.stopped`) without taking the screen back.
     func waitForUser(_ step: PlanStep, _ r: Run) async throws -> Bool {
         guard let watch = r.takeover, watch.userTookOver else { return false }
         r.callbacks.log(ActivityEntry(kind: .info, title: "Paused because you used the mouse", detail: watch.pauseDetail, stepID: step.id))
         await r.callbacks.waitingForUser(true)
         let waited: TimeInterval
         do {
-            waited = try await watch.waitForIdleUser(gate: runtime.gate)
+            waited = try await watch.waitForIdleUser(gate: runtime.gate, interrupted: r.callbacks.jobInterrupted)
         } catch {
             await r.callbacks.waitingForUser(false)
             throw error
@@ -614,6 +615,10 @@ extension UserInterferenceMonitor: UserInputMonitoring {}
 /// at once, and takes it back (behind that task) before carrying on. The monitor is
 /// `AutomationRuntime.jobInterference`, never the quick task's, and runs only while the step
 /// holds the screen, so job steps never share it.
+///
+/// Idle time is measured the way the lease measures it (Glide's own input left out), so
+/// another job using the screen meanwhile doesn't count as the user being busy. Pausing or
+/// stopping the step's job ends the wait, and the screen isn't taken back.
 final class UserTakeoverWatch: @unchecked Sendable {
     enum Mode: Sendable, Equatable {
         /// Any real mouse input counts (`ScreenUse.whenIdle`).
@@ -632,8 +637,13 @@ final class UserTakeoverWatch: @unchecked Sendable {
     private var tookOver = false
     private var watching = false
     private var handedOver = false
+    /// When the monitor last saw the user's input.
+    private var lastUserInput: Date?
     private let monitor: any UserInputMonitoring
     private let idleProbe: ScreenLease.IdleProbe
+    /// The idle time the waits go by, when it isn't `idleProbe` (production: the lease's,
+    /// which leaves Glide's own input out).
+    private let userIdle: (@Sendable () async -> Double)?
     private let lastAgentInput: @Sendable () -> Date
     private let lease: ScreenLease?
     private let leaseOwner: String?
@@ -643,16 +653,22 @@ final class UserTakeoverWatch: @unchecked Sendable {
     let waitSeconds: Double
 
     /// - Parameters:
+    ///   - idleProbe: seconds since the last input, the user's or Glide's (the step's start
+    ///     tells them apart with `lastAgentInput`).
+    ///   - userIdle: seconds the user has left the Mac alone, which the waits go by; nil to
+    ///     use `idleProbe`.
     ///   - lastAgentInput: when the agent last posted input, to tell the user's input from it.
     ///   - lease, leaseOwner: the screen lease the step's job holds, given up while waiting.
     init(monitor: any UserInputMonitoring, mode: Mode = .anyInput, idleSeconds: Double,
          idleProbe: @escaping ScreenLease.IdleProbe = ScreenLease.systemIdleSeconds,
+         userIdle: (@Sendable () async -> Double)? = nil,
          lastAgentInput: @escaping @Sendable () -> Date = { .distantPast },
          lease: ScreenLease? = nil, leaseOwner: String? = nil, pollInterval: Double = 0.5) {
         self.monitor = monitor
         self.mode = mode
         self.waitSeconds = max(idleSeconds, Self.minimumIdleSeconds)
         self.idleProbe = idleProbe
+        self.userIdle = userIdle
         self.lastAgentInput = lastAgentInput
         self.lease = lease
         self.leaseOwner = leaseOwner
@@ -665,11 +681,14 @@ final class UserTakeoverWatch: @unchecked Sendable {
         guard let jobID = request.jobID, settings.safety.pauseOnUserInput else { return nil }
         let owner = leaseOwner(jobID: jobID)
         let input = runtime.executor.input
+        // The same idle time the lease grants the screen by, so this step and the job it may be
+        // waiting behind agree on whether the user is away.
+        let userIdle: @Sendable () async -> Double = { await lease.userIdleTime() }
         if settings.jobs.screenUse == .always {
-            return UserTakeoverWatch(monitor: runtime.jobInterference, mode: .collisions, idleSeconds: minimumIdleSeconds,
+            return UserTakeoverWatch(monitor: runtime.jobInterference, mode: .collisions, idleSeconds: minimumIdleSeconds, userIdle: userIdle,
                                      lastAgentInput: { input.lastPost }, lease: lease, leaseOwner: owner)
         }
-        return UserTakeoverWatch(monitor: runtime.jobInterference, idleSeconds: settings.jobs.idleSeconds,
+        return UserTakeoverWatch(monitor: runtime.jobInterference, idleSeconds: settings.jobs.idleSeconds, userIdle: userIdle,
                                  lastAgentInput: { input.lastPost }, lease: lease, leaseOwner: owner)
     }
 
@@ -702,7 +721,9 @@ final class UserTakeoverWatch: @unchecked Sendable {
     }
 
     func noteUserInput() {
-        if mode == .collisions, Date().timeIntervalSince(lastAgentInput()) >= Self.collisionWindow { return }
+        let now = Date()
+        lock.withLock { lastUserInput = now }
+        if mode == .collisions, now.timeIntervalSince(lastAgentInput()) >= Self.collisionWindow { return }
         lock.withLock { tookOver = true }
     }
 
@@ -731,14 +752,18 @@ final class UserTakeoverWatch: @unchecked Sendable {
     /// back before returning, and the shared input gate is then cleared of any Stop or pause the
     /// other task left on it. Cancellation ends the wait with `AutomationError.stopped`; so does
     /// a stopped `gate`, but only while the step keeps the screen (given up, it's another's).
-    func waitForIdleUser(gate: ExecutionGate?) async throws -> TimeInterval {
+    /// `interrupted` (the step's job was paused or stopped) ends it too, without taking the
+    /// screen back: the job's runner then ends the run as paused.
+    func waitForIdleUser(gate: ExecutionGate?, interrupted: @escaping @Sendable () -> Bool = { false }) async throws -> TimeInterval {
         let began = Date()
         let wasWatching = lock.withLock { watching }
         stop()
+        // One of Glide's own events right after the user's input can hide it from the lease.
+        if let lease, let seen = lock.withLock({ lastUserInput }) { await lease.noteUserInput(at: seen) }
         let gaveUp = await giveUpScreen()
         do {
-            try await waitUntilIdle(gate: gaveUp ? nil : gate)
-            if gaveUp { try await takeScreenBack() }
+            try await waitUntilIdle(gate: gaveUp ? nil : gate, interrupted: interrupted)
+            if gaveUp { try await takeScreenBack(interrupted: interrupted) }
         } catch {
             throw AutomationError.stopped
         }
@@ -748,12 +773,18 @@ final class UserTakeoverWatch: @unchecked Sendable {
         return Date().timeIntervalSince(began)
     }
 
-    private func waitUntilIdle(gate: ExecutionGate?) async throws {
-        while idleProbe() < waitSeconds {
-            if Task.isCancelled || gate?.isStopped == true { throw AutomationError.stopped }
+    private func waitUntilIdle(gate: ExecutionGate?, interrupted: @Sendable () -> Bool) async throws {
+        while await idleNow() < waitSeconds {
+            if Task.isCancelled || gate?.isStopped == true || interrupted() { throw AutomationError.stopped }
             try await Task.sleep(for: .seconds(pollInterval))
         }
-        if Task.isCancelled { throw AutomationError.stopped }
+        if Task.isCancelled || interrupted() { throw AutomationError.stopped }
+    }
+
+    /// The idle time the waits go by.
+    func idleNow() async -> Double {
+        if let userIdle { return await userIdle() }
+        return idleProbe()
     }
 
     /// Releases the screen lease if this step's job holds it.
@@ -764,19 +795,47 @@ final class UserTakeoverWatch: @unchecked Sendable {
         return true
     }
 
-    /// Queues for the screen again, behind a quick task that took it. That task's input (or
-    /// the user's) may mean they haven't been idle long enough after all; then the screen goes
-    /// back and the wait goes on. A throw leaves the lease held at most once, which the job
-    /// runner releases as it does after any failed step.
-    private func takeScreenBack() async throws {
+    /// Queues for the screen again, behind a quick task that took it. The user's input since
+    /// (starting or watching that task) may mean they haven't been idle long enough after all;
+    /// then the screen goes back and the wait goes on. A pause or stop of the job ends the
+    /// queueing as well, since the quick task ahead may take a while. A throw leaves the lease
+    /// released.
+    private func takeScreenBack(interrupted: @escaping @Sendable () -> Bool) async throws {
         guard let lease, let leaseOwner else { return }
-        while true {
-            try await lease.acquire(owner: leaseOwner)
-            if Task.isCancelled { throw AutomationError.stopped }
-            if idleProbe() >= waitSeconds { break }
+        do {
+            while true {
+                guard try await acquire(lease, owner: leaseOwner, unless: interrupted), !Task.isCancelled, !interrupted() else {
+                    throw AutomationError.stopped
+                }
+                if await idleNow() >= waitSeconds { break }
+                await lease.release(owner: leaseOwner)
+                try await waitUntilIdle(gate: nil, interrupted: interrupted)
+            }
+        } catch {
             await lease.release(owner: leaseOwner)
-            try await waitUntilIdle(gate: nil)
+            throw error
         }
         lock.withLock { handedOver = false }
+    }
+
+    /// Waits for the lease, or gives up (false) once `interrupted`. Never leaves the lease held
+    /// when it gives up: it may have been granted just as the pause was seen.
+    private func acquire(_ lease: ScreenLease, owner: String, unless interrupted: @escaping @Sendable () -> Bool) async throws -> Bool {
+        let poll = pollInterval
+        let granted = try await withThrowingTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                try await lease.acquire(owner: owner)
+                return true
+            }
+            group.addTask {
+                while !interrupted() { try await Task.sleep(for: .seconds(poll)) }
+                return false
+            }
+            let first = try await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        if !granted { await lease.release(owner: owner) }
+        return granted
     }
 }
