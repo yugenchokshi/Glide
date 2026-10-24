@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Pair Glide</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body class="page">
+    <main class="card">
+      <header>
+        <img src="icons/icon48.png" alt="" />
+        <h1>Pair with Glide</h1>
+      </header>
+      <div class="status" role="status" aria-live="polite">
+        <span id="dot" class="dot"></span>
+        <div>
+          <div id="detail">Pairing…</div>
+          <div id="meta" class="meta"></div>
+        </div>
+      </div>
+      <div id="error" class="error" hidden></div>
+    </main>
+    <script src="common.js"></script>
+    <script src="pair.js"></script>
+  </body>
+</html>

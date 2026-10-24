@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Glide</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body class="popup">
+    <header>
+      <img src="icons/icon48.png" alt="" />
+      <h1>Glide</h1>
+    </header>
+
+    <div class="status" role="status" aria-live="polite">
+      <span id="dot" class="dot"></span>
+      <div>
+        <div id="detail">Checking…</div>
+        <div id="meta" class="meta"></div>
+      </div>
+    </div>
+
+    <div id="paused" class="notice" hidden>
+      <div>You closed Chrome's debugging bar, so Glide stopped working in your tabs.</div>
+      <div class="row"><button id="allow" class="primary">Allow again</button></div>
+    </div>
+
+    <div class="row">
+      <button id="reconnect">Reconnect</button>
+    </div>
+
+    <label for="code">Pairing code from Glide › Settings › Browser</label>
+    <div class="row" style="margin-top: 0">
+      <input id="code" type="text" placeholder="47823:…" autocomplete="off" spellcheck="false" />
+      <button id="pair" class="primary">Pair</button>
+    </div>
+    <div id="error" class="error" hidden></div>
+
+    <div class="row">
+      <button id="unpair" class="link" hidden>Forget this pairing</button>
+    </div>
+
+    <script src="common.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

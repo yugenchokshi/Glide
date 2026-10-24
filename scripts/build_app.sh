@@ -23,6 +23,11 @@ if [ ! -f build/AppIcon.icns ]; then
 fi
 cp build/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
+# The Glide Chrome extension ships inside the app so Settings › Browser can reveal it for
+# chrome://extensions › Load unpacked.
+rm -rf "$APP/Contents/Resources/ChromeExtension"
+cp -R Extensions/chrome "$APP/Contents/Resources/ChromeExtension"
+
 IDENTITY="${NB_SIGN_IDENTITY:-}"
 if [ -z "$IDENTITY" ]; then
   IDENTITY="$(security find-identity -v -p codesigning | grep -Eo '"(Developer ID Application|Apple Development)[^"]*"' | head -1 | tr -d '"' || true)"
