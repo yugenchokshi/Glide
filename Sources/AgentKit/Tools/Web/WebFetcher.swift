@@ -91,7 +91,10 @@ public enum WebFetcher {
     }
 
     /// True for this Mac, the local network and other non-public addresses. Numeric hosts in
-    /// any form inet_aton accepts ("127.1", "2130706433", "0x7f.1") are checked as addresses.
+    /// any form inet_aton accepts ("127.1", "2130706433", "0x7f.1") are checked as addresses;
+    /// IPv6 literals are parsed and checked numerically, including IPv4 addresses carried
+    /// inside them (`::ffff:7f00:1`, `64:ff9b::7f00:1`). Names are only judged by their text;
+    /// `resolvesToLocal` looks them up.
     public static func isLocalHost(_ rawHost: String?) -> Bool {
         guard var host = rawHost?.lowercased(), !host.isEmpty else { return false }
         if host.hasPrefix("[") && host.hasSuffix("]") { host = String(host.dropFirst().dropLast()) }
@@ -99,17 +102,97 @@ public enum WebFetcher {
         if host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") || host.hasSuffix(".internal")
             || host.hasSuffix(".lan") || host.hasSuffix(".home.arpa") || host == "0.0.0.0" { return true }
         if host.contains(":") {
-            if host == "::1" || host == "::" { return true }
-            if host.hasPrefix("fc") || host.hasPrefix("fd") || host.hasPrefix("fe80:") { return true }
-            if host.hasPrefix("::ffff:") { return isLocalHost(String(host.dropFirst(7))) }
-            return false
+            // A zone ("fe80::1%en0") only exists for link-local addresses.
+            if host.contains("%") { return true }
+            var a6 = in6_addr()
+            // Something with colons that isn't an IPv6 address can't be reached as a public
+            // host either, so it's refused rather than guessed at.
+            guard inet_pton(AF_INET6, host, &a6) == 1 else { return true }
+            return isLocalIPv6(withUnsafeBytes(of: &a6) { Array($0) })
         }
         var addr = in_addr()
         guard host.allSatisfy({ $0.isHexDigit || $0 == "." || $0 == "x" }), inet_aton(host, &addr) != 0 else { return false }
-        let ip = UInt32(bigEndian: addr.s_addr)
-        let a = ip >> 24, b = (ip >> 16) & 0xFF
+        return isLocalIPv4(UInt32(bigEndian: addr.s_addr))
+    }
+
+    /// Loopback, private, link-local, carrier-grade NAT, "this network", IETF-reserved,
+    /// multicast and broadcast IPv4 addresses.
+    static func isLocalIPv4(_ ip: UInt32) -> Bool {
+        let a = ip >> 24, b = (ip >> 16) & 0xFF, c = (ip >> 8) & 0xFF
         return a == 127 || a == 10 || a == 0 || (a == 172 && (16...31).contains(b)) || (a == 192 && b == 168)
-            || (a == 169 && b == 254) || (a == 100 && (64...127).contains(b))
+            || (a == 169 && b == 254) || (a == 100 && (64...127).contains(b)) || (a == 192 && b == 0 && c == 0) || a >= 224
+    }
+
+    /// IPv6 loopback, unspecified, unique-local, link- and site-local and multicast addresses,
+    /// and IPv4 addresses embedded in mapped, compatible, translated (::ffff:0:0:0/96),
+    /// NAT64 (64:ff9b::/96, 64:ff9b:1::/48) and 6to4 (2002::/16) forms.
+    static func isLocalIPv6(_ b: [UInt8]) -> Bool {
+        guard b.count == 16 else { return true }
+        func v4(_ at: Int) -> UInt32 { b[at..<(at + 4)].reduce(0) { $0 << 8 | UInt32($1) } }
+        let zeros = { (r: Range<Int>) in b[r].allSatisfy { $0 == 0 } }
+        if zeros(0..<15) && (b[15] == 0 || b[15] == 1) { return true }       // :: and ::1
+        if b[0] & 0xFE == 0xFC { return true }                                 // fc00::/7
+        if b[0] == 0xFE && b[1] & 0x80 == 0x80 { return true }                 // fe80::/10, fec0::/10
+        if b[0] == 0xFF { return true }                                        // multicast
+        if zeros(0..<10) && b[10] == 0xFF && b[11] == 0xFF { return isLocalIPv4(v4(12)) }       // ::ffff:a.b.c.d
+        if zeros(0..<8) && b[8] == 0xFF && b[9] == 0xFF && zeros(10..<12) { return isLocalIPv4(v4(12)) } // ::ffff:0:a.b.c.d
+        if zeros(0..<12) { return isLocalIPv4(v4(12)) }                                                 // ::a.b.c.d
+        if b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xFF && b[3] == 0x9B {
+            if zeros(4..<12) { return isLocalIPv4(v4(12)) }                                             // 64:ff9b::/96
+            if b[4] == 0x00 && b[5] == 0x01 { return isLocalIPv4(v4(12)) }                              // 64:ff9b:1::/48
+        }
+        if b[0] == 0x20 && b[1] == 0x02 { return isLocalIPv4(v4(2)) }                                   // 2002::/16
+        return false
+    }
+
+    /// Looks `host` up and reports whether any address it has is local (so a public-looking
+    /// name like `127.0.0.1.nip.io` can't stand in for this Mac). Lookups that fail or take
+    /// longer than `timeout` count as not local; the connection check in `FetchTask` still
+    /// refuses a local peer.
+    public static func resolvesToLocal(_ host: String, timeout: TimeInterval = 5) async -> Bool {
+        if isLocalHost(host) { return true }
+        final class Once: @unchecked Sendable {
+            private let lock = NSLock()
+            private var done = false
+            func claim() -> Bool { lock.withLock { defer { done = true }; return !done } }
+        }
+        let once = Once()
+        return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let local = lookupIsLocal(host)
+                if once.claim() { cont.resume(returning: local) }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                if once.claim() { cont.resume(returning: false) }
+            }
+        }
+    }
+
+    /// The blocking look-up behind `resolvesToLocal`: any local address among the results counts.
+    static func lookupIsLocal(_ host: String) -> Bool {
+        var hints = addrinfo()
+        hints.ai_family = AF_UNSPEC
+        hints.ai_socktype = SOCK_STREAM
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &result) == 0, let first = result else { return false }
+        defer { freeaddrinfo(first) }
+        var cursor: UnsafeMutablePointer<addrinfo>? = first
+        while let ai = cursor {
+            if let sa = ai.pointee.ai_addr {
+                switch Int32(sa.pointee.sa_family) {
+                case AF_INET:
+                    let ip = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { UInt32(bigEndian: $0.pointee.sin_addr.s_addr) }
+                    if isLocalIPv4(ip) { return true }
+                case AF_INET6:
+                    let bytes = sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { p in withUnsafeBytes(of: p.pointee.sin6_addr) { Array($0) } }
+                    if isLocalIPv6(bytes) { return true }
+                default:
+                    break
+                }
+            }
+            cursor = ai.pointee.ai_next
+        }
+        return false
     }
 
     // MARK: Fetching
@@ -173,7 +256,21 @@ public enum WebFetcher {
 
     private static func perform(_ request: URLRequest, maxBytes: Int) async throws -> FetchedResource {
         guard let url = request.url else { throw WebError.invalidURL("The request has no URL.") }
-        let task = FetchTask(requestedURL: url, maxBytes: maxBytes, originIsLocal: isLocalHost(url.host))
+        let originIsLocal = isLocalHost(url.host)
+        // A public-looking name that points into this Mac or the local network was judged as
+        // a public page; refuse it rather than reach a local service unasked.
+        if !originIsLocal, let host = url.host, await resolvesToLocal(host) {
+            throw WebError.refused("\(host) points to an address on this Mac or your local network. Use that address itself (for example http://192.168.1.1/) so Glide can ask first, or open it in the browser.")
+        }
+        return try await perform(request, maxBytes: maxBytes, originIsLocal: originIsLocal, resolvesToLocal: { await resolvesToLocal($0) })
+    }
+
+    /// The fetch itself. `resolvesToLocal` is the redirect check's name lookup (tests pass a
+    /// stand-in so they never use DNS).
+    static func perform(_ request: URLRequest, maxBytes: Int, originIsLocal: Bool,
+                        resolvesToLocal: @escaping @Sendable (String) async -> Bool) async throws -> FetchedResource {
+        guard let url = request.url else { throw WebError.invalidURL("The request has no URL.") }
+        let task = FetchTask(requestedURL: url, maxBytes: maxBytes, originIsLocal: originIsLocal, resolvesToLocal: resolvesToLocal)
         let session = URLSession(configuration: configuration(), delegate: task, delegateQueue: nil)
         // The session holds its delegate strongly until invalidated.
         defer { session.finishTasksAndInvalidate() }
@@ -302,7 +399,17 @@ public enum WebFetcher {
 
 /// URLSession delegate for one capped request. All mutable state is guarded by `lock`, since
 /// URLSession calls back on its own queue while cancellation can arrive from any thread.
+///
+/// When the request started on the internet, nothing from this Mac or the local network is
+/// handed back: redirects there are refused (by address text and by looking the name up),
+/// and so is a response whose connection actually ended at a local address (a name that
+/// changed its answer between the look-up and the connection).
 final class FetchTask: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    static let localRedirect = "The page redirected to an address on this Mac or the local network, which Glide doesn't follow."
+    static let localPeer = "The page was served from an address on this Mac or the local network, which Glide doesn't read for an internet address."
+    /// How long a finished request waits for its connection details before it is handed back.
+    static let metricsWait: TimeInterval = 1
+
     private let lock = NSLock()
     private var continuation: CheckedContinuation<FetchedResource, Error>?
     private var buffer = Data()
@@ -310,14 +417,18 @@ final class FetchTask: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private var truncated = false
     private var redirects = 0
     private var refusal: WebError?
+    private var metricsSeen = false
+    private var pending: Result<FetchedResource, Error>?
     private let requestedURL: URL
     private let maxBytes: Int
     private let originIsLocal: Bool
+    private let resolvesToLocal: @Sendable (String) async -> Bool
 
-    init(requestedURL: URL, maxBytes: Int, originIsLocal: Bool) {
+    init(requestedURL: URL, maxBytes: Int, originIsLocal: Bool, resolvesToLocal: @escaping @Sendable (String) async -> Bool) {
         self.requestedURL = requestedURL
         self.maxBytes = maxBytes
         self.originIsLocal = originIsLocal
+        self.resolvesToLocal = resolvesToLocal
     }
 
     func start(_ task: URLSessionDataTask, _ cont: CheckedContinuation<FetchedResource, Error>) {
@@ -366,28 +477,67 @@ final class FetchTask: NSObject, URLSessionDataDelegate, @unchecked Sendable {
                 return nil
             }
             if !originIsLocal && WebFetcher.isLocalHost(url.host) {
-                refusal = .refused("The page redirected to an address on this Mac or the local network, which Glide doesn't follow.")
+                refusal = .refused(Self.localRedirect)
                 return nil
             }
             return request
         }
-        completionHandler(decision)
+        guard let next = decision, !originIsLocal, let host = next.url?.host else {
+            completionHandler(decision)
+            return
+        }
+        // A name can point anywhere (`127.0.0.1.nip.io`), so look it up before following.
+        let resolves = resolvesToLocal
+        Task {
+            if await resolves(host) {
+                self.lock.withLock { self.refusal = .refused(Self.localRedirect) }
+                completionHandler(nil)
+            } else {
+                completionHandler(next)
+            }
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        // Where the connections really went; a proxy's own address says nothing about the page.
+        let peers = metrics.transactionMetrics.filter { !$0.isProxyConnection }.compactMap(\.remoteAddress)
+        let ready = lock.withLock { () -> Result<FetchedResource, Error>? in
+            metricsSeen = true
+            if !originIsLocal, peers.contains(where: { WebFetcher.isLocalHost($0) }), refusal == nil { refusal = .refused(Self.localPeer) }
+            defer { pending = nil }
+            return pending
+        }
+        if let ready { finishChecked(ready) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        let (data, resp, cut, refused) = lock.withLock { (buffer, response, truncated, refusal) }
-        if let refused { finish(.failure(refused)); return }
-        if let error {
-            // Our own cancel after hitting the size cap is a success with a truncated body.
-            if cut, (error as? URLError)?.code == .cancelled {} else {
-                finish(.failure(error))
-                return
-            }
+        let (data, resp, cut) = lock.withLock { (buffer, response, truncated) }
+        let result: Result<FetchedResource, Error>
+        if let error, !(cut && (error as? URLError)?.code == .cancelled) {
+            // (Our own cancel after hitting the size cap is a success with a truncated body.)
+            result = .failure(error)
+        } else {
+            let http = resp ?? (task.response as? HTTPURLResponse)
+            let final = http?.url ?? task.currentRequest?.url ?? requestedURL
+            result = .success(FetchedResource(requestedURL: requestedURL, finalURL: final, status: http?.statusCode ?? 0,
+                                              mimeType: (http?.mimeType ?? "").lowercased(), textEncodingName: http?.textEncodingName,
+                                              data: data, truncated: cut))
         }
-        let http = resp ?? (task.response as? HTTPURLResponse)
-        let final = http?.url ?? task.currentRequest?.url ?? requestedURL
-        finish(.success(FetchedResource(requestedURL: requestedURL, finalURL: final, status: http?.statusCode ?? 0,
-                                        mimeType: (http?.mimeType ?? "").lowercased(), textEncodingName: http?.textEncodingName,
-                                        data: data, truncated: cut)))
+        // Metrics normally arrive first; when they don't, wait briefly so the peer check runs.
+        let waitForMetrics = lock.withLock { () -> Bool in
+            guard !originIsLocal, !metricsSeen else { return false }
+            pending = result
+            return true
+        }
+        guard waitForMetrics else { finishChecked(result); return }
+        DispatchQueue.global().asyncAfter(deadline: .now() + Self.metricsWait) { [self] in
+            let ready = lock.withLock { () -> Result<FetchedResource, Error>? in defer { pending = nil }; return pending }
+            if let ready { finishChecked(ready) }
+        }
+    }
+
+    /// Hands back `result` unless a redirect or the connection check refused the page.
+    private func finishChecked(_ result: Result<FetchedResource, Error>) {
+        if let refused = lock.withLock({ refusal }) { finish(.failure(refused)) } else { finish(result) }
     }
 }

