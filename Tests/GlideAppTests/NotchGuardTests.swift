@@ -14,6 +14,8 @@ import AutomationKit
 struct NotchFixture {
     let suite: String
     let store: SettingsStore
+    /// The quick task's own runtime (its gate); never the app's shared one.
+    let runtime: AutomationRuntime
     let controller: TaskController
     let jobs: PreviewJobs
     let model: NotchModel
@@ -29,7 +31,8 @@ struct NotchFixture {
         suite = "dev.glide.tests.notch.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
         store = SettingsStore(defaults: defaults)
-        controller = TaskController(runtime: AutomationRuntime(), settingsStore: store)
+        runtime = AutomationRuntime()
+        controller = TaskController(runtime: runtime, settingsStore: store)
         jobs = PreviewJobs()
         model = NotchModel(controller: controller, settings: store, jobs: jobs)
         let clock = Clock()
@@ -92,6 +95,29 @@ struct GlideNotchClickGuardTests {
         #expect(NotchClickGuard.isAgentEvent(NSEvent(cgEvent: tagged)))
         #expect(!NotchClickGuard.isAgentEvent(NSEvent(cgEvent: plain)))
         #expect(!NotchClickGuard.isAgentEvent(nil))
+    }
+
+    @Test func glideDropsTheAgentsClicksAndKeysButNotMoves() throws {
+        // Built in memory and never posted.
+        func event(_ e: CGEvent?, tag: Bool = true) throws -> NSEvent {
+            let e = try #require(e)
+            if tag { e.setIntegerValueField(.eventSourceUserData, value: InputSynthesizer.eventTag) }
+            return try #require(NSEvent(cgEvent: e))
+        }
+        func tagged(_ e: CGEvent?) throws -> NSEvent { try event(e) }
+        let down = try tagged(CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: .zero, mouseButton: .left))
+        let right = try tagged(CGEvent(mouseEventSource: nil, mouseType: .rightMouseDown, mouseCursorPosition: .zero, mouseButton: .right))
+        let key = try tagged(CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: true))
+        let scroll = try tagged(CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: -3, wheel2: 0, wheel3: 0))
+        let move = try tagged(CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: .zero, mouseButton: .left))
+        for e in [down, right, key, scroll] { #expect(NotchClickGuard.dropsAgentInput(e), "\(e.type)") }
+        #expect(!NotchClickGuard.dropsAgentInput(move))
+
+        // The user's own click and Return go through.
+        let userDown = try event(CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: .zero, mouseButton: .left), tag: false)
+        let userKey = try event(CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: true), tag: false)
+        #expect(!NotchClickGuard.dropsAgentInput(userDown))
+        #expect(!NotchClickGuard.dropsAgentInput(userKey))
     }
 
     @Test func pointerIntentIsRecorded() {
@@ -242,6 +268,55 @@ struct GlideNotchApprovalTests {
         f.model.userDecision { f.model.startJob("c") }
         #expect(f.jobs.job("c")?.status == .running)
     }
+
+    @Test func jobRowDecisionsIgnoreAgentClicks() throws {
+        // The job rows in the detail view and the pill: Start, Pause, Resume and Stop.
+        let f = try NotchFixture()
+        defer { f.cleanup() }
+        f.jobs.jobs = [f.job("c", .awaitingConfirmation), f.job("r", .running), f.job("p", .paused), f.job("s", .running)]
+        let actions: [() -> Void] = [{ f.jobs.start("c") }, { f.jobs.pause("r") }, { f.jobs.resume("p") }, { f.model.stopJob("s") }]
+        let before = f.jobs.jobs.map(\.status)
+
+        // The agent's own click, and the user's click while the agent's pointer is still busy.
+        f.model.currentEventIsAgent = { true }
+        for act in actions { f.model.userDecision(act) }
+        f.model.currentEventIsAgent = { false }
+        f.model.agentPointerIdleSeconds = { 0.3 }
+        for act in actions { f.model.userDecision(act) }
+        #expect(f.jobs.jobs.map(\.status) == before)
+
+        f.model.agentPointerIdleSeconds = { 4 }
+        for act in actions { f.model.userDecision(act) }
+        #expect(f.jobs.job("c")?.status == .running)
+        #expect(f.jobs.job("r")?.status == .paused)
+        #expect(f.jobs.job("p")?.status == .running)
+        #expect(f.jobs.job("s")?.status == .stopped)
+    }
+}
+
+@MainActor
+@Suite("Glide notch pause and resume")
+struct GlideNotchResumeTests {
+    @Test func resumeGetsTheNotchOutOfTheWayFirst() throws {
+        // Input the pause held goes out as soon as the gate opens, so the panel must be
+        // click-through before that, not after.
+        let f = try NotchFixture()
+        defer { f.cleanup() }
+        var gatePausedAtHook: [Bool] = []
+        f.model.agentWillResume = { gatePausedAtHook.append(f.runtime.gate.isPaused) }
+        f.runtime.gate.pause()
+        f.controller.previewState(phase: .paused, status: "Paused")
+        f.model.togglePause()
+        #expect(gatePausedAtHook == [true])
+        #expect(f.runtime.gate.current == .running)
+        #expect(f.controller.phase == .executing)
+
+        // Pausing releases nothing.
+        f.model.togglePause()
+        #expect(gatePausedAtHook == [true])
+        #expect(f.runtime.gate.isPaused)
+        #expect(f.controller.phase == .paused)
+    }
 }
 
 @MainActor
@@ -265,21 +340,75 @@ struct GlideNotchDismissTests {
         #expect(f.model.isShowing(job: "d"))
         let work = try #require(f.model.jobDismissWork)
 
-        // Covered by the task field when the timer fires: the card stays and re-arms later.
+        // Covered by the task field: the timer is dropped, so it can't fire while hidden.
         f.model.inputOpen = true
         f.model.recompute()
+        #expect(work.isCancelled)
+        #expect(f.model.jobDismissWork == nil)
         work.perform()
         #expect(f.model.attentionJobID == "d")
-        #expect(f.model.jobDismissWork == nil)
+
+        // Back on screen: a new timer with the full time.
         f.model.inputOpen = false
         f.model.recompute()
         #expect(f.model.presentation == .job)
         let again = try #require(f.model.jobDismissWork)
+        #expect(again !== work)
+        #expect(!again.isCancelled)
 
         // On screen when it fires: the card folds away.
         again.perform()
         #expect(f.model.attentionJobID == nil)
         #expect(f.model.presentation != .job)
+    }
+
+    @Test func cardCoveredByAnotherJobsApprovalComesBackWithTheFullTime() throws {
+        // A finished card is up, another job asks for an OK a second later, and the user takes
+        // a few seconds to answer. The old timer must not fold the card away just after it's back.
+        let f = try NotchFixture()
+        defer { f.cleanup() }
+        let done = f.job("d", .completed)
+        f.jobs.jobs = [done, f.job("b", .running)]
+        f.model.jobFinished(done)
+        #expect(f.model.presentation == .job)
+        let first = try #require(f.model.jobDismissWork)
+
+        f.now.advance(1)
+        f.jobs.pendingApprovals["b"] = NotchFixture.request("git push")
+        f.model.jobNeedsAttention("b")
+        // The approval covers the card, which keeps its place (b has no card of its own).
+        #expect(f.model.presentation == .approval)
+        #expect(f.model.activeApproval?.jobID == "b")
+        #expect(f.model.attentionJobID == "d")
+        #expect(f.model.isShowing(job: "b"))
+        #expect(first.isCancelled)
+        #expect(f.model.jobDismissWork == nil)
+
+        f.now.advance(4.5)
+        let shown = try #require(f.model.activeApproval)
+        #expect(f.model.respondToApproval(.approve, to: shown))
+        #expect(f.model.presentation == .job)
+        #expect(f.model.isShowing(job: "d"))
+        let second = try #require(f.model.jobDismissWork)
+        #expect(second !== first)
+        #expect(!second.isCancelled)
+        // The first timer's deadline passes: nothing happens to the card.
+        first.perform()
+        #expect(f.model.attentionJobID == "d")
+        #expect(f.model.presentation == .job)
+    }
+
+    @Test func aJobWithACardOfItsOwnStillTakesTheSlot() throws {
+        // Only a bare approval waits behind another job's card; a confirmation replaces it.
+        let f = try NotchFixture()
+        defer { f.cleanup() }
+        let done = f.job("d", .completed)
+        f.jobs.jobs = [done, f.job("c", .awaitingConfirmation)]
+        f.model.jobFinished(done)
+        f.model.jobNeedsAttention("c")
+        #expect(f.model.attentionJobID == "c")
+        #expect(f.model.presentation == .job)
+        #expect(f.model.jobDismissWork == nil)
     }
 
     @Test func quickTaskResultTimesOutOnlyOnceOnScreen() async throws {
@@ -300,7 +429,22 @@ struct GlideNotchDismissTests {
         f.model.dismissJobCard()
         #expect(f.model.presentation == .result)
         let work = try #require(f.model.dismissWork)
+
+        // Covered by the detail view, then back: the old timer is gone and a new one starts.
+        f.model.detailOpen = true
+        f.model.recompute()
+        #expect(f.model.presentation == .detail)
+        #expect(work.isCancelled)
+        #expect(f.model.dismissWork == nil)
+        f.model.detailOpen = false
+        f.model.recompute()
+        #expect(f.model.presentation == .result)
+        let again = try #require(f.model.dismissWork)
+        #expect(again !== work)
         work.perform()
+        #expect(f.model.resultVisible)
+
+        again.perform()
         #expect(!f.model.resultVisible)
     }
 

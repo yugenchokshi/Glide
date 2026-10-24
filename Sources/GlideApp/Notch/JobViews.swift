@@ -276,17 +276,21 @@ struct NotchJobRow: View {
         .bkIridescentRim(pill && job.status == .running, cornerRadius: 14)
     }
 
+    /// The row shows in the detail view and the pill, which take clicks while a quick task is
+    /// paused. Like the job card's buttons, these are the user's decisions (Start agrees to the
+    /// estimate, Resume can extend a budget), so an agent click never counts.
     @ViewBuilder var controls: some View {
         let jobs = model.jobs
+        let id = job.id
         if job.status == .awaitingConfirmation {
-            BKIconButton(systemName: "play.fill", help: "Start job") { jobs.start(job.id) }
+            BKIconButton(systemName: "play.fill", help: "Start job") { model.userDecision { jobs.start(id) } }
         } else if job.status.canPause {
-            BKIconButton(systemName: "pause.fill", help: "Pause job") { jobs.pause(job.id) }
+            BKIconButton(systemName: "pause.fill", help: "Pause job") { model.userDecision { jobs.pause(id) } }
         } else if job.canResume {
-            BKIconButton(systemName: "play.fill", help: job.status == .waiting ? "Run now" : "Resume job") { jobs.resume(job.id) }
+            BKIconButton(systemName: "play.fill", help: job.status == .waiting ? "Run now" : "Resume job") { model.userDecision { jobs.resume(id) } }
         }
         if !job.status.isFinished {
-            BKIconButton(systemName: "stop.fill", help: "Stop job", tone: .danger) { model.stopJob(job.id) }
+            BKIconButton(systemName: "stop.fill", help: "Stop job", tone: .danger) { model.userDecision { model.stopJob(id) } }
         }
         if pill {
             BKIconButton(systemName: "chevron.down", help: "Show background jobs") { model.showJobsDetail() }

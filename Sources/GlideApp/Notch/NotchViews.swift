@@ -240,7 +240,7 @@ struct NotchRunningView: View {
             if c.phase == .planning {
                 Button("Cancel") { c.stop() }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
             } else {
-                BKIconButton(systemName: c.phase == .paused ? "play.fill" : "pause.fill", help: c.phase == .paused ? "Resume" : "Pause") { c.togglePause() }
+                BKIconButton(systemName: c.phase == .paused ? "play.fill" : "pause.fill", help: c.phase == .paused ? "Resume" : "Pause") { model.togglePause() }
                 BKIconButton(systemName: "stop.fill", help: "Stop now", tone: .danger) { c.stop() }
             }
             BKIconButton(systemName: "chevron.down", help: "Show details") {
@@ -275,7 +275,7 @@ struct NotchDetailView: View {
                     .font(.system(size: 13, weight: .semibold)).foregroundStyle(BK.Notch.text).lineLimit(2)
                 Spacer()
                 if c.isRunning {
-                    BKIconButton(systemName: c.phase == .paused ? "play.fill" : "pause.fill", help: c.phase == .paused ? "Resume" : "Pause") { c.togglePause() }
+                    BKIconButton(systemName: c.phase == .paused ? "play.fill" : "pause.fill", help: c.phase == .paused ? "Resume" : "Pause") { model.togglePause() }
                     BKIconButton(systemName: "stop.fill", help: "Stop now", tone: .danger) { c.stop() }
                 }
                 BKIconButton(systemName: "chevron.up", help: "Collapse") {

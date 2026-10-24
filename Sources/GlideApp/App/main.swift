@@ -11,7 +11,8 @@ MainActor.assumeIsolated {
         SettingsSnapshotRenderer.run(into: CommandLine.arguments[i + 1])
         exit(0)
     }
-    let app = NSApplication.shared
+    // Created first, so `NSApp` is the subclass that drops the agent's own input.
+    let app = GlideApplication.shared
     let delegate = AppDelegate()
     app.delegate = delegate
     app.run()

@@ -23,6 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         notchModel.openJob = { [weak self] id in self?.showJob(id) }
         notch = NotchWindowController(model: notchModel)
         statusItem = StatusItemController(controller: controller, jobs: JobCenter.shared, onOpen: { [weak self] in self?.toggleNotch() },
+                                          onTogglePause: { [weak self] in self?.notchModel.togglePause() },
                                           onSettings: { [weak self] in self?.showSettings(nil) },
                                           onHistory: { [weak self] in self?.showSettings("history") },
                                           onJobs: { [weak self] in self?.showSettings("jobs") })
@@ -34,7 +35,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self else { return }
             switch action {
             case .open: self.toggleNotch()
-            case .pauseResume: self.controller.togglePause()
+            // Through the notch, which gets out of the way of input the pause held.
+            case .pauseResume: self.notchModel.togglePause()
             case .stop:
                 // The emergency stop halts everything: the quick task and every background job.
                 self.controller.stop()
@@ -246,15 +248,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     let controller: TaskController
     let jobs: JobCenter
     let onOpen: () -> Void
+    /// Pause / Resume goes through the notch (`NotchModel.togglePause`).
+    let onTogglePause: () -> Void
     let onSettings: () -> Void
     let onHistory: () -> Void
     let onJobs: () -> Void
 
-    init(controller: TaskController, jobs: JobCenter, onOpen: @escaping () -> Void, onSettings: @escaping () -> Void,
-         onHistory: @escaping () -> Void, onJobs: @escaping () -> Void) {
+    init(controller: TaskController, jobs: JobCenter, onOpen: @escaping () -> Void, onTogglePause: @escaping () -> Void,
+         onSettings: @escaping () -> Void, onHistory: @escaping () -> Void, onJobs: @escaping () -> Void) {
         self.controller = controller
         self.jobs = jobs
         self.onOpen = onOpen
+        self.onTogglePause = onTogglePause
         self.onSettings = onSettings
         self.onHistory = onHistory
         self.onJobs = onJobs
@@ -301,7 +306,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     @objc func open() { onOpen() }
-    @objc func togglePause() { controller.togglePause() }
+    @objc func togglePause() { onTogglePause() }
     @objc func stop() { controller.stop() }
     @objc func settings() { onSettings() }
     @objc func history() { onHistory() }
