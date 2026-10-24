@@ -62,6 +62,9 @@ public struct TaskResult: Sendable {
     public var plan: Plan?
     public var metrics: TaskMetrics.Snapshot
     public var durationMs: Double
+    /// Set when the quick task handed its request to the job engine (plan mode `job`): the
+    /// background job that now does the work.
+    public var jobID: String? = nil
 }
 
 /// Callbacks from the orchestrator to whoever runs it (the notch UI or glidectl).

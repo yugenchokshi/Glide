@@ -8,6 +8,9 @@ import Network
 //                                agent loop (plan → act → verify) runs against real UI
 //                                without a paid model. It reads the same compact UI list a
 //                                real model gets and answers by matching labels.
+//                                Requests mentioning "tool-route" get a command-route plan
+//                                whose tool executor returns a `shell.run` batch; requests
+//                                mentioning "background-job" get a plan in job mode.
 
 setvbuf(stdout, nil, _IOLBF, 0)
 let args = Array(CommandLine.arguments.dropFirst())
@@ -67,10 +70,53 @@ struct ScriptedModel {
         return nil
     }
 
+    /// Tool-route scenario: one command step that the tool executor completes with a batch of
+    /// two `shell.run` calls, then reports done once both results are back.
+    static var toolRoutePlan: [String: Any] { [
+        "goal": "Run two shell commands", "mode": "quick", "clarification": NSNull(),
+        "steps": [
+            ["title": "Running the commands", "instruction": "Run `echo hello` and `echo world` with shell.run.", "route": "command", "app": NSNull(),
+             "risk": "low", "done_when": "Both commands printed their output", "hint_action": "none", "hint_target": NSNull(), "hint_text": NSNull()],
+        ],
+    ] }
+
+    /// Job scenario: a long, repetitive request the planner sends to the job engine.
+    static var jobPlan: [String: Any] { [
+        "goal": "Research every company in the sheet", "mode": "job", "clarification": NSNull(),
+        "steps": [
+            ["title": "Researching companies", "instruction": "Look up each company in the sheet on the web.", "route": "web", "app": NSNull(),
+             "risk": "low", "done_when": "Every company has a summary", "hint_action": "none", "hint_target": NSNull(), "hint_text": NSNull()],
+        ],
+    ] }
+
+    static func toolStep(user: String) -> [String: Any] {
+        var d: [String: Any] = ["thought": "", "status": "act", "calls": [Any](), "result_fields_json": NSNull(), "message": NSNull(), "remember": NSNull()]
+        let results = user.components(separatedBy: "Recent results:").last ?? ""
+        if results.contains("(none yet)") {
+            d["thought"] = "Run both commands in one batch."
+            d["calls"] = [
+                ["tool": "shell.run", "arguments_json": json(["command": "echo hello"])],
+                ["tool": "shell.run", "arguments_json": json(["command": "echo world"])],
+            ]
+        } else if results.contains("→ ok"), results.contains("hello"), results.contains("world") {
+            d["status"] = "task_done"
+            d["message"] = "Both commands ran: hello world"
+        } else {
+            d["status"] = "blocked"
+            d["message"] = "The commands didn't print what I expected."
+        }
+        return d
+    }
+
     static func reply(system: String, user: String) -> [String: Any] {
+        if system.contains("You are the tool executor") {
+            return toolStep(user: user)
+        }
         if system.contains("You are the planner") || system.contains("recovery planner") {
+            if user.contains("tool-route") { return toolRoutePlan }
+            if user.contains("background-job") { return jobPlan }
             return [
-                "goal": "Greet Ada in the NB Fixture app", "clarification": NSNull(),
+                "goal": "Greet Ada in the NB Fixture app", "mode": "quick", "clarification": NSNull(),
                 "steps": [
                     ["title": "Opening NB Fixture", "instruction": "Bring the NBFixtureApp window to the front.", "route": "native", "app": "NBFixtureApp",
                      "risk": "low", "done_when": "NB Fixture is frontmost", "hint_action": "activate_app", "hint_target": "NBFixtureApp", "hint_text": NSNull()],

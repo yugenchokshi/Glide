@@ -29,15 +29,20 @@ public final class TaskController {
 
     let runtime: AutomationRuntime
     let settingsStore: SettingsStore
+    /// Receives requests the planner marks as long-running jobs. Resolved only when a job is
+    /// handed off (nil = `JobCenter.shared`), so creating a controller doesn't start the job engine.
+    private let jobCenterOverride: JobCenter?
+    private var jobCenter: JobCenter { jobCenterOverride ?? .shared }
     private var task: Task<Void, Never>?
     private var runTask: Task<TaskResult, Never>?
     private var orchestrator: ExecutionOrchestrator?
     private var approvalContinuation: CheckedContinuation<ApprovalDecision, Never>?
     private var runID = 0
 
-    public init(runtime: AutomationRuntime = .shared, settingsStore: SettingsStore = .shared) {
+    public init(runtime: AutomationRuntime = .shared, settingsStore: SettingsStore = .shared, jobCenter: JobCenter? = nil) {
         self.runtime = runtime
         self.settingsStore = settingsStore
+        self.jobCenterOverride = jobCenter
     }
 
     public var isConfigured: Bool { ModelRouter(settings: settingsStore.settings).isConfigured }
@@ -81,6 +86,12 @@ public final class TaskController {
                 guard let self else { return .stop }
                 return await self.requestApproval(req, run: id)
             })
+        // Long or repetitive requests (plan mode `job`) become background jobs; this quick task
+        // then finishes with a short "Started a background job" summary and the job's id.
+        let handoff: ExecutionOrchestrator.JobHandoff = { [weak self] instruction, _ in
+            guard let self else { return nil }
+            return await self.startBackgroundJob(instruction, run: id)
+        }
         task = Task { [weak self] in
             var composio: (ComposioClient, String)?
             if settings.composio.enabled {
@@ -91,7 +102,7 @@ public final class TaskController {
                 return
             }
             let orchestrator = ExecutionOrchestrator(instruction: trimmed, settings: SettingsStore.shared.settings, runtime: self.runtime,
-                                                     callbacks: callbacks, composio: composio)
+                                                     callbacks: callbacks, composio: composio, jobHandoff: handoff)
             self.orchestrator = orchestrator
             self.lastTaskID = orchestrator.taskID
             let run = Task.detached(priority: .userInitiated) { await orchestrator.run() }
@@ -102,6 +113,20 @@ public final class TaskController {
             self.orchestrator = nil
             self.finish(result, run: id)
         }
+    }
+
+    /// Plans the request as a background job. Nil when this run was stopped or replaced while
+    /// planning, so nothing is started on its behalf.
+    private func startBackgroundJob(_ instruction: String, run: Int) async -> JobRecord? {
+        guard run == runID, !runtime.gate.isStopped else { return nil }
+        status = "Setting up a background job…"
+        let job = await jobCenter.create(instruction: instruction)
+        // A stop pressed while the job was being planned also stops the new job.
+        if run != runID || runtime.gate.isStopped {
+            if !job.status.isFinished { jobCenter.stop(job.id) }
+            return nil
+        }
+        return job
     }
 
     private func update(phase p: AgentPhase, status s: String, run: Int) {
