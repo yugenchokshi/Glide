@@ -61,6 +61,9 @@ public final class TaskController {
         self.credentials = credentials
     }
 
+    /// True while this run holds the screen lease, so the shared input gate is its own.
+    public var holdsScreen: Bool { holdsLease }
+
     /// Paused as far as this run is concerned: the gate once this run holds the lease, the
     /// pending pause before that.
     private var isPaused: Bool { holdsLease ? runtime.gate.isPaused : pendingPause }
@@ -313,7 +316,8 @@ public final class TaskController {
 
     /// Sets display state directly. Used only by the UI snapshot renderer (`--snapshot`).
     public func previewState(phase: AgentPhase, status: String, instruction: String = "", plan: Plan? = nil, stepIndex: Int = 0,
-                             activity: [ActivityEntry] = [], approval: ApprovalRequest? = nil) {
+                             activity: [ActivityEntry] = [], approval: ApprovalRequest? = nil, holdsScreen: Bool = false) {
+        self.holdsLease = holdsScreen
         self.phase = phase
         self.status = status
         self.instruction = instruction

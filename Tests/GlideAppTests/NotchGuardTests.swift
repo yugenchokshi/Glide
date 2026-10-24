@@ -305,7 +305,8 @@ struct GlideNotchResumeTests {
         var gatePausedAtHook: [Bool] = []
         f.model.agentWillResume = { gatePausedAtHook.append(f.runtime.gate.isPaused) }
         f.runtime.gate.pause()
-        f.controller.previewState(phase: .paused, status: "Paused")
+        // A task paused mid-run holds the screen, so its pause is the shared gate's.
+        f.controller.previewState(phase: .paused, status: "Paused", holdsScreen: true)
         f.model.togglePause()
         #expect(gatePausedAtHook == [true])
         #expect(f.runtime.gate.current == .running)
