@@ -52,12 +52,16 @@ public enum BrowserError: Error, LocalizedError, Sendable, Equatable {
     case restrictedPage(String)
     case elementNotFound(String)
     case chromeNotInstalled
+    /// The page shows a dialog that's the user's to answer (see `BrowserDialogPolicy`). It's
+    /// frozen until they do, so the driver stops waiting at once and says so.
+    case dialogOpen(String)
 
     public var errorDescription: String? {
         switch self {
         case .notConnected(let m): return m
         case .tabNotFound(let t): return "The browser tab \(t) is gone."
         case .cdp(let m): return "Browser error: \(m)"
+        case .dialogOpen(let m): return m
         case .timeout(let m): return "The page took too long: \(m)"
         case .restrictedPage(let u): return "Chrome doesn't allow automating \(u)."
         case .elementNotFound(let r): return "Element \(r) isn't on the page anymore. Take a new snapshot."

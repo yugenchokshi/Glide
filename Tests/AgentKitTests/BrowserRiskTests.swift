@@ -27,6 +27,17 @@ struct BrowserPressRiskTests {
         #expect(BrowserRisk.press(keys: "x", page: page(focused: masked)).blocked != nil)
     }
 
+    /// This check judges the snapshot's focus and the driver's (`BrowserKeys.insertsText`) the
+    /// focus right before each key, so every key the driver treats as entering text must be
+    /// refused here too. Shift+Insert pastes in Chrome on macOS; both count it with any other
+    /// modifier held as well.
+    @Test func refusesEveryKeyTheDriverChecksBeforeTyping() throws {
+        for keys in ["a", "Shift+A", "Space", "plus", "Meta+V", "Meta+Shift+V", "Shift+Insert", "Control+Shift+Insert", "Meta+Shift+Insert"] {
+            #expect(BrowserKeys.insertsText(try BrowserKeys.parse(keys)), "\(keys)")
+            #expect(BrowserRisk.press(keys: keys, page: page(focused: password)).blocked != nil, "\(keys) should be refused")
+        }
+    }
+
     @Test func navigationKeysStillWorkInAPasswordField() {
         for keys in ["Tab", "Shift+Tab", "Escape", "ArrowDown", "Backspace", "Meta+A", "Enter"] {
             #expect(BrowserRisk.press(keys: keys, page: page(focused: password)).blocked == nil, "\(keys) should be allowed")

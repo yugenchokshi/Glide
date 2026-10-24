@@ -834,9 +834,11 @@ public final class BrowserDriver: Sendable {
         }
     }
 
+    /// Errors that polling again can't fix, so waits stop at once: the tab or connection is
+    /// gone, or the page is frozen until the user answers its dialog.
     static func isFatal(_ e: BrowserError) -> Bool {
         switch e {
-        case .tabNotFound, .notConnected, .restrictedPage, .chromeNotInstalled: return true
+        case .tabNotFound, .notConnected, .restrictedPage, .chromeNotInstalled, .dialogOpen: return true
         default: return false
         }
     }
@@ -1044,9 +1046,16 @@ enum BrowserKeys {
 
     /// Whether the strokes put text into the focused element: a printable character, or paste.
     /// Enter, Tab and plain navigation keys don't, so a login form can still be submitted.
+    ///
+    /// Paste is Meta+V (sent with the `paste` command) and Shift+Insert, which is Blink's own
+    /// Paste key binding and works in Chrome on macOS even without a command. Any Insert with
+    /// Shift held counts, as in `BrowserRisk.press`. Nothing else Glide sends pastes: Control+V,
+    /// Control+Y (yank) and the other Cocoa bindings only work through commands, and Glide sends
+    /// none that insert text.
     static func insertsText(_ strokes: [Stroke]) -> Bool {
         strokes.contains { s in
             if s.commands.contains("paste") { return true }
+            if s.key == "Insert", s.modifiers & 8 != 0 { return true }
             guard let text = s.text else { return false }
             return text.unicodeScalars.contains { !CharacterSet.controlCharacters.contains($0) }
         }

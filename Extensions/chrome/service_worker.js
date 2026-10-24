@@ -58,6 +58,8 @@ const idleTimers = new Map(); // tab id → timer that detaches a tab Glide didn
 const openDialogs = new Map(); // tab id → dialog the page shows that's left for the user
 const navigationWatchers = new Set(); // see watchNavigation
 const popupSources = new Map(); // tab id → the tab whose page opened it
+let glideTabIds = null; // Set of the tabs Glide opened, once read from storage (see loadGlideTabs)
+let glideTabsLoading = null; // that read, while it's in flight
 
 // ---- Event listeners (registered synchronously, as MV3 requires) ----
 
@@ -414,6 +416,10 @@ async function updateTab(params) {
   if (params.active === true) props.active = true;
   let updated = tab;
   const watcher = props.url && props.url !== "about:blank" ? watchNavigation(tab.url || "") : null;
+  // Loading an address is one of Glide's actions, like Page.navigate in Glide's own Chrome: a
+  // "Leave site?" it brings up is Glide's doing and is answered, not left for the user.
+  const navigating = !!props.url;
+  if (navigating) beginCommand(tabId, true);
   try {
     if (watcher) await watcher.track(tabId);
     if (Object.keys(props).length > 0) updated = (await chrome.tabs.update(tabId, props)) || tab;
@@ -423,6 +429,7 @@ async function updateTab(params) {
     }
   } finally {
     if (watcher) watcher.finish();
+    if (navigating) endCommand(tabId, true);
   }
   if (params.active === true) await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
   return tabInfo(updated, await loadGlideTabs());
@@ -622,14 +629,22 @@ function scheduleIdleDetach(tabId) {
   idleTimers.set(tabId, timer);
 }
 
-/** Lets go of a tab Glide didn't open once Glide has stopped using it. Glide's own tabs stay
- * attached: their dialogs are answered for Glide, and Glide closes them when it's done. */
+/**
+ * Lets go of a tab Glide didn't open once Glide has stopped using it. Glide's own tabs stay
+ * attached: their dialogs are answered for Glide, and Glide closes them when it's done.
+ *
+ * A tab whose page shows a dialog left for the user stays attached until they answer it: only
+ * this session hears Page.javascriptDialogClosed, and Chrome doesn't tell a new session about a
+ * dialog that's already open. Re-attached, Glide's commands would hang on the frozen page
+ * instead of failing at once with "Answer it in Chrome".
+ */
 async function detachIfIdle(tabId) {
   if (!attached.has(tabId)) return;
   if ((await loadGlideTabs()).has(tabId)) return;
   if (!attached.has(tabId)) return; // detached while reading storage
-  if (isDriving(tabId)) {
-    // Still in use (or only just): look again later. A new command cancels this anyway.
+  if (isDriving(tabId) || openDialogs.has(tabId)) {
+    // Still in use (or only just), or the user's dialog is open: look again later. A new
+    // command cancels this anyway.
     if (!idleTimers.has(tabId)) scheduleIdleDetach(tabId);
     return;
   }
@@ -844,20 +859,48 @@ async function getSessionValue(key) {
   }
 }
 
-async function loadGlideTabs() {
-  const ids = await getSessionValue(G.SESSION_KEYS.glideTabs);
-  return new Set(Array.isArray(ids) ? ids : []);
+/**
+ * The tabs Glide opened, as one Set that every check reads and every change goes to: separate
+ * read-modify-write cycles on storage lost ids when two overlapped (two tabs opened at once, one
+ * closing meanwhile), and a lost Glide tab is treated as the user's. It's read from
+ * storage.session once per worker start (callers share that read) and written back in full after
+ * each change; storage applies writes in order, so the last one holds the latest list. Callers
+ * only read the Set.
+ */
+function loadGlideTabs() {
+  if (glideTabIds) return Promise.resolve(glideTabIds);
+  if (!glideTabsLoading) {
+    glideTabsLoading = getSessionValue(G.SESSION_KEYS.glideTabs).then((ids) => {
+      glideTabIds = new Set(Array.isArray(ids) ? ids.filter((id) => Number.isInteger(id)) : []);
+      return glideTabIds;
+    });
+  }
+  return glideTabsLoading;
 }
 
 async function rememberGlideTab(tabId) {
-  const ids = [...(await loadGlideTabs()), tabId].slice(-MAX_GLIDE_TABS);
-  await chrome.storage.session.set({ [G.SESSION_KEYS.glideTabs]: ids });
+  const ids = await loadGlideTabs();
+  ids.delete(tabId); // added again at the end, so the cap drops the oldest
+  ids.add(tabId);
+  for (const oldest of ids) {
+    if (ids.size <= MAX_GLIDE_TABS) break;
+    ids.delete(oldest);
+  }
+  await saveGlideTabs(ids);
 }
 
 async function forgetGlideTab(tabId) {
   const ids = await loadGlideTabs();
   if (!ids.delete(tabId)) return;
-  await chrome.storage.session.set({ [G.SESSION_KEYS.glideTabs]: [...ids] });
+  await saveGlideTabs(ids);
+}
+
+async function saveGlideTabs(ids) {
+  try {
+    await chrome.storage.session.set({ [G.SESSION_KEYS.glideTabs]: [...ids] });
+  } catch (e) {
+    // Storage is unavailable while Chrome shuts down; the Set still has the change.
+  }
 }
 
 function tabInfo(tab, glideTabs) {

@@ -308,12 +308,15 @@ struct BrowserClickTool: AgentTool {
             let before = Set((try? await env.driver.tabs())?.map(\.id) ?? [])
             let outcome = try await env.driver.click(tabID: tab, ref: ref)
             let lead = "Clicked \(ref) \(element.role)\(element.name.isEmpty ? "" : " “\(clip(element.name, 60))”")."
-            // A link with target=_blank or a script popup opens a new tab: continue there.
+            // A link with target=_blank or a script popup opens a new tab: continue there. It's
+            // Glide's only when the backend says so (it came from one of Glide's own tabs); one
+            // from the user's tab is theirs, so it's never closed behind their back and closing
+            // it needs their approval.
             var notes = outcome.notes
             if !before.isEmpty, let tabs = try? await env.driver.tabs() {
                 let isTracked = { (id: String) in env.sessions.isTracked(backend: env.kind, tabID: id) }
                 if let popup = Self.popup(openedFrom: tab, before: before, after: tabs, isTracked: isTracked) {
-                    let victims = env.sessions.adopt(key: env.key, backend: env.kind, tabID: popup.id, jobID: env.jobID, openedByGlide: true)
+                    let victims = env.sessions.adopt(key: env.key, backend: env.kind, tabID: popup.id, jobID: env.jobID, openedByGlide: popup.ownedByGlide)
                     for v in victims { try? await env.driver.closeTab(v.tabID); env.sessions.forgetTab(backend: env.kind, tabID: v.tabID) }
                     _ = try? await env.driver.waitForSettle(tabID: popup.id)
                     return try await env.pageOutput(tab: popup.id, lead: lead, notes: notes + ["The click opened a new tab (\(popup.id)); now working there. The previous tab is \(tab)."],
