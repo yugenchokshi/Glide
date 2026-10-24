@@ -23,6 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         notchModel.openJob = { [weak self] id in self?.showJob(id) }
         notch = NotchWindowController(model: notchModel)
         statusItem = StatusItemController(controller: controller, jobs: JobCenter.shared, onOpen: { [weak self] in self?.toggleNotch() },
+                                          onTogglePause: { [weak self] in self?.notchModel.togglePause() },
                                           onSettings: { [weak self] in self?.showSettings(nil) },
                                           onHistory: { [weak self] in self?.showSettings("history") },
                                           onJobs: { [weak self] in self?.showSettings("jobs") })
@@ -34,7 +35,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self else { return }
             switch action {
             case .open: self.toggleNotch()
-            case .pauseResume: self.controller.togglePause()
+            // Through the notch, which gets out of the way of input the pause held.
+            case .pauseResume: self.notchModel.togglePause()
             case .stop:
                 // The emergency stop halts everything: the quick task and every background job.
                 self.controller.stop()
@@ -101,12 +103,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     /// Shows a job event in the notch, and also as a notification if the notch was collapsed
-    /// when it happened (you're probably looking elsewhere).
+    /// when it happened (you're probably looking elsewhere), or if the notch is busy with
+    /// something else and doesn't show this job (a running task, the task field, another
+    /// job's card): its card then waits its turn, and the notification says it's there.
     private func announce(_ job: JobRecord, show: () -> Void) {
-        let wasExpanded = notchModel.isExpanded
         guard notchModel.shouldAnnounce(job) else { return }
+        let wasExpanded = notchModel.isExpanded
         show()
-        if !wasExpanded && store.settings.jobs.notifications {
+        if (!wasExpanded || !notchModel.isShowing(job: job.id)) && store.settings.jobs.notifications {
             JobNotifier.shared.notify(job, approval: JobCenter.shared.pendingApprovals[job.id])
         }
     }
@@ -244,15 +248,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     let controller: TaskController
     let jobs: JobCenter
     let onOpen: () -> Void
+    /// Pause / Resume goes through the notch (`NotchModel.togglePause`).
+    let onTogglePause: () -> Void
     let onSettings: () -> Void
     let onHistory: () -> Void
     let onJobs: () -> Void
 
-    init(controller: TaskController, jobs: JobCenter, onOpen: @escaping () -> Void, onSettings: @escaping () -> Void,
-         onHistory: @escaping () -> Void, onJobs: @escaping () -> Void) {
+    init(controller: TaskController, jobs: JobCenter, onOpen: @escaping () -> Void, onTogglePause: @escaping () -> Void,
+         onSettings: @escaping () -> Void, onHistory: @escaping () -> Void, onJobs: @escaping () -> Void) {
         self.controller = controller
         self.jobs = jobs
         self.onOpen = onOpen
+        self.onTogglePause = onTogglePause
         self.onSettings = onSettings
         self.onHistory = onHistory
         self.onJobs = onJobs
@@ -299,7 +306,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     @objc func open() { onOpen() }
-    @objc func togglePause() { controller.togglePause() }
+    @objc func togglePause() { onTogglePause() }
     @objc func stop() { controller.stop() }
     @objc func settings() { onSettings() }
     @objc func history() { onHistory() }

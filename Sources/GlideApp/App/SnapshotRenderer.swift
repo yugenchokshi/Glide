@@ -90,7 +90,14 @@ enum SnapshotRenderer {
             model.dismissJobCard()
             jobs.pendingApprovals = [demo.research.id: demo.approval]
         }
+        shot("job-approval-waiting") {
+            // The quick task holds the screen, so the job's approval waits behind its running pill.
+            controller.previewState(phase: .executing, status: "Clicking “New Note”", instruction: instruction, plan: plan, stepIndex: 2, activity: activity)
+            model.screenHolder = "task:1"
+        }
         shot("job-finished") {
+            controller.previewState(phase: .idle, status: "")
+            model.screenHolder = nil
             jobs.pendingApprovals = [:]
             jobs.jobs = [demo.finished]
             model.jobFinished(demo.finished)

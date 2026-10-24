@@ -95,8 +95,9 @@ extension JobStatus {
         }
     }
 
-    /// The job can be paused right now.
-    var canPause: Bool { self == .running || self == .planning }
+    /// The job can be paused right now. Only a running job: a planning job has no runner yet,
+    /// so `JobCenter.pause` has nothing to pause.
+    var canPause: Bool { self == .running }
 }
 
 extension JobRecord {
@@ -120,6 +121,14 @@ extension JobRecord {
     var canRetryFailed: Bool {
         usage.itemsFailed > 0 && (status.isFinished || status == .paused || status == .needsInput)
     }
+
+    /// Waiting for a free slot (Settings › Jobs limits how many run at once), not for a time.
+    /// JobCenter starts it by itself when another job finishes.
+    var isQueued: Bool { status == .waiting && nextWakeAt == nil }
+
+    /// "Resume" / "Run now" does something. A queued job can't jump the queue (`JobCenter.resume`
+    /// ignores it), so it offers neither.
+    var canResume: Bool { status.isResumable && !isQueued }
 }
 
 enum JobFormat {
@@ -223,7 +232,7 @@ struct NotchJobWing: View {
                     .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundStyle(BK.Notch.secondary)
                     .contentTransition(.numericText())
             }
-            BKJobRing(fraction: job.progressFraction, size: 14, lineWidth: 2, trackColor: BK.Palette.n800, dimmed: !job.status.canPause)
+            BKJobRing(fraction: job.progressFraction, size: 14, lineWidth: 2, trackColor: BK.Palette.n800, dimmed: !job.status.isActive)
         }
         .help(job.displayLine)
     }
@@ -242,7 +251,7 @@ struct NotchJobRow: View {
     var body: some View {
         HStack(spacing: 10) {
             BKJobRing(fraction: job.progressFraction, size: pill ? 20 : 16, lineWidth: pill ? 2.4 : 2, trackColor: BK.Palette.n800,
-                      dimmed: !job.status.canPause)
+                      dimmed: !job.status.isActive)
             VStack(alignment: .leading, spacing: 1) {
                 Text(job.title).font(.system(size: 12, weight: .semibold)).foregroundStyle(BK.Notch.text).lineLimit(1)
                 Text(job.displayLine).font(.system(size: 11.5)).foregroundStyle(BK.Notch.secondary).lineLimit(1)
@@ -267,17 +276,21 @@ struct NotchJobRow: View {
         .bkIridescentRim(pill && job.status == .running, cornerRadius: 14)
     }
 
+    /// The row shows in the detail view and the pill, which take clicks while a quick task is
+    /// paused. Like the job card's buttons, these are the user's decisions (Start agrees to the
+    /// estimate, Resume can extend a budget), so an agent click never counts.
     @ViewBuilder var controls: some View {
         let jobs = model.jobs
+        let id = job.id
         if job.status == .awaitingConfirmation {
-            BKIconButton(systemName: "play.fill", help: "Start job") { jobs.start(job.id) }
+            BKIconButton(systemName: "play.fill", help: "Start job") { model.userDecision { jobs.start(id) } }
         } else if job.status.canPause {
-            BKIconButton(systemName: "pause.fill", help: "Pause job") { jobs.pause(job.id) }
-        } else if job.status.isResumable {
-            BKIconButton(systemName: "play.fill", help: job.status == .waiting ? "Run now" : "Resume job") { jobs.resume(job.id) }
+            BKIconButton(systemName: "pause.fill", help: "Pause job") { model.userDecision { jobs.pause(id) } }
+        } else if job.canResume {
+            BKIconButton(systemName: "play.fill", help: job.status == .waiting ? "Run now" : "Resume job") { model.userDecision { jobs.resume(id) } }
         }
         if !job.status.isFinished {
-            BKIconButton(systemName: "stop.fill", help: "Stop job", tone: .danger) { model.stopJob(job.id) }
+            BKIconButton(systemName: "stop.fill", help: "Stop job", tone: .danger) { model.userDecision { model.stopJob(id) } }
         }
         if pill {
             BKIconButton(systemName: "chevron.down", help: "Show background jobs") { model.showJobsDetail() }
@@ -333,7 +346,12 @@ struct NotchJobCard: View {
 
     var body: some View {
         if let job = model.attentionJob {
-            if job.status == .awaitingConfirmation { confirmation(job) } else { result(job) }
+            Group {
+                if job.status == .awaitingConfirmation { confirmation(job) } else { result(job) }
+            }
+            // Another job's card (or this job in a new state) gets new buttons: a press that
+            // began on the previous card is dropped instead of finishing on this one.
+            .id("\(job.id)/\(job.status.rawValue)")
         }
     }
 
@@ -364,8 +382,9 @@ struct NotchJobCard: View {
             HStack {
                 Button("Review in Settings") { model.openJob(job.id) }.buttonStyle(BKButtonStyle(kind: .ghost, compact: true, onDark: true))
                 Spacer()
-                Button("Cancel") { model.cancelJob(job.id) }.buttonStyle(BKButtonStyle(kind: .secondary, onDark: true))
-                Button("Start") { model.startJob(job.id) }.buttonStyle(BKButtonStyle(kind: .primary))
+                // Starting a job is the user's consent to its estimate: never the agent's click.
+                Button("Cancel") { model.userDecision { model.cancelJob(job.id) } }.buttonStyle(BKButtonStyle(kind: .secondary, onDark: true))
+                Button("Start") { model.userDecision { model.startJob(job.id) } }.buttonStyle(BKButtonStyle(kind: .primary))
             }
         }
         .padding(.top, 8)
@@ -386,11 +405,12 @@ struct NotchJobCard: View {
                     .buttonStyle(BKButtonStyle(kind: .ghost, compact: true, onDark: true))
                 Spacer()
                 if job.canRetryFailed {
-                    Button("Retry failed") { model.dismissJobCard(); model.jobs.retryFailedItems(job.id) }
+                    Button("Retry failed") { model.userDecision { model.dismissJobCard(); model.jobs.retryFailedItems(job.id) } }
                         .buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
                 }
                 if job.status.isResumable && job.status != .waiting {
-                    Button("Resume") { model.dismissJobCard(); model.jobs.resume(job.id) }
+                    // Resuming can also extend a budget the job ran out of.
+                    Button("Resume") { model.userDecision { model.dismissJobCard(); model.jobs.resume(job.id) } }
                         .buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
                 }
                 Button("Close") { model.dismissJobCard() }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))

@@ -231,10 +231,16 @@ struct NotchRunningView: View {
                     .animation(.easeInOut(duration: 0.2), value: c.status)
             }
             Spacer(minLength: 6)
+            if model.jobApprovalWaiting {
+                // Held back while this task clicks on screen; the card shows when the task is done.
+                Image(systemName: "hand.raised.fill").font(.system(size: 11, weight: .semibold)).foregroundStyle(BK.Tone.warning.color)
+                    .help("A background job is waiting for your OK. It shows when this task is done.")
+                    .accessibilityLabel("A background job is waiting for your OK")
+            }
             if c.phase == .planning {
                 Button("Cancel") { c.stop() }.buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
             } else {
-                BKIconButton(systemName: c.phase == .paused ? "play.fill" : "pause.fill", help: c.phase == .paused ? "Resume" : "Pause") { c.togglePause() }
+                BKIconButton(systemName: c.phase == .paused ? "play.fill" : "pause.fill", help: c.phase == .paused ? "Resume" : "Pause") { model.togglePause() }
                 BKIconButton(systemName: "stop.fill", help: "Stop now", tone: .danger) { c.stop() }
             }
             BKIconButton(systemName: "chevron.down", help: "Show details") {
@@ -269,7 +275,7 @@ struct NotchDetailView: View {
                     .font(.system(size: 13, weight: .semibold)).foregroundStyle(BK.Notch.text).lineLimit(2)
                 Spacer()
                 if c.isRunning {
-                    BKIconButton(systemName: c.phase == .paused ? "play.fill" : "pause.fill", help: c.phase == .paused ? "Resume" : "Pause") { c.togglePause() }
+                    BKIconButton(systemName: c.phase == .paused ? "play.fill" : "pause.fill", help: c.phase == .paused ? "Resume" : "Pause") { model.togglePause() }
                     BKIconButton(systemName: "stop.fill", help: "Stop now", tone: .danger) { c.stop() }
                 }
                 BKIconButton(systemName: "chevron.up", help: "Collapse") {
@@ -375,15 +381,19 @@ struct NotchApprovalView: View {
                     ForEach(req.reasons.prefix(job == nil ? 3 : 2), id: \.self) { BKBadge(text: Self.short($0), tone: .warning) }
                 }
                 Text(req.detail).font(.system(size: 11.5)).foregroundStyle(BK.Notch.secondary).lineLimit(3)
+                // Each button answers the request it was drawn for (see `respondToApproval`).
                 HStack {
-                    Button(approval.jobID == nil ? "Stop task" : "Stop job") { model.respondToApproval(.stop) }
+                    Button(approval.jobID == nil ? "Stop task" : "Stop job") { model.respondToApproval(.stop, to: approval) }
                         .buttonStyle(BKButtonStyle(kind: .ghost, compact: true, onDark: true))
                     Spacer()
-                    Button("Reject") { model.respondToApproval(.reject) }.buttonStyle(BKButtonStyle(kind: .secondary, compact: false, onDark: true))
-                    Button("Approve") { model.respondToApproval(.approve) }.buttonStyle(BKButtonStyle(kind: .primary))
+                    Button("Reject") { model.respondToApproval(.reject, to: approval) }.buttonStyle(BKButtonStyle(kind: .secondary, compact: false, onDark: true))
+                    Button("Approve") { model.respondToApproval(.approve, to: approval) }.buttonStyle(BKButtonStyle(kind: .primary))
                 }
             }
             .padding(.top, 8)
+            // A new request gets new buttons: a press that began on the previous card is dropped
+            // instead of finishing on this one.
+            .id(req.id)
         }
     }
 

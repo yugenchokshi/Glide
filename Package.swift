@@ -43,6 +43,8 @@ let package = Package(
         .executableTarget(name: "NBMockServers"),
         .testTarget(name: "AutomationKitTests", dependencies: ["AutomationKit"]),
         .testTarget(name: "AgentKitTests", dependencies: ["AgentKit", "AutomationKit"], resources: [.copy("Fixtures")]),
+        // The notch's click and approval rules, offline (no windows, input or models).
+        .testTarget(name: "GlideAppTests", dependencies: ["GlideApp", "AgentKit", "AutomationKit"]),
     ],
     swiftLanguageModes: [.v6]
 )

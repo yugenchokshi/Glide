@@ -92,6 +92,65 @@ struct NotchApproval {
     var jobID: String?
 }
 
+/// Keeps the notch out of the agent's way. The agent can't see the notch (Glide's windows are
+/// left out of its screenshots), so a click it aims at a browser tab or toolbar under the notch
+/// would land on whatever card is there. While the agent may be using the pointer the panel is
+/// click-through, and decision buttons also drop clicks the agent posted.
+enum NotchClickGuard {
+    /// How long after the agent's last pointer input the panel stays click-through.
+    static let settleSeconds: Double = 1.0
+
+    /// Whether the click-through panel may take clicks again.
+    /// - The quick task's own approval: at once. The task is blocked on it and holds the
+    ///   screen, so no job can be clicking either.
+    /// - A background job's approval or card: only once agent input has settled. A paused
+    ///   quick task doesn't count: input held by the pause goes out the moment it resumes.
+    /// - Anything else (task field, running pill, results): once input has settled, or while
+    ///   the quick task is paused, so Resume and Stop can be clicked.
+    static func acceptsClicks(quickTaskApproval: Bool, jobDecisionShowing: Bool, pointerIdleSeconds: Double, agentPaused: Bool) -> Bool {
+        if quickTaskApproval { return true }
+        let settled = pointerIdleSeconds > settleSeconds
+        return jobDecisionShowing ? settled : settled || agentPaused
+    }
+
+    /// Whether a click on a decision button counts. The agent's own clicks never do. For a
+    /// background job's decision the agent's pointer must also have settled: a click that
+    /// reaches the card while the agent is acting got there before the panel turned
+    /// click-through, and can't be told apart from the agent's.
+    static func acceptsDecision(agentEvent: Bool, forJob: Bool, pointerIdleSeconds: Double) -> Bool {
+        if agentEvent { return false }
+        return !forJob || pointerIdleSeconds > settleSeconds
+    }
+
+    /// Whether `event` was posted by Glide's agent: `InputSynthesizer` tags every event it posts.
+    static func isAgentEvent(_ event: NSEvent?) -> Bool {
+        event?.cgEvent?.getIntegerValueField(.eventSourceUserData) == InputSynthesizer.eventTag
+    }
+
+    /// Input that can press, toggle, scroll or type into a control.
+    static let inputTypes: Set<NSEvent.EventType> = [
+        .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp,
+        .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel, .keyDown, .keyUp, .flagsChanged,
+    ]
+
+    /// Whether Glide drops `event` before any window sees it (`GlideApplication`): input the agent
+    /// posted. Moves still pass, so hover and tracking areas behave as before.
+    static func dropsAgentInput(_ event: NSEvent) -> Bool {
+        inputTypes.contains(event.type) && isAgentEvent(event)
+    }
+}
+
+/// When the agent last said it is about to use the pointer. Marked on the agent's thread before
+/// any pointer event is posted, so the panel can't turn clickable again in the gap before the
+/// first event (when `InputSynthesizer.lastPost` is still old).
+final class PointerIntent: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last = Date.distantPast
+
+    func mark() { lock.withLock { last = Date() } }
+    var lastMarked: Date { lock.withLock { last } }
+}
+
 @MainActor
 @Observable
 final class NotchModel {
@@ -108,6 +167,9 @@ final class NotchModel {
     var jobsDetailOpen = false
     /// Job whose card (confirmation or result) the notch shows, set when a job needs the user.
     var attentionJobID: String?
+    /// Who holds `ScreenLease` ("task:…" for the quick task, "job:…" for a job's on-screen
+    /// step), polled by the window controller. Nil when nobody does.
+    var screenHolder: String?
 
     let controller: TaskController
     let settings: SettingsStore
@@ -115,8 +177,25 @@ final class NotchModel {
     var openSettings: (String?) -> Void = { _ in }
     /// Opens Settings › Jobs on one job.
     var openJob: (String) -> Void = { _ in }
-    private var dismissWork: DispatchWorkItem?
-    private var jobDismissWork: DispatchWorkItem?
+    /// Seconds since the agent last used (or said it would use) the pointer. Set by the window
+    /// controller; snapshots and tests have no agent.
+    @ObservationIgnored var agentPointerIdleSeconds: () -> Double = { .infinity }
+    /// Whether the event being handled was posted by the agent rather than the user.
+    @ObservationIgnored var currentEventIsAgent: () -> Bool = { NotchClickGuard.isAgentEvent(NSApp?.currentEvent) }
+    /// Runs just before Resume lets the agent's held input go (see `togglePause`). The window
+    /// controller makes the panel click-through here; snapshots and tests have no panel.
+    @ObservationIgnored var agentWillResume: () -> Void = {}
+    @ObservationIgnored var clock: () -> Date = { Date() }
+    /// A request must be on screen this long before Approve or Reject counts, so a click aimed
+    /// at the card that was there a moment ago can't answer the one that replaced it.
+    static let approvalReadSeconds: Double = 0.5
+    /// The approval on screen and when it appeared.
+    @ObservationIgnored private var shownApproval: (id: UUID, since: Date)?
+    /// Auto-dismiss timers. Armed only while their card is on screen (see `armAutoDismiss`).
+    @ObservationIgnored private(set) var dismissWork: DispatchWorkItem?
+    @ObservationIgnored private(set) var jobDismissWork: DispatchWorkItem?
+    /// The quick task's result folds away on its own (completed or stopped; failures stay).
+    @ObservationIgnored private var resultFoldsAway = false
     /// Last copy of the attention job, so the card survives a reload that briefly drops it.
     private var attentionSnapshot: JobRecord?
     /// Jobs the user stopped from the notch: their "stopped" result card would only echo the click.
@@ -145,12 +224,24 @@ final class NotchModel {
             p = hovering ? .hover : .idle
         }
         if p != presentation { presentation = p }
+        let shownID = p == .approval ? activeApproval?.request.id : nil
+        if shownApproval?.id != shownID { shownApproval = shownID.map { ($0, clock()) } }
+        armAutoDismiss()
+    }
+
+    /// The quick task holds the screen: it may be clicking anywhere, including under the notch.
+    var quickTaskHoldsScreen: Bool {
+        controller.isRunning && (screenHolder?.hasPrefix("task:") ?? false)
     }
 
     /// The quick task's approval first (it holds the screen), then the job that last asked for
-    /// attention, then the oldest job's.
+    /// attention, then the oldest job's. A job's approval waits while the quick task holds the
+    /// screen: that task is clicking and can't see the notch, so the card would sit where its
+    /// clicks land. It shows once the task is done. (While the quick task is still waiting for
+    /// a job's on-screen step to finish, it doesn't hold the screen, so that job can still ask.)
     var activeApproval: NotchApproval? {
         if let req = controller.pendingApproval { return NotchApproval(request: req, jobID: nil) }
+        guard !quickTaskHoldsScreen else { return nil }
         let pending = jobs.pendingApprovals
         guard !pending.isEmpty else { return nil }
         if let id = attentionJobID, let req = pending[id] { return NotchApproval(request: req, jobID: id) }
@@ -162,15 +253,70 @@ final class NotchModel {
         return NotchApproval(request: req, jobID: id)
     }
 
-    func respondToApproval(_ decision: ApprovalDecision) {
-        guard let approval = activeApproval else { return }
-        if let id = approval.jobID {
-            if decision == .stop { stoppedFromNotch.insert(id) }
-            jobs.respond(jobID: id, decision: decision)
+    /// A background job is waiting for an OK that isn't on screen (held back by the quick task).
+    var jobApprovalWaiting: Bool {
+        controller.pendingApproval == nil && activeApproval == nil && !jobs.pendingApprovals.isEmpty
+    }
+
+    /// A background job's decision is on screen: its approval, or its confirmation or result card.
+    var showsJobDecision: Bool {
+        presentation == .job || (presentation == .approval && activeApproval?.jobID != nil)
+    }
+
+    /// Whether this job's card or approval is what the notch shows right now.
+    func isShowing(job id: String) -> Bool {
+        switch presentation {
+        case .approval: return activeApproval?.jobID == id
+        case .job: return attentionJob?.id == id
+        default: return false
+        }
+    }
+
+    /// Whether the click being handled is the user's own and may decide for a job (or the quick task).
+    func acceptsUserDecision(forJob: Bool) -> Bool {
+        NotchClickGuard.acceptsDecision(agentEvent: currentEventIsAgent(), forJob: forJob, pointerIdleSeconds: agentPointerIdleSeconds())
+    }
+
+    /// Answers `shown`, the approval the card was drawn for, and never a different one. The click
+    /// is dropped (and the card redrawn) when another request has taken its place, when it has
+    /// only just appeared, or when the agent posted the click. Returns whether it was answered.
+    @discardableResult
+    func respondToApproval(_ decision: ApprovalDecision, to shown: NotchApproval) -> Bool {
+        let id = shown.request.id
+        guard acceptsUserDecision(forJob: shown.jobID != nil),
+              let live = activeApproval, live.request.id == id, live.jobID == shown.jobID,
+              let since = shownApproval.flatMap({ $0.id == id ? $0.since : nil }),
+              clock().timeIntervalSince(since) >= Self.approvalReadSeconds else {
+            recompute()
+            return false
+        }
+        if let jobID = shown.jobID {
+            // `respond` answers the head of the job's queue, which is what `pendingApprovals` shows.
+            guard jobs.pendingApprovals[jobID]?.id == id else { recompute(); return false }
+            if decision == .stop { stoppedFromNotch.insert(jobID) }
+            jobs.respond(jobID: jobID, decision: decision)
         } else {
+            guard controller.pendingApproval?.id == id else { recompute(); return false }
             controller.respondToApproval(decision)
         }
         recompute()
+        return true
+    }
+
+    /// Pauses or resumes the quick task. Every Resume in Glide (notch, hotkey, menu bar) goes
+    /// through here. A pause can catch the agent mid-action: the rest of a move and its click
+    /// wait inside `InputSynthesizer` and go out the moment the gate opens, without another
+    /// `willUsePointer`. The panel may have turned clickable during the pause, so it turns
+    /// click-through first, or that click could land on the notch.
+    func togglePause() {
+        if controller.phase == .paused { agentWillResume() }
+        controller.togglePause()
+    }
+
+    /// Runs a job decision (Start, Cancel, Pause, Resume, Retry, Stop) only for the user's own click.
+    func userDecision(_ action: () -> Void) {
+        guard acceptsUserDecision(forJob: true) else { return }
+        action()
     }
 
     /// The job shown in the wing ring: one is running and the notch isn't busy with a quick task.
@@ -188,8 +334,12 @@ final class NotchModel {
     var attentionJob: JobRecord? {
         guard let id = attentionJobID else { return nil }
         guard let job = jobs.job(id) ?? (attentionSnapshot?.id == id ? attentionSnapshot : nil) else { return nil }
-        let wantsCard = job.status == .awaitingConfirmation || job.status == .needsInput || job.status.isFinished
-        return wantsCard ? job : nil
+        return Self.wantsCard(job) ? job : nil
+    }
+
+    /// The job has a card of its own to show: a confirmation, a question or a result.
+    static func wantsCard(_ job: JobRecord) -> Bool {
+        job.status == .awaitingConfirmation || job.status == .needsInput || job.status.isFinished
     }
 
     /// Anything beyond the bare notch (or hover) is on screen.
@@ -259,16 +409,47 @@ final class NotchModel {
     func taskFinished(_ result: TaskResult) {
         resultVisible = true
         detailOpen = false
-        recompute()
         dismissWork?.cancel()
-        guard result.status == .completed || result.status == .stopped else { return }
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, !self.hovering, !self.inputOpen, !self.detailOpen else { return }
-            self.resultVisible = false
-            self.recompute()
+        dismissWork = nil
+        // Successful results fold away (once on screen); failures and questions stay.
+        resultFoldsAway = result.status == .completed || result.status == .stopped
+        recompute()
+    }
+
+    /// Results fold away a few seconds after they are actually on screen. One that gets covered
+    /// (by a job's card or approval, the task field, the detail view or a running task) loses its
+    /// timer, and a new one starts when it shows again, so it always gets the full time in view.
+    /// A hovered card stays until closed.
+    private func armAutoDismiss() {
+        if presentation != .job {
+            jobDismissWork?.cancel()
+            jobDismissWork = nil
+        } else if jobDismissWork == nil, let job = attentionJob, job.status == .completed || job.status == .stopped {
+            let id = job.id
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.attentionJobID == id else { return }
+                guard self.presentation == .job else { self.jobDismissWork = nil; return }
+                guard !self.hovering else { return }
+                self.clearJobAttention()
+                self.recompute()
+            }
+            jobDismissWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + max(4, settings.settings.completedDismissSeconds), execute: work)
         }
-        dismissWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + settings.settings.completedDismissSeconds, execute: work)
+        if presentation != .result {
+            dismissWork?.cancel()
+            dismissWork = nil
+        } else if resultFoldsAway, dismissWork == nil {
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                guard self.presentation == .result else { self.dismissWork = nil; return }
+                guard !self.hovering else { return }
+                self.resultVisible = false
+                self.recompute()
+            }
+            dismissWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + settings.settings.completedDismissSeconds, execute: work)
+        }
     }
 
     // MARK: Background jobs
@@ -280,9 +461,15 @@ final class NotchModel {
 
     /// A job needs the user (approval, confirmation, question, finished): show its card.
     /// Approvals show through `activeApproval` on their own; marking the job also makes its
-    /// approval win over another job's.
+    /// approval win over another job's. But a job that only needs an OK doesn't take the place
+    /// of another job's card still on show (a finished job, say): the approval covers that card
+    /// for now, and the card comes back once the approval is answered instead of being lost.
     func jobNeedsAttention(_ id: String) {
         guard let job = jobs.job(id), shouldAnnounce(job) else { return }
+        if !Self.wantsCard(job), let shown = attentionJob, shown.id != id {
+            recompute()
+            return
+        }
         showJobCard(job)
     }
 
@@ -291,21 +478,14 @@ final class NotchModel {
         showJobCard(job)
     }
 
+    /// Successful results fold away like quick-task results (`armAutoDismiss`, once the card is
+    /// on screen); failures and questions stay.
     private func showJobCard(_ job: JobRecord) {
+        jobDismissWork?.cancel()
+        jobDismissWork = nil
         attentionJobID = job.id
         attentionSnapshot = job
         recompute()
-        jobDismissWork?.cancel()
-        // Successful results fold away like quick-task results; failures and questions stay.
-        guard job.status == .completed || job.status == .stopped else { return }
-        let id = job.id
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.attentionJobID == id, !self.hovering else { return }
-            self.clearJobAttention()
-            self.recompute()
-        }
-        jobDismissWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + max(4, settings.settings.completedDismissSeconds), execute: work)
     }
 
     private func clearJobAttention() {
@@ -358,6 +538,11 @@ final class NotchWindowController {
     let model: NotchModel
     private var shrinkWork: DispatchWorkItem?
     private var previousApp: NSRunningApplication?
+    private let pointerIntent = PointerIntent()
+    private var pollingLease = false
+    /// The agent's gate as of the last timer tick, to catch a resume that didn't go through
+    /// `NotchModel.togglePause`.
+    private var gateWasPaused = false
 
     init(model: NotchModel) {
         self.model = model
@@ -376,17 +561,38 @@ final class NotchWindowController {
             }
         }
         // While the agent is moving the pointer, the panel is click-through so it can never
-        // intercept an agent click; it becomes interactive again ~1s after agent input stops.
+        // intercept an agent click; it becomes interactive again ~1s after agent input stops
+        // (see `NotchClickGuard`). The intent is marked first, so the timer can't undo the
+        // change before the first event goes out.
         let panelRef = panel
-        AutomationRuntime.shared.executor.input.willUsePointer = {
-            DispatchQueue.main.async { panelRef.ignoresMouseEvents = true }
+        let intent = pointerIntent
+        let input = AutomationRuntime.shared.executor.input
+        input.willUsePointer = {
+            intent.mark()
+            Self.makeClickThrough(panelRef)
             Thread.sleep(forTimeInterval: 0.01)
         }
+        model.agentPointerIdleSeconds = { Date().timeIntervalSince(max(input.lastPost, intent.lastMarked)) }
+        // Resume releases input the pause held, without another `willUsePointer`.
+        model.agentWillResume = { [weak self] in self?.holdClicksForAgent() }
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, self.panel.ignoresMouseEvents else { return }
-                let idle = Date().timeIntervalSince(AutomationRuntime.shared.executor.input.lastPost) > 1.0
-                if idle || AutomationRuntime.shared.gate.isPaused || self.model.activeApproval != nil {
+                guard let self else { return }
+                self.pollScreenHolder()
+                let gate = AutomationRuntime.shared.gate.current
+                let paused = gate == .paused
+                defer { self.gateWasPaused = paused }
+                // Every resume in Glide makes the panel click-through first (`togglePause`); this
+                // catches any other within a tick. The quick task's own approval stays clickable:
+                // the task is blocked on it.
+                if self.gateWasPaused, gate == .running, !self.panel.ignoresMouseEvents, self.model.controller.pendingApproval == nil {
+                    self.holdClicksForAgent()
+                }
+                guard self.panel.ignoresMouseEvents else { return }
+                if NotchClickGuard.acceptsClicks(quickTaskApproval: self.model.controller.pendingApproval != nil,
+                                                 jobDecisionShowing: self.model.showsJobDecision,
+                                                 pointerIdleSeconds: self.model.agentPointerIdleSeconds(),
+                                                 agentPaused: paused) {
                     self.panel.ignoresMouseEvents = false
                 }
             }
@@ -400,6 +606,41 @@ final class NotchWindowController {
         }
     }
 
+    /// Makes the panel click-through now, on the main thread, and keeps it so until agent input
+    /// settles again (the timer reopens it per `NotchClickGuard`).
+    private func holdClicksForAgent() {
+        pointerIntent.mark()
+        panel.ignoresMouseEvents = true
+    }
+
+    /// Makes the panel click-through before the agent's next pointer event. Called on the agent's
+    /// thread; it waits (briefly) for the main thread so the change is in place, not just queued,
+    /// when the event is posted.
+    nonisolated private static func makeClickThrough(_ panel: NotchPanel) {
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { panel.ignoresMouseEvents = true }
+            return
+        }
+        let applied = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            panel.ignoresMouseEvents = true
+            applied.signal()
+        }
+        _ = applied.wait(timeout: .now() + 0.5)
+    }
+
+    /// Refreshes `model.screenHolder` from the screen lease (an actor, so read asynchronously).
+    private func pollScreenHolder() {
+        guard !pollingLease else { return }
+        pollingLease = true
+        Task { [weak self] in
+            let holder = await ScreenLease.shared.currentHolder
+            guard let self else { return }
+            self.pollingLease = false
+            if self.model.screenHolder != holder { self.model.screenHolder = holder }
+        }
+    }
+
     private func observe() {
         withObservationTracking {
             _ = model.presentation
@@ -410,6 +651,7 @@ final class NotchWindowController {
             _ = model.jobs.jobs
             _ = model.jobs.pendingApprovals
             _ = model.attentionJobID
+            _ = model.screenHolder
         } onChange: { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
