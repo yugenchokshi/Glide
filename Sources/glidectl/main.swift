@@ -43,11 +43,29 @@ let runtime = AutomationRuntime.shared
 nonisolated(unsafe) var cliHeadless: (backend: GlideChromeBackend, profile: URL)?
 let fixtureURL = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().appendingPathComponent("NBFixtureApp")
 
+let usage = """
+usage: glidectl <command> [options]
+
+Tools, browser and jobs (no Accessibility needed):
+  tool list [--category <name>]              every tool the agent can call
+  tool run <name> '<json>' [--yes] [--json] [--headless]
+                                             run one tool, safety-checked like the agent
+  browser status                             which Chrome backend is available
+  job run "<task>" [--yes] [--mock-url <url>]  plan a background job and follow it (Ctrl-C halts)
+  job list | job show <id> | job resume <id> [--mock-url <url>]
+
+Driving apps (needs Accessibility for this terminal):
+  run "<task>" [--yes] [--mock-url <url>] [--model <id>]   full agent as a quick task
+  inspect [app] [--ocr] | click "<label>" [--app <app>] | type "<text>" | key cmd+n | menu "File > New"
+  workflow | bench [--only 1,2] [--json <file>]
+  permissions
+"""
+
 @MainActor
 func main() async -> Int32 {
-    guard let command = args.first else {
-        print("usage: glidectl inspect|click|type|key|menu|workflow|bench|run|permissions …")
-        return 2
+    guard let command = args.first, !["help", "-h", "--help"].contains(command) else {
+        print(usage)
+        return args.first == nil ? 2 : 0
     }
     // Tools, jobs and the browser don't need Accessibility; driving the UI does.
     let needsAccessibility = !["permissions", "tool", "job", "browser"].contains(command)
@@ -178,7 +196,7 @@ func main() async -> Int32 {
             return await jobCommand(settings: cliSettings)
 
         default:
-            print("unknown command \(command)")
+            print("unknown command \(command)\n\n\(usage)")
             return 2
         }
     } catch {

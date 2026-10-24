@@ -21,6 +21,9 @@ struct BrowserSettingsView: View {
     @State private var copiedExtensionsURL = false
     @State private var pairNote: String?
     @State private var confirmReset = false
+    /// The bridge port being edited; applied with the Apply button so a half-typed number
+    /// doesn't restart the bridge on every keystroke.
+    @State private var portText = ""
 
     static let extensionsPage = "chrome://extensions"
 
@@ -50,6 +53,16 @@ struct BrowserSettingsView: View {
             if backend == .extensionBridge {
                 BKFormRow(title: "Fall back to Glide's Chrome", detail: "When the extension isn't connected, use a separate Chrome window with its own profile (you'd need to sign in to sites there).") {
                     BKSwitch(isOn: $store.settings.browser.fallbackToGlideChrome, label: "Fall back to Glide's Chrome")
+                }
+            }
+            if backend == .extensionBridge {
+                BKFormRow(title: "Bridge port", detail: "The local port the extension connects to. Change it only if another app uses it, then pair the extension again.") {
+                    HStack(spacing: 6) {
+                        BKTextField(placeholder: String(BrowserSettings().bridgePort), text: $portText, monospaced: true).frame(width: 80)
+                        Button("Apply", action: applyPort).buttonStyle(BKButtonStyle(kind: .secondary, compact: true)).fixedSize()
+                            .disabled(newPort == nil)
+                    }
+                    .onAppear { portText = String(store.settings.browser.bridgePort) }
                 }
             }
             BKFormRow(title: "Custom Chrome", detail: chromePathDetail) {
@@ -193,6 +206,21 @@ struct BrowserSettingsView: View {
     func copy(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    /// A valid port that differs from the current one, or nil.
+    var newPort: Int? {
+        guard let p = Int(portText.trimmingCharacters(in: .whitespaces)), (1024...65535).contains(p),
+              p != store.settings.browser.bridgePort else { return nil }
+        return p
+    }
+
+    /// Glide restarts the bridge on the new port by itself (AppDelegate watches the setting);
+    /// the pairing code includes the port, so the extension has to pair again.
+    func applyPort() {
+        guard let p = newPort else { return }
+        store.settings.browser.bridgePort = p
+        pairNote = "Glide now listens on port \(p). Pair the extension again so it uses the new port."
     }
 
     func copyPairingCode() {
