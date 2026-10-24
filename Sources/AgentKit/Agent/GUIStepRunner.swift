@@ -20,16 +20,19 @@ public struct GUIStepRunner: StepExecuting {
     let runtime: AutomationRuntime
     let router: ModelRouter
     let safety: SafetyPolicy
+    /// The lease a job's step gives up while it waits for the user (the job runner's).
+    let screenLease: ScreenLease
 
     public init(settings: AppSettings, runtime: AutomationRuntime = .shared, credentials: CredentialStore = .shared) {
         self.init(settings: settings, runtime: runtime, router: ModelRouter(settings: settings, credentials: credentials))
     }
 
-    init(settings: AppSettings, runtime: AutomationRuntime, router: ModelRouter) {
+    init(settings: AppSettings, runtime: AutomationRuntime, router: ModelRouter, screenLease: ScreenLease = .shared) {
         self.settings = settings
         self.runtime = runtime
         self.router = router
         self.safety = SafetyPolicy(settings: settings.safety)
+        self.screenLease = screenLease
     }
 
     /// Everything one step run needs besides the step: the task it belongs to, the shared task
@@ -49,8 +52,8 @@ public struct GUIStepRunner: StepExecuting {
         /// Job steps never stop the shared input gate on their own decisions (an approval's
         /// Stop): stopping a job is the job runner's business, and it cancels the step.
         var isJob = false
-        /// Job steps: pauses the step while the user is using the Mac (nil for quick tasks,
-        /// which the orchestrator's own monitor pauses, or when the setting is off).
+        /// Job steps: waits while the user is using the Mac (nil for quick tasks, which the
+        /// orchestrator's own monitor pauses, or when the setting is off).
         var takeover: UserTakeoverWatch? = nil
     }
 
@@ -72,8 +75,9 @@ public struct GUIStepRunner: StepExecuting {
         let session = TaskSession(limits: settings.limits)
         if !request.context.isEmpty { session.appendNote(request.context) }
         let step = request.step.asPlanStep
-        let takeover = UserTakeoverWatch.forStep(request, settings: settings)
+        let takeover = UserTakeoverWatch.forStep(request, settings: settings, runtime: runtime, lease: screenLease)
         takeover?.start()
+        takeover?.noteRecentUserInput()
         defer { takeover?.stop() }
         let run = Run(instruction: request.goal, plan: Plan(goal: request.goal, steps: [step], clarification: nil), session: session,
                       metrics: metrics, callbacks: callbacks, workspace: request.workspace, itemID: request.itemID,
@@ -86,11 +90,13 @@ public struct GUIStepRunner: StepExecuting {
                 // shared gate. When the job is stopped or halted (its task cancelled), stop the
                 // gate too, so input already being posted (a long text being typed) ends at
                 // once, as it does for a quick task's Stop. Whoever takes the lease next resets it.
+                // Not while the step has given the screen up to wait for the user: the gate is
+                // the quick task's then.
                 let gate = runtime.gate
                 outcome = try await withTaskCancellationHandler {
                     try await self.run(step, run)
                 } onCancel: {
-                    gate.stop()
+                    if takeover?.screenHandedOver != true { gate.stop() }
                 }
             } else {
                 outcome = try await self.run(step, run)
@@ -134,23 +140,19 @@ public struct GUIStepRunner: StepExecuting {
 
         // Bring the step's app forward first if it's already running (cheap, deterministic).
         // Switching apps takes focus from the user, so a job waits until they're idle first.
-        try await waitForUser(step, r)
-        if let appName = step.app, step.hint?.action != "launch_app",
-           let running = runtime.executor.apps.runningApp(named: appName),
-           running.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier {
-            r.callbacks.phase(.executing, "Switching to \(running.localizedName ?? appName)…")
-            if let info = try? await runtime.executor.apps.activate(running, timeout: 6) {
-                r.session.currentApp = info
-                r.callbacks.log(ActivityEntry(kind: .action, title: "Switched to \(info.name)", route: .native, success: true, stepID: step.id))
-            }
-        }
+        _ = try await waitForUser(step, r)
+        await bringAppForward(step, r)
 
         while true {
             try await runtime.gate.checkpoint()
             try r.session.checkLimits(gate: runtime.gate)
-            // Below, the screen is observed afresh, so after waiting for the user the step
-            // carries on from whatever they left on screen.
-            try await waitForUser(step, r)
+            // After waiting for the user the step's app comes forward again and the loop starts
+            // over, so the screen is observed afresh and the step carries on from whatever they
+            // left on screen.
+            if try await waitForUser(step, r) {
+                await bringAppForward(step, r)
+                continue
+            }
             guard actionsInStep < settings.limits.maxActionsPerStep else {
                 return outcome(.failed("Too many actions without finishing this step (\(actionsInStep))."))
             }
@@ -242,6 +244,7 @@ public struct GUIStepRunner: StepExecuting {
                 if result.ran { actionsInStep += 1 }
                 if case .blocked(let m) = result { return outcome(.blocked(m)) }
                 if case .error = result { errors += 1 }
+                if case .skipped = result { turns -= 1 } // the user took over; this turn's action never ran
             case .act:
                 let resolution = await resolver.resolve(decision, obs: obs, objective: step.instruction)
                 switch resolution {
@@ -261,7 +264,11 @@ public struct GUIStepRunner: StepExecuting {
                         if rejections >= 2 { return outcome(.blocked("You declined the proposed action. Tell me how you'd like to proceed.")) }
                     case .blocked(let m): return outcome(.blocked(m))
                     case .error: errors += 1
-                    case .skipped: signatures[sig, default: 1] -= 1 // it never ran, so proposing it again isn't a repeat
+                    case .skipped:
+                        // The user took over before it ran: proposing it again isn't a repeat, and
+                        // the turn doesn't count toward the step's limit.
+                        signatures[sig, default: 1] -= 1
+                        turns -= 1
                     }
 
                     // 3. Batched follow-ups, while the screen is still the one the model planned against.
@@ -325,6 +332,7 @@ public struct GUIStepRunner: StepExecuting {
                     if result.ran { actionsInStep += 1 }
                     if case .blocked(let m) = result { return outcome(.blocked(m)) }
                     if case .error = result { errors += 1 }
+                    if case .skipped = result { turns -= 1 }
                 case .tool:
                     history.append("- call_tool isn't available in this step; use the UI.")
                     errors += 1
@@ -408,19 +416,37 @@ public struct GUIStepRunner: StepExecuting {
         }
     }
 
-    /// Job steps: while the user is using the Mac, waits in place (holding the screen) until
-    /// they've been idle long enough, and says so in the job's log. The wait doesn't count
-    /// toward the step's time limit.
-    private func waitForUser(_ step: PlanStep, _ r: Run) async throws {
-        guard let watch = r.takeover else { return }
-        let idle = Int(watch.waitSeconds.rounded())
-        let waited = try await watch.waitWhileUserActive(gate: runtime.gate) {
-            r.callbacks.log(ActivityEntry(kind: .info, title: "Paused because you used the mouse",
-                                          detail: "This step continues by itself once you've been idle for \(idle) seconds.", stepID: step.id))
+    /// Job steps: once the user has started using the Mac, waits until they leave it alone
+    /// (giving the screen to a quick task meanwhile) and says so in the job's log. Returns
+    /// whether it waited. The wait doesn't count toward the step's time limit, and is reported
+    /// through `waitingForUser` so the job's time budget can leave it out too.
+    func waitForUser(_ step: PlanStep, _ r: Run) async throws -> Bool {
+        guard let watch = r.takeover, watch.userTookOver else { return false }
+        r.callbacks.log(ActivityEntry(kind: .info, title: "Paused because you used the mouse", detail: watch.pauseDetail, stepID: step.id))
+        await r.callbacks.waitingForUser(true)
+        let waited: TimeInterval
+        do {
+            waited = try await watch.waitForIdleUser(gate: runtime.gate)
+        } catch {
+            await r.callbacks.waitingForUser(false)
+            throw error
         }
-        guard let waited else { return }
+        await r.callbacks.waitingForUser(false)
         r.session.extendDeadline(by: waited)
         r.callbacks.log(ActivityEntry(kind: .info, title: "Continuing after you've been idle", stepID: step.id))
+        return true
+    }
+
+    /// Brings the step's app to the front if it's running and isn't already.
+    private func bringAppForward(_ step: PlanStep, _ r: Run) async {
+        guard let appName = step.app, step.hint?.action != "launch_app",
+              let running = runtime.executor.apps.runningApp(named: appName),
+              running.processIdentifier != NSWorkspace.shared.frontmostApplication?.processIdentifier else { return }
+        r.callbacks.phase(.executing, "Switching to \(running.localizedName ?? appName)…")
+        if let info = try? await runtime.executor.apps.activate(running, timeout: 6) {
+            r.session.currentApp = info
+            r.callbacks.log(ActivityEntry(kind: .action, title: "Switched to \(info.name)", route: .native, success: true, stepID: step.id))
+        }
     }
 
     /// Safety check → approval → execute → verify → record.
@@ -572,68 +598,185 @@ protocol UserInputMonitoring: AnyObject, Sendable {
 
 extension UserInterferenceMonitor: UserInputMonitoring {}
 
-/// Pauses a background job's on-screen step while the user is using the Mac
+/// Holds a background job's on-screen step while the user is using the Mac
 /// (`SafetySettings.pauseOnUserInput`). A quick task pauses until the user presses Resume; a
-/// job has nobody to press it, so its step waits in place, still holding the screen, until the
-/// user has been idle for the jobs' idle threshold (`JobSettings.idleSeconds`), then looks at
-/// the screen again and carries on. The item isn't failed for it.
+/// job has nobody to press it, so its step waits until the user leaves the Mac alone, then
+/// looks at the screen again and carries on. The item isn't failed for it.
 ///
-/// Any real mouse input during the step counts (Glide's own events carry its tag and are
-/// ignored), not only input that collides with the agent's as for quick tasks: a job uses the
-/// screen because the user is away, so input means they're back. Each step gets its own
-/// monitor, so it never touches the quick task's (`AutomationRuntime.interference`).
+/// What counts follows `JobSettings.screenUse`. With "only when I'm idle" a job uses the screen
+/// because the user is away, so any real mouse input means they're back, and the step waits
+/// until they've been idle for `JobSettings.idleSeconds`. With "any time" the user is often at
+/// the Mac, so, as for quick tasks, only input that collides with the agent's own counts, and
+/// the step waits a few seconds for them to let go. Glide's own events carry its tag and are
+/// ignored either way.
+///
+/// While it waits, the step gives the screen lease up, so a quick task started meanwhile runs
+/// at once, and takes it back (behind that task) before carrying on. The monitor is
+/// `AutomationRuntime.jobInterference`, never the quick task's, and runs only while the step
+/// holds the screen, so job steps never share it.
 final class UserTakeoverWatch: @unchecked Sendable {
-    /// Shortest wait, so an idle setting of 0 doesn't resume while the user is mid-gesture.
+    enum Mode: Sendable, Equatable {
+        /// Any real mouse input counts (`ScreenUse.whenIdle`).
+        case anyInput
+        /// Only input within `collisionWindow` of the agent's own (`ScreenUse.always`).
+        case collisions
+    }
+
+    /// Shortest wait, so an idle setting of 0 (or "any time") doesn't resume while the user is
+    /// mid-gesture.
     static let minimumIdleSeconds: Double = 3
+    /// The quick task's rule: user input this soon after the agent's own collides with it.
+    static let collisionWindow: Double = 2.5
 
     private let lock = NSLock()
     private var tookOver = false
+    private var watching = false
+    private var handedOver = false
     private let monitor: any UserInputMonitoring
     private let idleProbe: ScreenLease.IdleProbe
+    private let lastAgentInput: @Sendable () -> Date
+    private let lease: ScreenLease?
+    private let leaseOwner: String?
     private let pollInterval: Double
+    let mode: Mode
     /// How long the user must leave the Mac alone before the step continues.
     let waitSeconds: Double
 
-    init(monitor: any UserInputMonitoring = UserInterferenceMonitor(), idleSeconds: Double,
-         idleProbe: @escaping ScreenLease.IdleProbe = ScreenLease.systemIdleSeconds, pollInterval: Double = 0.5) {
+    /// - Parameters:
+    ///   - lastAgentInput: when the agent last posted input, to tell the user's input from it.
+    ///   - lease, leaseOwner: the screen lease the step's job holds, given up while waiting.
+    init(monitor: any UserInputMonitoring, mode: Mode = .anyInput, idleSeconds: Double,
+         idleProbe: @escaping ScreenLease.IdleProbe = ScreenLease.systemIdleSeconds,
+         lastAgentInput: @escaping @Sendable () -> Date = { .distantPast },
+         lease: ScreenLease? = nil, leaseOwner: String? = nil, pollInterval: Double = 0.5) {
         self.monitor = monitor
+        self.mode = mode
         self.waitSeconds = max(idleSeconds, Self.minimumIdleSeconds)
         self.idleProbe = idleProbe
+        self.lastAgentInput = lastAgentInput
+        self.lease = lease
+        self.leaseOwner = leaseOwner
         self.pollInterval = max(0.01, pollInterval)
     }
 
     /// The watch for one step, or nil: quick tasks are watched by the orchestrator, and the
     /// user may have turned the setting off.
-    static func forStep(_ request: StepRequest, settings: AppSettings) -> UserTakeoverWatch? {
-        guard request.jobID != nil, settings.safety.pauseOnUserInput else { return nil }
-        return UserTakeoverWatch(idleSeconds: settings.jobs.idleSeconds)
+    static func forStep(_ request: StepRequest, settings: AppSettings, runtime: AutomationRuntime, lease: ScreenLease) -> UserTakeoverWatch? {
+        guard let jobID = request.jobID, settings.safety.pauseOnUserInput else { return nil }
+        let owner = leaseOwner(jobID: jobID)
+        let input = runtime.executor.input
+        if settings.jobs.screenUse == .always {
+            return UserTakeoverWatch(monitor: runtime.jobInterference, mode: .collisions, idleSeconds: minimumIdleSeconds,
+                                     lastAgentInput: { input.lastPost }, lease: lease, leaseOwner: owner)
+        }
+        return UserTakeoverWatch(monitor: runtime.jobInterference, idleSeconds: settings.jobs.idleSeconds,
+                                 lastAgentInput: { input.lastPost }, lease: lease, leaseOwner: owner)
     }
 
-    func start() { monitor.start { [weak self] in self?.noteUserInput() } }
-    func stop() { monitor.stop() }
+    /// The name a job holds the screen lease under; it must match `JobRunner.leaseOwner`. If it
+    /// ever doesn't, the step finds it isn't the holder and waits keeping the screen.
+    static func leaseOwner(jobID: String) -> String { "job:\(jobID)" }
 
-    func noteUserInput() { lock.withLock { tookOver = true } }
+    /// What the job's log says while the step waits.
+    var pauseDetail: String {
+        switch mode {
+        case .anyInput: return "It continues by itself once you've been idle for \(Int(waitSeconds.rounded())) seconds."
+        case .collisions: return "It continues by itself once you've left the mouse alone for a few seconds."
+        }
+    }
+
+    func start() {
+        lock.withLock { watching = true }
+        monitor.start { [weak self] in self?.noteUserInput() }
+    }
+
+    /// Stops the monitor if this watch is running it. Once a waiting step has given the screen
+    /// up it has stopped it already, and must not stop it again: the next holder's step may be
+    /// using it.
+    func stop() {
+        let wasWatching = lock.withLock { () -> Bool in
+            defer { watching = false }
+            return watching
+        }
+        if wasWatching { monitor.stop() }
+    }
+
+    func noteUserInput() {
+        if mode == .collisions, Date().timeIntervalSince(lastAgentInput()) >= Self.collisionWindow { return }
+        lock.withLock { tookOver = true }
+    }
+
+    /// Called as the step starts. The lease can be granted while the user is at the Mac: it
+    /// takes any input during a hold for Glide's own, so when a waiting step gives the screen
+    /// up while the user is busy, another job may get it. With "only when I'm idle", input
+    /// newer than Glide's last event and within the idle time is the user's, so the step waits
+    /// before it touches anything.
+    func noteRecentUserInput() {
+        guard mode == .anyInput else { return }
+        let idle = idleProbe()
+        guard idle < waitSeconds else { return }
+        let lastEvent = Date().addingTimeInterval(-idle)
+        if lastEvent > lastAgentInput().addingTimeInterval(0.5) { lock.withLock { tookOver = true } }
+    }
+
     var userTookOver: Bool { lock.withLock { tookOver } }
     /// Forgets input so far (answering an approval moves the mouse too).
     func clear() { lock.withLock { tookOver = false } }
+    /// True while the step has given the screen up to wait for the user: the shared input gate
+    /// belongs to whoever holds the screen then.
+    var screenHandedOver: Bool { lock.withLock { handedOver } }
 
-    /// If the user took over since the last wait, calls `onPause`, waits until they've been
-    /// idle for `waitSeconds` and returns how long that took; returns nil at once otherwise.
-    /// Cancellation and a stopped `gate` end the wait with `AutomationError.stopped`.
-    func waitWhileUserActive(gate: ExecutionGate?, onPause: () -> Void) async throws -> TimeInterval? {
-        guard userTookOver else { return nil }
-        onPause()
-        let start = Date()
-        while true {
-            if Task.isCancelled || gate?.isStopped == true { throw AutomationError.stopped }
-            if idleProbe() >= waitSeconds { break }
-            do {
-                try await Task.sleep(for: .seconds(pollInterval))
-            } catch {
-                throw AutomationError.stopped
-            }
+    /// Waits until the user has left the Mac alone for `waitSeconds` and returns how long that
+    /// took. Meanwhile the screen lease is given up (when this step's job holds it) and taken
+    /// back before returning, and the shared input gate is then cleared of any Stop or pause the
+    /// other task left on it. Cancellation ends the wait with `AutomationError.stopped`; so does
+    /// a stopped `gate`, but only while the step keeps the screen (given up, it's another's).
+    func waitForIdleUser(gate: ExecutionGate?) async throws -> TimeInterval {
+        let began = Date()
+        let wasWatching = lock.withLock { watching }
+        stop()
+        let gaveUp = await giveUpScreen()
+        do {
+            try await waitUntilIdle(gate: gaveUp ? nil : gate)
+            if gaveUp { try await takeScreenBack() }
+        } catch {
+            throw AutomationError.stopped
         }
+        if gaveUp, let gate, gate.current != .running { gate.reset() }
         clear()
-        return Date().timeIntervalSince(start)
+        if wasWatching { start() }
+        return Date().timeIntervalSince(began)
+    }
+
+    private func waitUntilIdle(gate: ExecutionGate?) async throws {
+        while idleProbe() < waitSeconds {
+            if Task.isCancelled || gate?.isStopped == true { throw AutomationError.stopped }
+            try await Task.sleep(for: .seconds(pollInterval))
+        }
+        if Task.isCancelled { throw AutomationError.stopped }
+    }
+
+    /// Releases the screen lease if this step's job holds it.
+    private func giveUpScreen() async -> Bool {
+        guard let lease, let leaseOwner, await lease.currentHolder == leaseOwner else { return false }
+        lock.withLock { handedOver = true }
+        await lease.release(owner: leaseOwner)
+        return true
+    }
+
+    /// Queues for the screen again, behind a quick task that took it. That task's input (or
+    /// the user's) may mean they haven't been idle long enough after all; then the screen goes
+    /// back and the wait goes on. A throw leaves the lease held at most once, which the job
+    /// runner releases as it does after any failed step.
+    private func takeScreenBack() async throws {
+        guard let lease, let leaseOwner else { return }
+        while true {
+            try await lease.acquire(owner: leaseOwner)
+            if Task.isCancelled { throw AutomationError.stopped }
+            if idleProbe() >= waitSeconds { break }
+            await lease.release(owner: leaseOwner)
+            try await waitUntilIdle(gate: nil)
+        }
+        lock.withLock { handedOver = false }
     }
 }

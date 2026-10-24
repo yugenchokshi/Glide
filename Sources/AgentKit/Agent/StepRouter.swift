@@ -140,7 +140,8 @@ extension StepResult {
     /// string, but in the prompt-only fallbacks (OpenAI-compatible servers such as Ollama or
     /// LM Studio, or a provider that rejected the schema) models often send the object itself;
     /// both are accepted. `unreadable` means something other than null was sent that isn't an
-    /// object, so the model can be asked to send it again.
+    /// object, so a step that lists output fields can ask for them again (any other step
+    /// ignores it).
     static func decodeResultFields(_ value: JSONValue?) -> (fields: [String: JSONValue]?, unreadable: Bool) {
         switch value {
         case nil, .null?:

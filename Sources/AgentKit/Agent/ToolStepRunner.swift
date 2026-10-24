@@ -243,7 +243,9 @@ public struct ToolStepRunner: StepExecuting {
                     continue
                 }
             }
-            if decision.resultFieldsUnreadable {
+            // Only a step that lists output fields needs them; for any other, whatever was sent
+            // (`[]`, `false`) is ignored rather than refused.
+            if decision.resultFieldsUnreadable, !request.step.outputFields.isEmpty {
                 state.note("result_fields_json wasn't a valid JSON object; send it again")
                 if state.recordError("unreadable result fields") { return state.result(.failed(state.budgetMessage)) }
                 continue
@@ -606,7 +608,8 @@ struct ToolDecision: Sendable {
     var thought: String
     var calls: [Call]
     var resultFields: [String: JSONValue]?
-    /// result_fields_json was given but isn't a JSON object.
+    /// result_fields_json was given but isn't a JSON object (acted on only when the step lists
+    /// output fields).
     var resultFieldsUnreadable: Bool
     var message: String?
     var remember: String?

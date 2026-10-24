@@ -81,31 +81,112 @@ public struct SafetyPolicy: Sendable {
     }
 
     /// Judges a tool by the words in its name. Names come in every style (`delete_file`,
-    /// `API-delete-a-block`, `deleteRecord`, `gmail.send`), so they're split into words first.
+    /// `API-delete-a-block`, `deleteRecord`, `gmail.send`), so they're split into words first,
+    /// and words that don't say what the tool does are left out (see `toolAction`).
     public func assessTool(name: String, risk modelRisk: RiskLevel) -> Verdict {
-        let n = Self.toolNameWords(name)
+        let action = Self.toolAction(name)
         var risk = modelRisk
         var reasons: [String] = []
-        if Self.matches(n, Self.highRiskWords) || Self.matches(n, Self.highRiskToolWords) { risk = .high; reasons.append("tool \(name)") }
-        else if Self.matches(n, Self.mediumRiskWords) { risk = max(risk, .medium) }
+        if Self.matches(action.judged, Self.highRiskWords) || Self.matches(action.judged, Self.highRiskToolWords) {
+            risk = .high
+            reasons.append("tool \(name)")
+        } else if Self.matches(action.judged, Self.mediumRiskWords) || action.httpWrite {
+            risk = max(risk, .medium)
+        }
         return Verdict(risk: risk, reasons: reasons, blocked: nil)
     }
 
     /// Integration tools (MCP servers, Composio) run code Glide knows nothing about, and their
-    /// name is the only signal, so they never rate below medium. An HTTP DELETE passed to a
-    /// generic request tool is high, whatever the tool is called.
+    /// name is the only signal. One whose first verb is a read verb (`get_current_time`,
+    /// `GMAIL_FETCH_EMAILS`, `notion-search`) stays low; any other rates at least medium. An
+    /// HTTP DELETE passed to a generic request tool is high, and POST, PUT or PATCH medium,
+    /// whatever the tool is called.
     public func assessIntegrationTool(name: String, arguments: JSONValue) -> Verdict {
-        var v = assessTool(name: name, risk: .medium)
-        if v.risk < .high, Self.httpMethod(in: arguments) == "DELETE" {
+        var v = assessTool(name: name, risk: Self.toolAction(name).reads ? .low : .medium)
+        let method = Self.httpMethod(in: arguments)
+        if v.risk < .high, method == "DELETE" {
             v.risk = .high
             v.reasons.append("HTTP DELETE")
+        } else if v.risk < .medium, let method, ["POST", "PUT", "PATCH"].contains(method) {
+            v.risk = .medium
         }
         return v
     }
 
-    /// Risky verbs judged only in tool names: as button labels ("Forward", "Reply", "Drop")
-    /// they usually just navigate or open a draft.
-    static let highRiskToolWords = ["destroy", "drop", "purge", "wipe", "terminate", "kill", "charge", "refund", "reply", "forward", "invite"]
+    /// Risky verbs judged only in tool names: as button labels ("Forward", "Reply") they
+    /// usually just navigate or open a draft. "Drop" counts only for data ("dropTable"), not
+    /// for a browser tool's drag and drop.
+    static let highRiskToolWords = ["destroy", "purge", "wipe", "terminate", "kill", "charge", "refund", "reply", "forward", "invite",
+                                    "drop table", "drop database", "drop db", "drop collection", "drop schema", "drop index", "drop column"]
+
+    /// Verbs that say a tool only reads.
+    static let readVerbs: Set<String> = ["get", "list", "search", "find", "fetch", "read", "retrieve", "query", "lookup", "describe",
+                                         "resolve", "count", "view", "show", "preview", "inspect"]
+    /// Verbs that say a tool changes something although no risk list names them, so a read verb
+    /// after them ("write_query", "run_query") doesn't make the tool a read.
+    static let writeVerbs: Set<String> = ["write", "run", "execute", "exec", "eval", "add", "set", "insert", "append", "put", "patch",
+                                          "modify", "change", "apply", "import", "sync", "mark", "toggle", "enable", "disable", "start",
+                                          "stop", "restart", "cancel", "close", "commit", "push", "deploy", "upsert", "assign", "attach",
+                                          "detach", "link", "unlink", "approve", "reject", "schedule", "book", "click", "type", "press",
+                                          "fill", "select", "navigate", "drag", "call", "invoke", "trigger", "notify", "empty", "place"]
+    /// Risky words that are also nouns. After a read verb they name what's read, not what's
+    /// done: "getPost", "STRIPE_RETRIEVE_A_CHARGE", "get_merge_request", "get_invite".
+    static let riskyNouns: Set<String> = ["post", "tweet", "share", "transfer", "purchase", "trash", "checkout", "merge", "reset", "format",
+                                          "charge", "refund", "invite", "reply", "forward", "subscribe"]
+    /// HTTP methods spelled into names generated from an OpenAPI spec ("API-post-search").
+    static let httpVerbs: Set<String> = ["get", "post", "put", "patch", "delete", "head"]
+    /// The one-word entries of the risk lists, which act as verbs when reading a tool name.
+    static let singleRiskWords = Set((highRiskWords + mediumRiskWords + highRiskToolWords).filter { !$0.contains(" ") })
+
+    /// What a tool name says about the tool, judged deterministically:
+    /// - `judged`: the words to match against the risk lists. Left out are an HTTP method that
+    ///   doesn't say what the call does (`API-post-search`: Notion searches with POST), and,
+    ///   after a read verb, risky nouns and medium-risk words (`getPost`, `GMAIL_LIST_DRAFTS`).
+    ///   Strong verbs always count, wherever they are (`get_and_delete`, `search_and_replace`).
+    /// - `reads`: the name has a verb, and the first verb of each part ("and", "or" and "then"
+    ///   split parts) is a read verb.
+    /// - `httpWrite`: the name spells POST, PUT or PATCH and doesn't read (`API-patch-page`).
+    static func toolAction(_ name: String) -> (judged: String, reads: Bool, httpWrite: Bool) {
+        var words = toolNameWords(name).split(separator: " ").map(String.init)
+        var httpWrite = false
+        // "API-post-search", "API-patch-page": the word after "api" is an HTTP method. "post_search",
+        // "postSearch": a write method followed by a read verb is a request that reads.
+        if let i = words.indices.first(where: { words[$0] == "api" }), i + 1 < words.count, httpVerbs.contains(words[i + 1]) {
+            if ["post", "put", "patch"].contains(words[i + 1]) {
+                httpWrite = true
+                words.remove(at: i + 1)
+            }
+        } else if let first = words.first, ["post", "put", "patch"].contains(first), words.count > 1, readVerbs.contains(words[1]) {
+            words.removeFirst()
+        }
+        let conjunctions: Set<String> = ["and", "or", "then"]
+        var judged: [String] = []
+        var partReads: Bool?
+        var reads = true
+        var sawVerb = false
+        for word in words {
+            if conjunctions.contains(word) {
+                partReads = nil
+                judged.append(word)
+                continue
+            }
+            if partReads == nil {
+                if readVerbs.contains(word) {
+                    partReads = true
+                    sawVerb = true
+                } else if writeVerbs.contains(word) || singleRiskWords.contains(word) {
+                    partReads = false
+                    sawVerb = true
+                    reads = false
+                }
+            } else if partReads == true, riskyNouns.contains(word) || mediumRiskWords.contains(word) {
+                continue
+            }
+            judged.append(word)
+        }
+        let readsOnly = reads && sawVerb
+        return (judged.joined(separator: " "), readsOnly, httpWrite && !readsOnly)
+    }
 
     /// A tool name as lowercase words: camelCase is split, and `_ - . / :` are separators.
     /// "API-delete-a-block" → "api delete a block", "sendHTTPRequest" → "send http request".
