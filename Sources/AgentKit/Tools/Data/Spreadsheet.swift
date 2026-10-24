@@ -338,9 +338,12 @@ public enum Spreadsheet {
         var editIndex: [String: Int] = [:]
         let headerRow = g.headerSource ?? g.nextSourceRow
 
-        func addEdit(_ row: Int, _ col: Int, _ value: String) {
+        func addEdit(_ row: Int, _ col: Int, _ value: String, inheritStyle: Bool = false) {
             let k = "\(row):\(col)"
-            if let i = editIndex[k] { edits[i].value = value } else { editIndex[k] = edits.count; edits.append(CellEdit(row: row, col: col, value: value)) }
+            if let i = editIndex[k] { edits[i].value = value } else {
+                editIndex[k] = edits.count
+                edits.append(CellEdit(row: row, col: col, value: value, inheritStyle: inheritStyle))
+            }
         }
         func norm(_ s: String) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
         func columnIndex(_ name: String) -> Int? {
@@ -356,7 +359,7 @@ public enum Spreadsheet {
             columns.append(clean)
             positions.append(pos)
             change.addedColumns.append(clean)
-            addEdit(headerRow, pos, clean)
+            addEdit(headerRow, pos, clean, inheritStyle: g.headerSource != nil)
             return columns.count - 1
         }
         func current(_ dataRow: Int?, _ colIdx: Int) -> String {

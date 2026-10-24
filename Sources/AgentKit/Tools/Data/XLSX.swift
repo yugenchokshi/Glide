@@ -531,6 +531,10 @@ struct CellEdit: Hashable, Sendable {
     var row: Int
     var col: Int
     var value: String
+    /// A new cell takes the style of the cell to its left (a new header next to bold headers
+    /// stays bold). Off for data cells, where a neighbour's date or currency format would
+    /// change how the value reads.
+    var inheritStyle: Bool = false
 }
 
 /// Rewrites only the rows a set of edits touches inside one worksheet's XML.
@@ -778,6 +782,15 @@ struct XLSXSheetEditor {
         return out
     }
 
+    /// The `s` attribute of the nearest existing cell left of `col` in `row`.
+    private func styleLeft(of col: Int, in row: Row) -> String? {
+        for case .cell(let c, let raw, _) in row.items.reversed() where c < col {
+            let te = raw.firstIndex(of: 0x3E) ?? (raw.count - 1)
+            return Self.attributes(raw[0...te]).first { $0.name == "s" }?.raw
+        }
+        return nil
+    }
+
     private func cellXML(ref: String, style: String?, value: String) -> [UInt8]? {
         let p = String(decoding: prefix, as: UTF8.self)
         let s = style.map { " s=\"\($0)\"" } ?? ""
@@ -869,7 +882,7 @@ struct XLSXSheetEditor {
                     } else {
                         row.items.remove(at: idx)
                     }
-                } else if let x = cellXML(ref: ref, style: nil, value: e.value) {
+                } else if let x = cellXML(ref: ref, style: e.inheritStyle ? styleLeft(of: e.col, in: row) : nil, value: e.value) {
                     let insertAt = row.items.firstIndex { if case .cell(let c, _, _) = $0 { return c > e.col }; return false }
                         ?? (row.items.lastIndex { if case .cell = $0 { return true }; return false }.map { $0 + 1 } ?? row.items.startIndex)
                     row.items.insert(.cell(col: e.col, raw: x, hasRef: true), at: insertAt)

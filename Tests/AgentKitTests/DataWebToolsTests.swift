@@ -437,6 +437,17 @@ struct DataWebToolsTests {
             #expect(try XLSXPackage.entries(path).first == "[Content_Types].xml")
         }
 
+        @Test func newColumnsMatchTheHeaderStyle() throws {
+            let dir = try tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+            let path = dir.appendingPathComponent("leads.xlsx").path
+            try Spreadsheet.write(path, TableData(columns: ["Company", "Website"], rows: [["Acme", ""], ["Globex", ""]]))
+            try Spreadsheet.update(path, keyColumn: "Company", updates: ["Acme": ["Website": "acme.com", "Size": "120"]])
+            let xml = try zipPart(path, "xl/worksheets/sheet1.xml")
+            // The new header is bold like its neighbours; the new data cell gets no style.
+            #expect(xml.contains("<c r=\"C1\" s=\"1\" t=\"inlineStr\"><is><t>Size</t></is></c>"), "\(xml)")
+            #expect(xml.contains("<c r=\"C2\"><v>120</v></c>"), "\(xml)")
+        }
+
         @Test func readsAnExcelStyleWorkbook() throws {
             let dir = try tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
             let path = dir.appendingPathComponent("book.xlsx").path
@@ -492,7 +503,7 @@ struct DataWebToolsTests {
             #expect(sheet.contains("<c r=\"D5\" s=\"1\"/>"))
             #expect(sheet.contains("<row r=\"5\" spans=\"1:4\">")) // an untouched row stays verbatim
             #expect(sheet.contains("<c r=\"A1\" s=\"3\" t=\"s\"><v>0</v></c>"))
-            #expect(sheet.contains("<c r=\"E1\" t=\"inlineStr\"><is><t>Status</t></is></c>"))
+            #expect(sheet.contains("<c r=\"E1\" s=\"3\" t=\"inlineStr\"><is><t>Status</t></is></c>")) // styled like the other headers
             #expect(sheet.contains("<c r=\"C3\"><v>8</v></c>"))
             #expect(sheet.contains("<row r=\"6\"><c r=\"A6\" t=\"inlineStr\"><is><t>Linus</t></is></c>"))
             #expect(sheet.contains("<dimension ref=\"A1:E6\"/>"))

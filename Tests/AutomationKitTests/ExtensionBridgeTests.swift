@@ -1327,6 +1327,7 @@ final class NodeHarness {
     const attachedTabs = new Set();
     let attachCount = 0;
     const onDetach = makeEvent();
+    const onEvent = makeEvent();
     const onRemoved = makeEvent();
     const noTab = (id) => new Error(`No tab with id: ${id}.`);
 
@@ -1375,10 +1376,12 @@ final class NodeHarness {
         async sendCommand({ tabId }, method, params) {
           if (!attachedTabs.has(tabId)) throw new Error(`Debugger is not attached to the tab with id: ${tabId}.`);
           if (method === "Runtime.evaluate" && params && params.expression === "1+1") return { result: { type: "number", value: 2 } };
+          if (method === "Page.handleJavaScriptDialog") out(`DIALOG_ANSWERED ${tabId} ${params.accept}`);
           return { echo: { method, params: params || {} }, attachCount };
         },
         async getTargets() { return [...tabs.keys()].map((id) => ({ tabId: id, attached: attachedTabs.has(id) })); },
         onDetach,
+        onEvent,
       },
       action: { async setBadgeText() {}, async setBadgeBackgroundColor() {}, async setTitle() {} },
     };
@@ -1399,6 +1402,10 @@ final class NodeHarness {
         attachedTabs.delete(tabId);
         onDetach.emit({ tabId }, "canceled_by_user");
         out(`CANCELED ${tabId}`);
+      } else if (command === "dialog") {
+        // "dialog <tabId> <type>": the page opens alert()/confirm()/prompt().
+        const [, , type] = line.trim().split(/\s+/);
+        onEvent.emit({ tabId: Number(arg) }, "Page.javascriptDialogOpening", { type, message: `Sure (${type})?` });
       }
     });
     process.stdin.on("end", () => process.exit(0));
@@ -1457,6 +1464,17 @@ struct ExtensionBridgeEndToEndTests {
         #expect(await browserError { _ = try await backend.cdp(tabID: "999", method: "Runtime.evaluate", params: nil) } == .tabNotFound("999"))
         let unknown = await browserError { _ = try await bridge.call("history.clear") }
         #expect(unknown?.message.contains("doesn't support") == true)
+
+        // Page dialogs are answered at once (alerts accepted, confirm() declined) so they can't
+        // freeze the tab, and Glide is told what was answered.
+        harness.send("dialog \(tab.id) confirm")
+        #expect(await harness.waitFor("DIALOG_ANSWERED \(tab.id) false"), "\(harness.log)")
+        #expect(await events.waitFor { $0 == .dialog(tabID: tab.id, dialog: BrowserDialog(type: "confirm", message: "Sure (confirm)?", accepted: false)) }, "\(harness.log)")
+        harness.send("dialog \(tab.id) alert")
+        #expect(await harness.waitFor("DIALOG_ANSWERED \(tab.id) true"), "\(harness.log)")
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(await backend.takeHandledDialogs(tabID: tab.id).map(\.type) == ["confirm", "alert"])
+        #expect(await backend.takeHandledDialogs(tabID: tab.id).isEmpty)
 
         // The user dismisses Chrome's debugging bar: Glide hears about it, and the extension
         // refuses further debugging until the user allows it again.

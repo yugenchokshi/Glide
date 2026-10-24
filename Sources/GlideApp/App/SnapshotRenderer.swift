@@ -156,7 +156,7 @@ final class PreviewJobs: JobsSource {
     /// A lead-research job in progress (with items and activity), one awaiting confirmation,
     /// a daily check that's waiting, and a finished job with a report.
     static func demo(now: Date = Date()) -> Demo {
-        let folder = "/Users/you/Library/Application Support/NotchBuddy/Jobs/"
+        let folder = "/Users/you/Library/Application Support/Glide/Jobs/"
         var research = JobRecord(id: "job-leads", title: "Find the website and LinkedIn page for 120 leads",
                                  instruction: "For every company in ~/Documents/leads.xlsx, find its website, LinkedIn page and employee count, and fill in the empty columns.",
                                  status: .running, folder: folder + "job-leads")

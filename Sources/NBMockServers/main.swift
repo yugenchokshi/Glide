@@ -108,7 +108,61 @@ struct ScriptedModel {
         return d
     }
 
+    /// Long-job scenario ("shout-job"): for every company in a CSV, a command step uppercases
+    /// the name with a real shell.run call; results go to a table and back into the CSV.
+    static func shoutJobPlan(csvPath: String) -> [String: Any] {
+        let recipe: [String: Any] = [
+            "title": "Shouting the name", "instruction": "Uppercase the company name with shell.run and return it as the field shout.",
+            "route": "command", "app": NSNull(), "risk": "low", "done_when": "The uppercase name is known", "output_fields": ["shout"],
+        ]
+        let forEach: [String: Any] = [
+            "source": ["kind": "file", "path": csvPath, "sheet": NSNull(), "column": "Company", "has_header": true,
+                       "table": NSNull(), "items": NSNull(), "step_number": NSNull()],
+            "item_label": "company", "parallelism": 3, "output_table": "companies", "output_columns": ["shout"], "limit": NSNull(),
+            "recipe": [recipe],
+            "write_back": ["path": csvPath, "sheet": NSNull(), "key_column": "Company", "columns": ["shout"]],
+        ]
+        return [
+            "goal": "Uppercase every company name in the sheet", "clarification": NSNull(), "outputs": "A shout column in the CSV",
+            "milestones": [[
+                "title": "Shout every company", "description": "Uppercase each name", "done_when": "Every company has a shout value",
+                "requires_approval": false,
+                "steps": [["kind": "for_each", "title": "Shouting companies", "action": NSNull(), "for_each": forEach, "wait": NSNull()]],
+            ]],
+        ]
+    }
+
+    static func shoutStep(user: String) -> [String: Any] {
+        var d: [String: Any] = ["thought": "", "status": "act", "calls": [Any](), "result_fields_json": NSNull(), "message": NSNull(), "remember": NSNull()]
+        // "Current company (3 of 12): Acme Corp"
+        let name = user.components(separatedBy: "\n").first(where: { $0.hasPrefix("Current company (") })
+            .flatMap { $0.components(separatedBy: "): ").dropFirst().first } ?? "unknown"
+        let results = user.components(separatedBy: "Recent results:").last ?? ""
+        if results.contains("(none yet)") {
+            let quoted = "'" + name.replacingOccurrences(of: "'", with: "'\\''") + "'"
+            d["calls"] = [["tool": "shell.run", "arguments_json": json(["command": "printf %s \(quoted) | tr '[:lower:]' '[:upper:]'"])]]
+        } else {
+            d["status"] = "step_done"
+            d["result_fields_json"] = json(["shout": name.uppercased()])
+            d["message"] = "Shouted \(name)"
+        }
+        return d
+    }
+
     static func reply(system: String, user: String) -> [String: Any] {
+        if system.contains("You plan long-running background jobs"), user.contains("shout-job") {
+            let path = user.components(separatedBy: CharacterSet.whitespacesAndNewlines).first { $0.hasSuffix(".csv") } ?? "/tmp/companies.csv"
+            return shoutJobPlan(csvPath: path.trimmingCharacters(in: CharacterSet(charactersIn: "\"'.,")))
+        }
+        if system.contains("You are the tool executor"), user.contains("Uppercase the company name") {
+            return shoutStep(user: user)
+        }
+        if system.contains("You write the result of a step") {
+            if user.contains("\"done\"") || user.contains("done, reason") {
+                return ["message": "Every company has a shout value.", "result_fields_json": json(["done": true, "reason": "All rows processed"])]
+            }
+            return ["message": "Uppercased every company name and wrote the shout column back into the CSV.", "result_fields_json": NSNull()]
+        }
         if system.contains("You are the tool executor") {
             return toolStep(user: user)
         }
@@ -209,7 +263,11 @@ final class LLMServer: @unchecked Sendable {
                             "usage": ["prompt_tokens": user.count / 4, "completion_tokens": content.count / 4]])
         }
         let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(payload.utf8.count)\r\nConnection: close\r\n\r\n" + payload
-        conn.send(content: Data(response.utf8), completion: .contentProcessed { _ in conn.cancel() })
+        // NB_MOCK_DELAY_MS slows every reply, for testing stop and resume on long jobs.
+        let delay = Int(ProcessInfo.processInfo.environment["NB_MOCK_DELAY_MS"] ?? "") ?? 0
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(delay)) {
+            conn.send(content: Data(response.utf8), completion: .contentProcessed { _ in conn.cancel() })
+        }
     }
 }
 

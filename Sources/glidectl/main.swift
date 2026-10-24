@@ -287,17 +287,19 @@ func jobCommand(settings base: AppSettings) async -> Int32 {
         } else {
             guard let prefix = positional.dropFirst().first, let j = center.jobs.first(where: { $0.id.hasPrefix(prefix) }) else { print("job not found"); return 1 }
             id = j.id
+            guard j.status.isResumable else { print("✗ This job is \(j.status.rawValue) and can't be resumed."); return 1 }
             center.resume(id)
         }
         signal(SIGINT, SIG_IGN)
         let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        sig.setEventHandler { print("\n■ stopping job"); center.stop(id) }
+        // Like the emergency stop: end the step in flight now, keep the job paused and resumable.
+        sig.setEventHandler { print("\n■ halting — resume with: glidectl job resume \(id.prefix(8))"); center.haltAll() }
         sig.resume()
         // Follow the job: print new log lines, answer approvals, stop when it settles.
         var seen = Set<UUID>()
         var lastLine = ""
         while true {
-            for e in center.events(id, limit: 50).reversed() where !seen.contains(e.id) {
+            for e in center.events(id, limit: 50) where !seen.contains(e.id) {
                 seen.insert(e.id)
                 let mark = e.success.map { $0 ? "✓" : "✗" } ?? "·"
                 print("  \(mark) \(e.kind.rawValue): \(e.title)\(e.detail.map { " — " + $0.replacingOccurrences(of: "\n", with: " | ").prefix(200) } ?? "")")
