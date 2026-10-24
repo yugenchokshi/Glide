@@ -1231,7 +1231,7 @@ struct JobStepUserInputTests {
         try await lease.acquire(owner: "task:1", priority: true)
         idle.value = 10
         #expect(await eventually { await lease.queueLength == 1 })
-        // The quick task's own input (or the user's) means the Mac wasn't left alone after all.
+        // The user's input meanwhile (starting the quick task, say) means the Mac wasn't left alone after all.
         idle.value = 0
         await lease.release(owner: "task:1")
         #expect(await eventually {
@@ -1283,6 +1283,164 @@ struct JobStepUserInputTests {
         #expect(await eventually { await lease.queueLength == 0 })
         await lease.release(owner: "task:1")
         #expect(await lease.currentHolder == nil)
+    }
+
+    /// Pausing the step's job ends the wait, and the screen it gave up isn't taken back when
+    /// the user walks away (nor once a quick task ahead of it finishes). Each wait is let go
+    /// after a while, so a wait that ignores the pause fails the test instead of hanging it.
+    @Test func pausingTheJobEndsTheWaitWithoutTakingTheScreenBack() async throws {
+        let lease = ScreenLease(idleProbe: { 1000 })
+        try await lease.acquire(owner: "job:j1")
+        let idle = Box(0.0)
+        let paused = Box(false)
+        let watch = UserTakeoverWatch(monitor: FakeInputMonitor(), idleSeconds: 5, idleProbe: { idle.value }, lease: lease, leaseOwner: "job:j1",
+                                      pollInterval: 0.01)
+        watch.noteUserInput()
+        let ended = Box(false)
+        let wait = Task {
+            defer { ended.value = true }
+            return try await watch.waitForIdleUser(gate: ExecutionGate(), interrupted: { paused.value })
+        }
+        #expect(await eventually { await lease.currentHolder == nil })
+        paused.value = true
+        #expect(await eventually(timeout: 3) { ended.value }, "the pause ends the wait")
+        idle.value = 10 // the user walks away
+        await #expect(throws: AutomationError.stopped) { try await wait.value }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await lease.currentHolder == nil)
+        #expect(watch.screenHandedOver, "the screen stays someone else's")
+
+        // Queued behind a quick task when the job is paused: it leaves the queue.
+        try await lease.acquire(owner: "job:j1")
+        idle.value = 0
+        paused.value = false
+        watch.noteUserInput()
+        let queuedEnded = Box(false)
+        let queued = Task {
+            defer { queuedEnded.value = true }
+            return try await watch.waitForIdleUser(gate: ExecutionGate(), interrupted: { paused.value })
+        }
+        #expect(await eventually { await lease.currentHolder == nil })
+        try await lease.acquire(owner: "task:1", priority: true)
+        idle.value = 10
+        #expect(await eventually { await lease.queueLength == 1 })
+        paused.value = true
+        #expect(await eventually(timeout: 3) { queuedEnded.value }, "the pause ends the wait for the screen")
+        #expect(await lease.queueLength == 0)
+        await lease.release(owner: "task:1")
+        await #expect(throws: AutomationError.stopped) { try await queued.value }
+        #expect(await lease.currentHolder == nil)
+
+        // Keeping the screen (no lease to give up), a pause ends the wait too.
+        let keptIdle = Box(0.0)
+        let kept = UserTakeoverWatch(monitor: FakeInputMonitor(), idleSeconds: 30, idleProbe: { keptIdle.value }, pollInterval: 0.01)
+        kept.noteUserInput()
+        let keptPaused = Box(false)
+        let keptEnded = Box(false)
+        let keptWait = Task {
+            defer { keptEnded.value = true }
+            return try await kept.waitForIdleUser(gate: ExecutionGate(), interrupted: { keptPaused.value })
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        keptPaused.value = true
+        #expect(await eventually(timeout: 3) { keptEnded.value })
+        keptIdle.value = 100
+        await #expect(throws: AutomationError.stopped) { try await keptWait.value }
+    }
+
+    /// The runner hands the job's pause to the wait, and still reports the wait's end.
+    @Test func theRunnerEndsTheWaitWhenTheJobIsPaused() async throws {
+        let credentials = CredentialStore(service: "dev.glide.tests.\(UUID().uuidString)")
+        credentials.useMemoryOnly()
+        let settings = AppSettings()
+        let runner = GUIStepRunner(settings: settings, runtime: AutomationRuntime(), router: ModelRouter(settings: settings, credentials: credentials),
+                                   screenLease: ScreenLease(idleProbe: { 1000 }))
+        let idle = Box(0.0)
+        let watch = UserTakeoverWatch(monitor: FakeInputMonitor(), idleSeconds: 5, idleProbe: { idle.value }, pollInterval: 0.01)
+        let paused = Box(false)
+        let events = Ledger()
+        let callbacks = AgentCallbacks(waitingForUser: { events.add("waiting: \($0)") }, jobInterrupted: { paused.value })
+        let step = commandStep(route: .gui).asPlanStep
+        let run = GUIStepRunner.Run(instruction: "Test goal", plan: Plan(goal: "Test goal", steps: [step], clarification: nil),
+                                    session: TaskSession(deadline: Date().addingTimeInterval(60), maxTotalActions: 10),
+                                    metrics: TaskMetrics(), callbacks: callbacks, isJob: true, takeover: watch)
+        watch.noteUserInput()
+        let wait = Task { try await runner.waitForUser(step, run) }
+        #expect(await eventually { events.all == ["waiting: true"] })
+        paused.value = true
+        #expect(await eventually(timeout: 3) { events.all.count == 2 })
+        idle.value = 10
+        await #expect(throws: AutomationError.stopped) { try await wait.value }
+        #expect(events.all == ["waiting: true", "waiting: false"])
+    }
+
+    /// A job step's watch waits by the lease's idle time: Glide's own input a moment ago (another
+    /// job's step) doesn't count when the user has been away for longer than the idle setting.
+    @Test func aJobStepWaitsByTheLeasesIdleTime() async throws {
+        let hid = Box((input: Date().addingTimeInterval(-5000), post: Date.distantPast))
+        let lease = ScreenLease(idleProbe: { Date().timeIntervalSince(hid.value.input) }, lastSyntheticInput: { hid.value.post })
+        // The lease has seen the user's last input, long ago; then another job posted.
+        #expect(await lease.userIdleTime() > 4999)
+        let now = Date()
+        hid.value = (now, now)
+        var settings = AppSettings()
+        settings.jobs.idleSeconds = 30
+        let watch = try #require(UserTakeoverWatch.forStep(request(jobID: "job-1"), settings: settings, runtime: AutomationRuntime(), lease: lease))
+        // Not the system's idle time (that's whatever this Mac's real input was).
+        #expect(abs(await watch.idleNow() - 5000) < 5)
+        let ended = Box(false)
+        let wait = Task {
+            defer { ended.value = true }
+            return try await watch.waitForIdleUser(gate: ExecutionGate())
+        }
+        #expect(await eventually(timeout: 3) { ended.value }, "the user has been away a minute")
+        wait.cancel()
+        _ = try? await wait.value
+    }
+
+    /// Another job keeps using the screen while this step waits for the user, who has left.
+    /// Its clicks and keystrokes are Glide's, not the user's: the step gets the screen back once
+    /// the user has been idle long enough, instead of only once that job's on-screen work is done.
+    @Test func anotherJobsInputDoesNotKeepTheStepWaiting() async throws {
+        // Simulated HID state: when the last event happened, and when Glide last posted one.
+        let hid = Box((input: Date().addingTimeInterval(-1000), post: Date.distantPast))
+        let rawIdle: ScreenLease.IdleProbe = { Date().timeIntervalSince(hid.value.input) }
+        let lease = ScreenLease(idleProbe: rawIdle, lastSyntheticInput: { hid.value.post }, pollInterval: 0.01)
+        try await lease.acquire(owner: "job:a")
+        let a = UserTakeoverWatch(monitor: FakeInputMonitor(), idleSeconds: UserTakeoverWatch.minimumIdleSeconds, idleProbe: rawIdle,
+                                  userIdle: { await lease.userIdleTime() }, lease: lease, leaseOwner: "job:a", pollInterval: 0.01)
+        // The user touches the mouse during job a's step, then leaves.
+        let userAt = Date()
+        hid.value.input = userAt
+        a.noteUserInput()
+        let finished = Box(false)
+        let waiting = Task {
+            defer { finished.value = true }
+            return try await a.waitForIdleUser(gate: ExecutionGate())
+        }
+        #expect(await eventually { await lease.currentHolder == nil })
+        // Job b uses the screen step after step, posting input all the while.
+        let stop = Box(false)
+        let b = Task {
+            while !stop.value {
+                try await lease.acquire(owner: "job:b")
+                for _ in 0..<5 {
+                    let now = Date()
+                    hid.value = (now, now)
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                await lease.release(owner: "job:b")
+                try await Task.sleep(for: .milliseconds(5))
+            }
+        }
+        #expect(await eventually(timeout: 10) { finished.value })
+        #expect(Date().timeIntervalSince(userAt) >= UserTakeoverWatch.minimumIdleSeconds - 0.1, "only once the user had been idle long enough")
+        #expect(await lease.currentHolder == "job:a")
+        stop.value = true
+        waiting.cancel()
+        await lease.release(owner: "job:a")
+        _ = try? await b.value
+        await lease.release(owner: "job:b")
     }
 
     /// Job steps share one long-lived monitor. A step that gave the screen up and is then

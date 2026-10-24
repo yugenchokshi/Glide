@@ -208,7 +208,7 @@ struct JobDetailView: View {
                 Button { jobs.pause(job.id) } label: { Label("Pause", systemImage: "pause.fill") }
                     .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
             }
-            if job.canResume {
+            if jobs.canResume(job) {
                 Button { jobs.resume(job.id) } label: { Label(s == .waiting ? "Run now" : "Resume", systemImage: "play.fill") }
                     .buttonStyle(BKButtonStyle(kind: s == .waiting ? .secondary : .primary, compact: true))
             }
@@ -245,9 +245,12 @@ struct JobDetailView: View {
                 BKCallout(tone: .info, icon: "play.circle", title: "Ready to start", message: "Review the plan below, then press Start.")
             }
         }
-        if job.status == .waiting, let wake = job.nextWakeAt {
+        if let wake = jobs.wakeTime(job) {
             BKCallout(tone: .neutral, icon: "moon.zzz.fill", title: "Continues \(JobFormat.when(wake))",
                       message: "The job is sleeping and uses nothing until then. Glide needs to be running at that time.")
+        } else if job.status == .waiting, jobs.isQueued(job.id) {
+            BKCallout(tone: .neutral, icon: "hourglass", title: "Queued",
+                      message: "Other jobs are using every slot (Settings › Jobs). This one starts by itself when one of them finishes.")
         }
         if let err = job.lastError, !err.isEmpty, job.status == .failed || job.status == .needsInput || job.status == .paused {
             BKCallout(tone: job.status == .failed ? .danger : .warning, icon: job.status == .failed ? "xmark.octagon.fill" : "hand.raised.fill",

@@ -474,14 +474,49 @@ struct GlideJobControlTests {
         for s in JobStatus.allCases where s != .running { #expect(!s.canPause, "\(s)") }
     }
 
+    /// Whether a job is queued comes from the job center, not the record: a wait that came due
+    /// (or a Run now pressed while every slot was busy) keeps its wake time while queued.
+    @MainActor
     @Test func queuedJobsDontOfferRunNow() {
+        let source = QueueJobs()
+        let due = record(.waiting, wake: Date().addingTimeInterval(-60))
+        source.jobs = [due]
+        source.queued = ["j"]
         // Queued behind the concurrency limit: JobCenter.resume ignores it.
-        #expect(record(.waiting).isQueued)
-        #expect(!record(.waiting).canResume)
+        #expect(!source.canResume(due))
+        #expect(source.wakeTime(due) == nil, "it waits for a slot, not for a time that has already passed")
+        #expect(!source.canResume(record(.waiting)))
         // Sleeping until a time: Run now wakes it.
-        #expect(!record(.waiting, wake: Date().addingTimeInterval(600)).isQueued)
-        #expect(record(.waiting, wake: Date().addingTimeInterval(600)).canResume)
-        for s in [JobStatus.paused, .needsInput, .failed] { #expect(record(s).canResume, "\(s)") }
-        for s in [JobStatus.running, .planning, .completed, .stopped, .awaitingConfirmation] { #expect(!record(s).canResume, "\(s)") }
+        source.queued = []
+        let later = record(.waiting, wake: Date().addingTimeInterval(600))
+        #expect(source.canResume(later))
+        #expect(source.wakeTime(later) == later.nextWakeAt)
+        for s in [JobStatus.paused, .needsInput, .failed] { #expect(source.canResume(record(s)), "\(s)") }
+        for s in [JobStatus.running, .planning, .completed, .stopped, .awaitingConfirmation] { #expect(!source.canResume(record(s)), "\(s)") }
+        #expect(source.wakeTime(record(.paused, wake: Date().addingTimeInterval(600))) == nil)
     }
+}
+
+/// In-memory jobs whose queue a test sets, as JobCenter's would be.
+@MainActor
+final class QueueJobs: JobsSource {
+    var jobs: [JobRecord] = []
+    var queued: Set<String> = []
+    var pendingApprovals: [String: ApprovalRequest] = [:]
+    var activeJob: JobRecord? { nil }
+    func job(_ id: String) -> JobRecord? { jobs.first { $0.id == id } }
+    func items(_ jobID: String, limit: Int) -> [JobItem] { [] }
+    func events(_ jobID: String, limit: Int) -> [ActivityEntry] { [] }
+    func report(_ jobID: String) -> String? { nil }
+    func start(_ id: String) {}
+    func pause(_ id: String) {}
+    func resume(_ id: String) {}
+    func stop(_ id: String) {}
+    func retryFailedItems(_ id: String) {}
+    func delete(_ id: String) {}
+    func respond(jobID: String, decision: ApprovalDecision) {}
+    func exportResultFiles(_ jobID: String, to url: URL) throws -> [URL] { [] }
+    func isRunningElsewhere(_ id: String) -> Bool { false }
+    func isQueued(_ id: String) -> Bool { queued.contains(id) }
+    func reload() {}
 }

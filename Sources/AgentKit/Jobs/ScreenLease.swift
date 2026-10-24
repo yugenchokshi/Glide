@@ -108,6 +108,18 @@ public actor ScreenLease {
         handOff()
     }
 
+    /// The user's idle time as the lease judges it, with Glide's own input left out. A job step
+    /// waiting for the user to leave the Mac alone goes by this too: by the raw idle time,
+    /// another job's clicks and keystrokes would keep it waiting for as long as that job has
+    /// on-screen work, while the lease kept handing that job the screen.
+    func userIdleTime() -> Double { userIdleSeconds() }
+
+    /// Input known to be the user's (a job step's input monitor saw it), so it counts even
+    /// when one of Glide's own events landed right after it and hid it from the idle time.
+    func noteUserInput(at date: Date) {
+        lastUserInput = max(lastUserInput ?? date, date)
+    }
+
     /// Runs `body` while holding the lease.
     public func withLease<T: Sendable>(owner: String, screenUse: ScreenUse = .always, idleSeconds: Double = 0, priority: Bool = false,
                                        _ body: @Sendable () async throws -> T) async throws -> T {

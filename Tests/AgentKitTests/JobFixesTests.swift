@@ -36,6 +36,23 @@ final class Latch: Sendable {
     }
 }
 
+/// A step executor that sees the callbacks the job runner hands its steps.
+final class CallbackExecutor: StepExecuting {
+    typealias Handler = @Sendable (StepRequest, AgentCallbacks) async throws -> StepResult
+    private let handler: Handler
+    private let calls = Mutex<[Int]>([])
+
+    init(_ handler: @escaping Handler) { self.handler = handler }
+
+    /// The step ids executed, in order.
+    var stepIDs: [Int] { calls.withLock { $0 } }
+
+    func execute(_ request: StepRequest, callbacks: AgentCallbacks) async throws -> StepResult {
+        calls.withLock { $0.append(request.step.id) }
+        return try await handler(request, callbacks)
+    }
+}
+
 @MainActor
 @Observable
 final class SettingsBox {
@@ -49,7 +66,7 @@ func makeTestCenter(_ fx: JobFixture, plan: JobPlan?, executor: (any StepExecuti
                     lease: ScreenLease = ScreenLease(idleProbe: { 1000 }), now: @escaping @Sendable () -> Date = { Date() },
                     keepAwake: (@MainActor (Bool) -> Void)? = nil,
                     releaseBrowser: @escaping @Sendable (String) async -> Void = { _ in },
-                    scope: JobCenter.Scope = .allJobs) -> JobCenter {
+                    scope: JobCenter.Scope = .allJobs, elsewherePollSeconds: Double = 0.05) -> JobCenter {
     let planner: any JobPlanning = plan.map { FixedPlanner(plan: $0) } ?? FailingPlanner()
     var env = JobCenter.Environment(
         store: fx.store, settings: settings, planner: { _ in planner },
@@ -57,7 +74,7 @@ func makeTestCenter(_ fx: JobFixture, plan: JobPlan?, executor: (any StepExecuti
         executor: { _ in executor }, lease: lease, models: { _ in (nil, nil) }, keepAwake: keepAwake,
         removeFolder: { url in try FileManager.default.removeItem(at: url) }, now: now, schedulerMaxSleep: 0.05)
     env.releaseBrowser = releaseBrowser
-    env.elsewherePollSeconds = 0.05
+    env.elsewherePollSeconds = elsewherePollSeconds
     env.scope = scope
     return JobCenter(environment: env)
 }
@@ -290,6 +307,76 @@ struct JobRunLockTests {
         #expect(fx.store.job(later.id)?.nextWakeAt.map { $0.timeIntervalSinceNow > 80_000 } == true)
         #expect(executor.calls.map(\.stepID) == [5])
     }
+
+    /// glidectl dies mid-run or mid-plan (killed, terminal closed, Ctrl-C while planning) after
+    /// the app last looked. Opening the notch reloads the list: those jobs must be picked up
+    /// like ones found after a quit, not shown as running (with a Pause that does nothing).
+    @Test(arguments: [true, false])
+    func reloadPicksUpJobsAnotherProcessLeftBehind(autoResume: Bool) async throws {
+        let fx = try JobFixture()
+        defer { fx.cleanup() }
+        let plan = JobPlan(goal: "g", milestones: [Milestone(id: 1, title: "m", steps: [action(1, "A")])])
+        var settings = testSettings()
+        settings.jobs.autoResume = autoResume
+        let executor = ScriptedExecutor()
+        let app = makeTestCenter(fx, plan: plan, executor: executor, settings: { settings })
+        app.launch()
+        // Saved by the process that died (it held their locks, which went with it).
+        let running = fx.record(plan)
+        var planning = fx.record(plan)
+        planning.plan = nil
+        planning.status = .planning
+        fx.store.saveJob(planning)
+
+        app.reload()
+        #expect(await eventuallyOnMain { app.job(planning.id)?.status == .failed })
+        if autoResume {
+            #expect(await eventuallyOnMain { app.job(running.id)?.status == .completed })
+            #expect(app.events(running.id).contains { $0.title.contains("other Glide process quit") })
+        } else {
+            #expect(await eventuallyOnMain { app.job(running.id)?.status == .paused })
+            #expect(app.job(running.id)?.lastError?.contains("other Glide process") == true)
+            #expect(executor.calls.isEmpty)
+        }
+        #expect(app.activeJob == nil)
+    }
+
+    /// The other process lets go and the notch opens before the next look at it: the reload
+    /// must not forget the job it was watching.
+    @Test func aJobLetGoJustBeforeAReloadIsPickedUp() async throws {
+        let fx = try JobFixture()
+        defer { fx.cleanup() }
+        let plan = JobPlan(goal: "g", milestones: [Milestone(id: 1, title: "m", steps: [action(1, "A")])])
+        let record = fx.record(plan)
+        let other = try #require(JobRunLock.tryAcquire(folder: fx.store.folder(for: record.id)))
+        let app = makeTestCenter(fx, plan: plan, executor: ScriptedExecutor(), elsewherePollSeconds: 60)
+        app.launch()
+        #expect(app.isRunningElsewhere(record.id))
+        other.release()
+        app.reload()
+        #expect(await eventuallyOnMain { app.job(record.id)?.status == .completed })
+        #expect(!app.isRunningElsewhere(record.id))
+    }
+
+    /// glidectl ran a job until a wait and exited; the app had nothing else asleep. The reload
+    /// that shows it must also wake it when it's due.
+    @Test func aWaitingJobFoundByAReloadWakes() async throws {
+        let fx = try JobFixture()
+        defer { fx.cleanup() }
+        let plan = JobPlan(goal: "g", milestones: [Milestone(id: 1, title: "m", steps: [
+            JobStep(id: 1, title: "A moment", kind: .wait(.duration(seconds: 3600))), action(2, "After"),
+        ])])
+        let executor = ScriptedExecutor()
+        let app = makeTestCenter(fx, plan: plan, executor: executor)
+        app.launch()
+        var sleeper = fx.record(plan)
+        sleeper.status = .waiting
+        sleeper.nextWakeAt = Date().addingTimeInterval(0.2)
+        fx.store.saveJob(sleeper)
+        app.reload()
+        #expect(await eventuallyOnMain { app.job(sleeper.id)?.status == .completed })
+        #expect(executor.calls.contains { $0.stepID == 2 })
+    }
 }
 
 // MARK: - JobCenter fixes
@@ -360,11 +447,123 @@ struct JobCenterFixTests {
         }
         #expect(await eventuallyOnMain { center.job(sleeper.id)?.statusLine.contains("Queued") == true })
         #expect(fx.store.job(sleeper.id)?.nextWakeAt != nil)
+        // The UI asks the center: the record alone looks like a job sleeping until a past time.
+        #expect(center.isQueued(sleeper.id))
+        #expect(!center.isQueued(blocker.id))
 
         latch.open()
         #expect(await eventuallyOnMain { center.job(blocker.id)?.status == .completed })
         #expect(await eventuallyOnMain { center.job(sleeper.id)?.status == .completed })
+        #expect(!center.isQueued(sleeper.id))
         #expect(executor.calls.contains { $0.stepID == 3 })
+    }
+
+    /// glidectl resumed a job the app had queued and left it asleep until later. When a slot
+    /// frees up the app skips it, and must then wake it at its new time instead of keeping the
+    /// queued copy that has no wake time.
+    @Test func aQueuedJobPutToSleepElsewhereWakesAtItsTime() async throws {
+        let fx = try JobFixture()
+        defer { fx.cleanup() }
+        var settings = testSettings()
+        settings.jobs.maxConcurrentJobs = 1
+        let blockerPlan = JobPlan(goal: "Blocker", milestones: [Milestone(id: 1, title: "m", steps: [action(7, "Long")])])
+        let sleeperPlan = JobPlan(goal: "Sleeper", milestones: [Milestone(id: 1, title: "m", steps: [
+            JobStep(id: 1, title: "A while", kind: .wait(.duration(seconds: 3600))), action(2, "After"),
+        ])])
+        var sleeper = fx.record(sleeperPlan)
+        sleeper.status = .paused
+        fx.store.saveJob(sleeper)
+        let latch = Latch()
+        let executor = ScriptedExecutor { req, _ in
+            if req.step.id == 7 { await latch.wait() }
+            return ScriptedExecutor.standard(req) ?? StepResult(status: .done)
+        }
+        let center = makeTestCenter(fx, plan: blockerPlan, executor: executor, settings: { settings })
+        center.launch()
+        let blocker = await center.create(instruction: "block")
+        #expect(await eventuallyOnMain { executor.calls.count == 1 })
+        center.resume(sleeper.id)
+        #expect(center.isQueued(sleeper.id))
+
+        // Another process ran it meanwhile, into its wait.
+        sleeper.status = .waiting
+        sleeper.nextWakeAt = Date().addingTimeInterval(1.5)
+        sleeper.statusLine = "Waiting until later"
+        fx.store.saveJob(sleeper)
+        latch.open()
+        #expect(await eventuallyOnMain { center.job(blocker.id)?.status == .completed })
+        #expect(!center.isQueued(sleeper.id))
+        #expect(await eventuallyOnMain { center.job(sleeper.id)?.status == .completed })
+        #expect(executor.calls.contains { $0.stepID == 2 })
+    }
+
+    /// Opening the notch reloads the list. Jobs this process runs keep the lines their runner
+    /// shows but never saves, so a job blocked on the user doesn't look like it's progressing.
+    @Test func reloadKeepsWhatRunningJobsShow() async throws {
+        let fx = try JobFixture()
+        defer { fx.cleanup() }
+        let lease = ScreenLease(idleProbe: { 1000 }, pollInterval: 0.01)
+        try await lease.acquire(owner: "task", priority: true)
+        let latch = Latch()
+        let executor = ScriptedExecutor { req, _ in
+            if req.step.id == 1 || req.step.id == 2 { await latch.wait() }
+            return ScriptedExecutor.standard(req) ?? StepResult(status: .done)
+        }
+        let plan = JobPlan(goal: "g", milestones: [Milestone(id: 1, title: "m", steps: [action(1, "Clicking", route: .gui), action(2, "Thinking")])])
+        let center = makeTestCenter(fx, plan: plan, executor: executor, lease: lease)
+        let job = await center.create(instruction: "x")
+        let waitLine = "Waiting to use the screen…"
+        #expect(await eventuallyOnMain { center.job(job.id)?.statusLine == waitLine })
+        #expect(fx.store.job(job.id)?.statusLine != waitLine)
+        center.reload()
+        #expect(center.job(job.id)?.statusLine == waitLine)
+
+        // Once it has the screen, the progress line is back.
+        await lease.release(owner: "task")
+        #expect(await eventuallyOnMain { executor.calls.count == 1 })
+        #expect(await eventuallyOnMain { center.job(job.id)?.statusLine == "Clicking" })
+
+        // "Pausing…" is only in memory too.
+        center.pause(job.id)
+        center.reload()
+        #expect(center.job(job.id)?.statusLine == "Pausing after the current step…")
+        latch.open()
+        #expect(await eventuallyOnMain { center.job(job.id)?.status == .paused && !center.hasRunner(job.id) })
+        #expect(center.job(job.id)?.statusLine == "Paused")
+    }
+
+    /// glidectl waits at "Start? [y/N]" holding nothing, and the user stops, deletes, or starts
+    /// and finishes the job in the app meanwhile. Answering "y" then shows what happened
+    /// instead of a confirmation nothing will act on (glidectl followed that forever).
+    @Test(arguments: ["stop", "delete", "finish"])
+    func startingAJobChangedElsewhereShowsWhatHappened(change: String) async throws {
+        let fx = try JobFixture()
+        defer { fx.cleanup() }
+        let plan = JobPlan(goal: "g", milestones: [Milestone(id: 1, title: "m", steps: [action(1, "A")])])
+        let cliExecutor = ScriptedExecutor()
+        let cli = makeTestCenter(fx, plan: plan, executor: cliExecutor, scope: .ownJobs)
+        let job = await cli.create(instruction: "x", autoStartIfSmall: false)
+        #expect(job.status == .awaitingConfirmation)
+
+        let app = makeTestCenter(fx, plan: plan, executor: ScriptedExecutor())
+        app.launch()
+        switch change {
+        case "stop": app.stop(job.id)
+        case "delete": app.delete(job.id)
+        default:
+            app.start(job.id)
+            #expect(await eventuallyOnMain { app.job(job.id)?.status == .completed && !app.hasRunner(job.id) })
+        }
+
+        cli.start(job.id)
+        #expect(!cli.isRunnerActive(job.id))
+        #expect(!cli.isRunningElsewhere(job.id))
+        switch change {
+        case "stop": #expect(cli.job(job.id)?.status == .stopped)
+        case "delete": #expect(cli.job(job.id) == nil)
+        default: #expect(cli.job(job.id)?.status == .completed)
+        }
+        #expect(cliExecutor.calls.isEmpty)
     }
 
     /// glidectl ran a sleeping job early and it went back to sleep until later. When the app's
@@ -566,6 +765,88 @@ struct JobRunnerFixTests {
         let final = await task.value
         #expect(final.status == .completed)
         #expect(final.usage.activeSeconds < 0.5)
+    }
+
+    /// An on-screen step that gives the screen up while the user works can wait for hours;
+    /// that isn't work either, and the job says why nothing moves meanwhile.
+    @Test func waitingForTheUserInsideAStepIsNotWorkTime() async throws {
+        let fx = try JobFixture()
+        defer { fx.cleanup() }
+        let plan = JobPlan(goal: "g", milestones: [Milestone(id: 1, title: "m", steps: [action(1, "Clicking", route: .gui), action(2, "Then this")])])
+        let executor = CallbackExecutor { req, callbacks in
+            if req.step.id == 1 {
+                await callbacks.waitingForUser(true)
+                try await Task.sleep(for: .milliseconds(800))
+                await callbacks.waitingForUser(false)
+            }
+            return ScriptedExecutor.standard(req) ?? StepResult(status: .done)
+        }
+        let lines = Mutex<[String]>([])
+        let record = fx.record(plan, budget: JobBudget(maxCostUSD: nil, maxDurationSeconds: 0.5, maxModelCalls: nil))
+        let final = await fx.runner(record, executor, callbacks: JobRunner.Callbacks(update: { r in lines.withLock { $0.append(r.statusLine) } })).run()
+        #expect(final.status == .completed)
+        #expect(final.usage.activeSeconds < 0.5)
+        let shown = lines.withLock { $0 }
+        let waitIndex = try #require(shown.firstIndex(of: "Waiting for you to let go of the mouse…"))
+        #expect(shown.dropFirst(waitIndex + 1).first == "Clicking", "the progress line comes back once the step carries on")
+    }
+
+    /// Pausing a job whose step gave the screen up to wait for the user ends the wait: the job
+    /// pauses and never takes the screen back, even once the user walks away. Resuming runs the
+    /// step again from a fresh look at the screen.
+    @Test(arguments: [false, true])
+    func pausingWhileAStepWaitsForTheUserPausesTheJob(behindAQuickTask: Bool) async throws {
+        let fx = try JobFixture()
+        defer { fx.cleanup() }
+        let plan = JobPlan(goal: "g", milestones: [Milestone(id: 1, title: "m", steps: [action(1, "Clicking", route: .gui), action(2, "Then this")])])
+        let lease = ScreenLease(idleProbe: { 1000 }, pollInterval: 0.01)
+        let idle = Box(0.0)
+        let waitFor = Box(true)
+        // What GUIStepRunner does when the user takes over: wait with the job's own watch.
+        let executor = CallbackExecutor { req, callbacks in
+            if req.step.id == 1, waitFor.value, let jobID = req.jobID {
+                let watch = UserTakeoverWatch(monitor: FakeInputMonitor(), idleSeconds: 5, idleProbe: { idle.value }, lease: lease,
+                                              leaseOwner: UserTakeoverWatch.leaseOwner(jobID: jobID), pollInterval: 0.01)
+                watch.noteUserInput()
+                _ = try await watch.waitForIdleUser(gate: ExecutionGate(), interrupted: callbacks.jobInterrupted)
+            }
+            return ScriptedExecutor.standard(req) ?? StepResult(status: .done)
+        }
+        let record = fx.record(plan)
+        let runner = fx.runner(record, executor, lease: lease)
+        let ended = Box(false)
+        let task = Task {
+            defer { ended.value = true }
+            return await runner.run()
+        }
+        #expect(await eventually { executor.stepIDs.count == 1 })
+        #expect(await eventually { await lease.currentHolder == nil }, "the step gave the screen up")
+        if behindAQuickTask {
+            // The user went idle with a quick task running; the step queues for the screen.
+            try await lease.acquire(owner: "task", priority: true)
+            idle.value = 10
+            #expect(await eventually { await lease.queueLength == 1 })
+        }
+        runner.pause()
+        #expect(await eventually(timeout: 3) { ended.value }, "the pause ends the wait")
+        #expect(await lease.queueLength == 0)
+        if behindAQuickTask {
+            #expect(await lease.currentHolder == "task")
+            await lease.release(owner: "task")
+        }
+        // The user walks away: nothing takes the screen.
+        idle.value = 10
+        let final = await task.value
+        #expect(final.status == .paused)
+        #expect(final.statusLine == "Paused")
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(await lease.currentHolder == nil)
+        #expect(executor.stepIDs == [1])
+
+        waitFor.value = false
+        let resumed = try await fx.resumeRunner(record.id, executor).run()
+        #expect(resumed.status == .completed)
+        #expect(executor.stepIDs.filter { $0 == 1 }.count == 2)
     }
 
     /// Updaters read the first row as column names, so a headerless source file is left as it

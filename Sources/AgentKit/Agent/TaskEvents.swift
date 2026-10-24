@@ -77,16 +77,22 @@ public struct AgentCallbacks: Sendable {
     /// carries on (false). Like an approval wait, that time isn't work, so a job runner can
     /// leave it out of the job's time budget.
     public var waitingForUser: @Sendable (Bool) async -> Void
+    /// Whether the job the step belongs to has been paused or stopped. A step waiting for the
+    /// user ends that wait instead of taking the screen back: a paused job must not start
+    /// clicking and typing on its own once the user walks away. Always false for quick tasks.
+    public var jobInterrupted: @Sendable () -> Bool
 
     public init(phase: @escaping @Sendable (AgentPhase, String) -> Void = { _, _ in },
                 log: @escaping @Sendable (ActivityEntry) -> Void = { _ in },
                 plan: @escaping @Sendable (Plan, Int) -> Void = { _, _ in },
                 approve: @escaping @Sendable (ApprovalRequest) async -> ApprovalDecision = { _ in .reject },
-                waitingForUser: @escaping @Sendable (Bool) async -> Void = { _ in }) {
+                waitingForUser: @escaping @Sendable (Bool) async -> Void = { _ in },
+                jobInterrupted: @escaping @Sendable () -> Bool = { false }) {
         self.phase = phase
         self.log = log
         self.plan = plan
         self.approve = approve
         self.waitingForUser = waitingForUser
+        self.jobInterrupted = jobInterrupted
     }
 }

@@ -93,7 +93,7 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
     /// Callbacks for the step runners: their log entries are persisted with this task.
     private var stepCallbacks: AgentCallbacks {
         AgentCallbacks(phase: callbacks.phase, log: { [weak self] e in self?.emit(e) }, plan: callbacks.plan, approve: callbacks.approve,
-                       waitingForUser: callbacks.waitingForUser)
+                       waitingForUser: callbacks.waitingForUser, jobInterrupted: callbacks.jobInterrupted)
     }
 
     // MARK: - Run
