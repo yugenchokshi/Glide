@@ -73,14 +73,20 @@ public struct AgentCallbacks: Sendable {
     public var log: @Sendable (ActivityEntry) -> Void
     public var plan: @Sendable (Plan, Int) -> Void
     public var approve: @Sendable (ApprovalRequest) async -> ApprovalDecision
+    /// A job's on-screen step stopped to wait for the user to leave the Mac alone (true), and
+    /// carries on (false). Like an approval wait, that time isn't work, so a job runner can
+    /// leave it out of the job's time budget.
+    public var waitingForUser: @Sendable (Bool) async -> Void
 
     public init(phase: @escaping @Sendable (AgentPhase, String) -> Void = { _, _ in },
                 log: @escaping @Sendable (ActivityEntry) -> Void = { _ in },
                 plan: @escaping @Sendable (Plan, Int) -> Void = { _, _ in },
-                approve: @escaping @Sendable (ApprovalRequest) async -> ApprovalDecision = { _ in .reject }) {
+                approve: @escaping @Sendable (ApprovalRequest) async -> ApprovalDecision = { _ in .reject },
+                waitingForUser: @escaping @Sendable (Bool) async -> Void = { _ in }) {
         self.phase = phase
         self.log = log
         self.plan = plan
         self.approve = approve
+        self.waitingForUser = waitingForUser
     }
 }

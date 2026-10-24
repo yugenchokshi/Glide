@@ -220,8 +220,14 @@ enum ActorSchema {
         d.remember = str("remember")
         d.message = str("message")
         d.toolName = str("tool_name")
-        d.toolArguments = str("tool_arguments_json").flatMap { JSONValue.extractObject(from: $0) }
-        d.resultFields = str("result_fields_json").flatMap { JSONValue.extractObject(from: $0)?.objectValue }
+        // Both JSON-string fields also accept the object itself, which models send when the
+        // schema isn't enforced (prompt-only fallbacks).
+        if case .object? = j["tool_arguments_json"] {
+            d.toolArguments = j["tool_arguments_json"]
+        } else {
+            d.toolArguments = str("tool_arguments_json").flatMap { JSONValue.extractObject(from: $0) }
+        }
+        d.resultFields = StepResult.decodeResultFields(j["result_fields_json"]).fields
         // Capped here so a model can't queue an unbounded batch; items without an action are dropped.
         d.followUps = (j["actions"]?.arrayValue ?? []).prefix(maxFollowUps).compactMap { item in
             guard item.objectValue != nil else { return nil }

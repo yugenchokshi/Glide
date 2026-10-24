@@ -243,7 +243,9 @@ public struct ToolStepRunner: StepExecuting {
                     continue
                 }
             }
-            if decision.resultFieldsUnreadable {
+            // Only a step that lists output fields needs them; for any other, whatever was sent
+            // (`[]`, `false`) is ignored rather than refused.
+            if decision.resultFieldsUnreadable, !request.step.outputFields.isEmpty {
                 state.note("result_fields_json wasn't a valid JSON object; send it again")
                 if state.recordError("unreadable result fields") { return state.result(.failed(state.budgetMessage)) }
                 continue
@@ -433,11 +435,12 @@ public struct ToolStepRunner: StepExecuting {
                 continue
             }
             let text = (response.json?["message"]?.stringValue ?? response.text).trimmingCharacters(in: .whitespacesAndNewlines)
-            let rawFields = response.json?["result_fields_json"]?.stringValue
-            let fields = rawFields.flatMap { JSONValue.extractObject(from: $0)?.objectValue }
+            let (fields, fieldsUnreadable) = StepResult.decodeResultFields(response.json?["result_fields_json"])
             let missing = StepResult.missingFields(fields, required: request.step.outputFields)
             if !missing.isEmpty && attempt == 0 {
-                reminder = "Your previous reply was missing result_fields_json keys: \(missing.joined(separator: ", ")). Include every listed key (null when unknown)."
+                reminder = fieldsUnreadable
+                    ? "result_fields_json in your previous reply wasn't a valid JSON object. Send it again with every listed key (null when unknown)."
+                    : "Your previous reply was missing result_fields_json keys: \(missing.joined(separator: ", ")). Include every listed key (null when unknown)."
                 continue
             }
             let complete = StepResult.completeFields(fields ?? [:], required: request.step.outputFields)
@@ -605,7 +608,8 @@ struct ToolDecision: Sendable {
     var thought: String
     var calls: [Call]
     var resultFields: [String: JSONValue]?
-    /// result_fields_json was given but isn't a JSON object.
+    /// result_fields_json was given but isn't a JSON object (acted on only when the step lists
+    /// output fields).
     var resultFieldsUnreadable: Bool
     var message: String?
     var remember: String?
@@ -666,13 +670,12 @@ enum ToolDecisionSchema {
             }
             return ToolDecision.Call(tool: tool, arguments: args, argumentsText: ToolStepRunner.clip(text, 300))
         }
-        let rawFields = str("result_fields_json")
-        let fields = rawFields.flatMap { JSONValue.extractObject(from: $0)?.objectValue }
+        let (fields, fieldsUnreadable) = StepResult.decodeResultFields(j["result_fields_json"])
         // An unknown status is treated as act: with calls they run, without calls it costs an
         // error and the model is told what's expected.
         let status = str("status").flatMap { ToolDecision.Status(rawValue: $0.lowercased()) } ?? .act
         return ToolDecision(status: status, thought: str("thought") ?? "", calls: calls, resultFields: fields,
-                            resultFieldsUnreadable: rawFields != nil && fields == nil, message: str("message"), remember: str("remember"))
+                            resultFieldsUnreadable: fieldsUnreadable, message: str("message"), remember: str("remember"))
     }
 }
 
@@ -849,7 +852,7 @@ struct MCPToolAdapter: AgentTool {
     func assess(_ arguments: JSONValue, context: ToolContext) -> ToolVerdict {
         // The tool's own name is judged (send/delete/post → high); the server name isn't, so a
         // server called "post-office" doesn't make every tool high risk.
-        let v = SafetyPolicy(settings: context.settings.safety).assessTool(name: tool.name, risk: .low)
+        let v = SafetyPolicy(settings: context.settings.safety).assessIntegrationTool(name: tool.name, arguments: arguments)
         return ToolVerdict(risk: v.risk, reasons: v.reasons, summary: "Run \(tool.name) on \(tool.server)")
     }
 
@@ -866,7 +869,7 @@ struct MCPToolAdapter: AgentTool {
         guard tools.count > limit else { return tools }
         let words = Set(ElementMatcherShim.tokens(instruction))
         let scored = tools.enumerated().map { i, t -> (Int, Int, MCPTool) in
-            let text = Set(ElementMatcherShim.tokens(t.name.replacingOccurrences(of: "_", with: " ") + " " + t.description))
+            let text = Set(ElementMatcherShim.tokens(SafetyPolicy.toolNameWords(t.name) + " " + t.description))
             return (words.intersection(text).count, i, t)
         }
         return scored.sorted { $0.0 != $1.0 ? $0.0 > $1.0 : $0.1 < $1.1 }.prefix(limit).map(\.2)
@@ -886,7 +889,7 @@ struct ComposioToolAdapter: AgentTool {
     }
 
     func assess(_ arguments: JSONValue, context: ToolContext) -> ToolVerdict {
-        let v = SafetyPolicy(settings: context.settings.safety).assessTool(name: schema.slug, risk: .low)
+        let v = SafetyPolicy(settings: context.settings.safety).assessIntegrationTool(name: schema.slug, arguments: arguments)
         return ToolVerdict(risk: v.risk, reasons: v.reasons, summary: "Run \(schema.slug)")
     }
 

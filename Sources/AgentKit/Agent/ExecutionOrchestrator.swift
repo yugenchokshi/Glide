@@ -18,6 +18,10 @@ public final class AutomationRuntime: @unchecked Sendable {
         return e
     }()
     public let interference = UserInterferenceMonitor()
+    /// The user-input monitor background jobs' on-screen steps run (`UserTakeoverWatch`). Its
+    /// own instance, so a job step never stops the quick task's; long-lived, because the
+    /// monitor's event tap refers to it without retaining it.
+    public let jobInterference = UserInterferenceMonitor()
 
     public init() {}
 }
@@ -88,7 +92,8 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
 
     /// Callbacks for the step runners: their log entries are persisted with this task.
     private var stepCallbacks: AgentCallbacks {
-        AgentCallbacks(phase: callbacks.phase, log: { [weak self] e in self?.emit(e) }, plan: callbacks.plan, approve: callbacks.approve)
+        AgentCallbacks(phase: callbacks.phase, log: { [weak self] e in self?.emit(e) }, plan: callbacks.plan, approve: callbacks.approve,
+                       waitingForUser: callbacks.waitingForUser)
     }
 
     // MARK: - Run

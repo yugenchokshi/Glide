@@ -872,3 +872,575 @@ struct OrchestratorToolRouteTests {
         #expect(failed.jobID == "job-43")
     }
 }
+
+// MARK: - Tool names and integration risk
+
+@Suite("SafetyPolicy tool names")
+struct SafetyToolNameTests {
+    let policy = SafetyPolicy(settings: SafetySettings())
+
+    @Test func toolNamesInAnyStyleBecomeWords() {
+        #expect(SafetyPolicy.toolNameWords("API-delete-a-block") == "api delete a block")
+        #expect(SafetyPolicy.toolNameWords("deleteRecord") == "delete record")
+        #expect(SafetyPolicy.toolNameWords("sendHTTPRequest") == "send http request")
+        #expect(SafetyPolicy.toolNameWords("GMAIL_SEND_EMAIL") == "gmail send email")
+        #expect(SafetyPolicy.toolNameWords("files/delete.v2") == "files delete v2")
+        #expect(SafetyPolicy.toolNameWords("slack:post__message") == "slack post message")
+    }
+
+    @Test func destructiveNamesAreHighRiskInEveryStyle() {
+        for name in ["API-delete-a-block", "deleteRecord", "sendMessage", "gmail.send", "files/delete", "post-message", "DeleteRecord",
+                     "emptyTrash", "placeOrder", "dropTable", "drop_database", "GMAIL_SEND_EMAIL", "stripe_create_refund", "replyToThread",
+                     "GMAIL_MOVE_TO_TRASH", "STRIPE_CREATE_CHARGE", "send_invite", "GITHUB_MERGE_A_PULL_REQUEST",
+                     // A read verb first doesn't excuse a strong verb later in the name.
+                     "get_and_delete", "search_and_replace", "fetchThenSend", "search_console_delete_site"] {
+            #expect(policy.assessTool(name: name, risk: .low).risk == .high, "\(name)")
+        }
+        for name in ["getRecord", "listBlocks", "API-retrieve-a-page", "GMAIL_FETCH_EMAILS", "dropbox_list_files"] {
+            #expect(policy.assessTool(name: name, risk: .low).risk == .low, "\(name)")
+        }
+        #expect(policy.assessTool(name: "API-update-a-block", risk: .low).risk == .medium)
+        #expect(policy.assessTool(name: "updateContact", risk: .low).risk == .medium)
+        #expect(policy.assessTool(name: "get_or_create_user", risk: .low).risk == .medium)
+    }
+
+    /// The reviewer's false positives: an HTTP method spelled into an OpenAPI name, and risky
+    /// nouns that a read verb is applied to.
+    @Test func readsOfRiskyNounsAreNotHighRisk() {
+        for name in ["API-post-search", "API-post-database-query", "getPost", "getPostComments", "get_post", "STRIPE_RETRIEVE_A_CHARGE",
+                     "get_invite", "gitlab_get_merge_request", "getShareLink", "post_search", "postSearch", "list_trash", "GMAIL_GET_DRAFT"] {
+            #expect(policy.assessTool(name: name, risk: .low).risk == .low, "\(name)")
+        }
+        // Drag and drop in a browser isn't dropping a table.
+        #expect(policy.assessTool(name: "browser_drop", risk: .low).risk == .low)
+        // A write method in an OpenAPI name is a write.
+        #expect(policy.assessTool(name: "API-patch-page", risk: .low).risk == .medium)
+        #expect(policy.assessTool(name: "API-post-page", risk: .low).risk == .medium)
+    }
+
+    @Test func integrationToolsRateByWhatTheyDo() {
+        // Reads stay low, so "Ask for medium and high" doesn't ask about every lookup.
+        for name in ["get_current_time", "GMAIL_FETCH_EMAILS", "notion-search", "API-retrieve-a-page", "get-library-docs", "resolve-library-id",
+                     "read_file", "API-post-search", "API-post-database-query", "API-get-self", "getPost", "STRIPE_RETRIEVE_A_CHARGE",
+                     "list_directory", "read_query"] {
+            #expect(policy.assessIntegrationTool(name: name, arguments: [:]).risk == .low, "\(name)")
+        }
+        // Anything that doesn't say it reads is at least medium: writes, and names with no verb.
+        for name in ["write_query", "run_query", "execute_sql", "browser_click", "browser_drop", "API-post-page", "API-patch-page",
+                     "sequentialthinking", "request", "write_file", "GMAIL_CREATE_EMAIL_DRAFT"] {
+            #expect(policy.assessIntegrationTool(name: name, arguments: [:]).risk == .medium, "\(name)")
+        }
+        #expect(policy.assessIntegrationTool(name: "API-delete-a-block", arguments: ["block_id": "b1"]).risk == .high)
+        #expect(policy.assessIntegrationTool(name: "GMAIL_SEND_EMAIL", arguments: [:]).risk == .high)
+        let delete = policy.assessIntegrationTool(name: "request", arguments: ["method": "delete", "url": "https://api.test/items/1"])
+        #expect(delete.risk == .high && delete.reasons.contains("HTTP DELETE"))
+        #expect(policy.assessIntegrationTool(name: "request", arguments: ["httpMethod": "GET"]).risk == .medium)
+        #expect(policy.assessIntegrationTool(name: "fetch", arguments: ["method": "GET"]).risk == .low)
+        #expect(policy.assessIntegrationTool(name: "fetch", arguments: ["method": "POST"]).risk == .medium)
+
+        let context = ToolContext(settings: AppSettings(), gate: ExecutionGate(), log: { _ in })
+        let mcp = MCPToolAdapter(tool: MCPTool(server: "notion", name: "API-get-self", description: "", inputSchema: ["type": "object"]),
+                                 call: { _, _ in ("", false) })
+        #expect(mcp.assess([:], context: context).risk == .low)
+        let write = MCPToolAdapter(tool: MCPTool(server: "sqlite", name: "write_query", description: "", inputSchema: ["type": "object"]),
+                                   call: { _, _ in ("", false) })
+        #expect(write.assess([:], context: context).risk == .medium)
+        let composio = ComposioToolAdapter(schema: .init(slug: "NOTION_DELETE_BLOCK", toolkit: "notion", description: "", inputSchema: nil),
+                                           client: ComposioClient(apiKey: "test", settings: ComposioSettings()), sessionID: "s")
+        #expect(composio.assess([:], context: context).risk == .high)
+    }
+
+    /// The reported case: a medium step calls a kebab-case delete tool. It must ask first.
+    @Test func kebabCaseDeleteInAMediumStepNeedsApproval() async throws {
+        let calls = Ledger()
+        let integrations = ToolStepRunner.Integrations(
+            composio: { nil },
+            mcpTools: { [MCPTool(server: "notion", name: "API-delete-a-block", description: "Delete a block.", inputSchema: ["type": "object"])] },
+            mcpCall: { name, _ in calls.add(name); return ("deleted", false) })
+        let llm = ScriptedLLM([toolReply(calls: [("notion__API-delete-a-block", ["block_id": "b1"])]), toolReply("step_done", message: "Tidied")])
+        let rec = CallbackRecorder([.reject])
+        _ = try await makeRunner([], llm: llm, integrations: integrations)
+            .execute(request(commandStep(route: .mcp, risk: .medium)), callbacks: rec.callbacks)
+        #expect(rec.approvals.map(\.risk) == [.high])
+        #expect(calls.all.isEmpty, "declined, so the delete never ran")
+    }
+
+    /// A for_each job that searches Notion for every row mustn't stop on "Waiting for your OK"
+    /// for each one, even when the user asks about medium-risk actions.
+    @Test func searchingWithPostRunsWithoutApproval() async throws {
+        for level in [ApprovalLevel.highRiskOnly, .mediumAndHigh] {
+            let calls = Ledger()
+            let integrations = ToolStepRunner.Integrations(
+                composio: { nil },
+                mcpTools: { [MCPTool(server: "notion", name: "API-post-search", description: "Search pages.", inputSchema: ["type": "object"]),
+                             MCPTool(server: "time", name: "get_current_time", description: "The time.", inputSchema: ["type": "object"])] },
+                mcpCall: { name, _ in calls.add(name); return ("found", false) })
+            let llm = ScriptedLLM([toolReply(calls: [("notion__API-post-search", ["query": "Acme"]), ("time__get_current_time", [:])]),
+                                   toolReply("step_done", message: "Found it")])
+            var settings = AppSettings()
+            settings.safety.approvalLevel = level
+            let rec = CallbackRecorder()
+            let result = try await makeRunner([], llm: llm, settings: settings, integrations: integrations)
+                .execute(request(commandStep(route: .mcp), jobID: "job-1"), callbacks: rec.callbacks)
+            #expect(result.status == .done)
+            #expect(rec.approvals.isEmpty, "\(level)")
+            #expect(calls.all == ["notion__API-post-search", "time__get_current_time"])
+        }
+    }
+}
+
+// MARK: - result_fields_json as an object
+
+@Suite("Result fields decoding")
+struct ResultFieldsDecodingTests {
+    @Test func resultFieldsAcceptAnObjectOrAString() {
+        let object = StepResult.decodeResultFields(["price": "$20"])
+        #expect(object.fields == ["price": "$20"] && !object.unreadable)
+        let string = StepResult.decodeResultFields(.string("{\"price\":\"$20\"}"))
+        #expect(string.fields == ["price": "$20"] && !string.unreadable)
+        for absent: JSONValue? in [nil, .null, .string(""), .string("null")] {
+            let r = StepResult.decodeResultFields(absent)
+            #expect(r.fields == nil && !r.unreadable)
+        }
+        for bad: JSONValue in [.string("oops"), .array(["$20"]), .number(20)] {
+            let r = StepResult.decodeResultFields(bad)
+            #expect(r.fields == nil && r.unreadable)
+        }
+    }
+
+    @Test func decodersAcceptObjectFields() {
+        let tool = ToolDecisionSchema.decode(["status": "step_done", "calls": [], "result_fields_json": ["price": "$20"]])
+        #expect(tool.resultFields == ["price": "$20"] && !tool.resultFieldsUnreadable)
+        let actor = ActorSchema.decode(["status": "step_done", "action": "none", "risk": "low", "result_fields_json": ["price": "$20"],
+                                        "tool_arguments_json": ["to": "a@b.c"]])
+        #expect(actor.resultFields == ["price": "$20"])
+        #expect(actor.toolArguments?["to"]?.stringValue == "a@b.c")
+    }
+
+    @Test func jobStepKeepsObjectFieldsWithoutAReminder() async throws {
+        let done: JSONValue = ["thought": "t", "status": "step_done", "calls": [], "result_fields_json": ["price": "$20"],
+                               "message": "Found it", "remember": .null]
+        let llm = ScriptedLLM([done])
+        let result = try await makeRunner([FakeTool("shell.run")], llm: llm)
+            .execute(request(commandStep(outputFields: ["price"]), jobID: "job-1"), callbacks: CallbackRecorder().callbacks)
+        #expect(result.status == .done)
+        #expect(result.fields == ["price": "$20"])
+        #expect(result.modelCalls == 1)
+
+        let answer = ScriptedLLM([["message": "The price is $20", "result_fields_json": ["price": "$20"]]])
+        let written = try await makeRunner([], llm: answer)
+            .execute(request(commandStep(outputFields: ["price"], route: .answer), jobID: "job-1"), callbacks: CallbackRecorder().callbacks)
+        #expect(written.fields == ["price": "$20"])
+        #expect(written.modelCalls == 1)
+    }
+
+    /// A step with no output fields doesn't need any, so an odd value (`[]`, `false`, text) the
+    /// model sends with step_done is ignored instead of costing an error and another turn.
+    @Test func stepsWithoutOutputFieldsIgnoreOddFields() async throws {
+        for odd: JSONValue in [.array([]), .bool(false), .number(0), .string("none")] {
+            let done: JSONValue = ["thought": "t", "status": "step_done", "calls": [], "result_fields_json": odd, "message": "Done", "remember": .null]
+            let llm = ScriptedLLM([done])
+            let result = try await makeRunner([FakeTool("shell.run")], llm: llm)
+                .execute(request(commandStep(), jobID: "job-1"), callbacks: CallbackRecorder().callbacks)
+            #expect(result.status == .done, "\(odd)")
+            #expect(result.modelCalls == 1, "\(odd)")
+            #expect(result.fields.isEmpty)
+        }
+        // With output fields, the model is still asked to send them again.
+        let bad: JSONValue = ["thought": "t", "status": "step_done", "calls": [], "result_fields_json": .array([]), "message": "Done", "remember": .null]
+        let good: JSONValue = ["thought": "t", "status": "step_done", "calls": [], "result_fields_json": ["price": "$20"], "message": "Done", "remember": .null]
+        let llm = ScriptedLLM([bad, good])
+        let result = try await makeRunner([FakeTool("shell.run")], llm: llm)
+            .execute(request(commandStep(outputFields: ["price"]), jobID: "job-1"), callbacks: CallbackRecorder().callbacks)
+        #expect(result.fields == ["price": "$20"])
+        #expect(result.modelCalls == 2)
+        #expect(llm.userMessages.last?.contains("wasn't a valid JSON object") == true)
+    }
+}
+
+// MARK: - Job steps and the user taking over
+
+/// A user-input monitor the test fires by hand.
+final class FakeInputMonitor: UserInputMonitoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var handler: (@Sendable () -> Void)?
+    var isRunning: Bool { lock.withLock { handler != nil } }
+    func start(onUserInput: @escaping @Sendable () -> Void) { lock.withLock { handler = onUserInput } }
+    func stop() { lock.withLock { handler = nil } }
+    func userMovedTheMouse() { lock.withLock { handler }?() }
+}
+
+/// A value tests change while code under test polls it.
+final class Box<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: T
+    init(_ value: T) { _value = value }
+    var value: T {
+        get { lock.withLock { _value } }
+        set { lock.withLock { _value = newValue } }
+    }
+}
+
+@Suite("Job steps and user input")
+struct JobStepUserInputTests {
+    @Test func theWatchFollowsTheSettings() {
+        let runtime = AutomationRuntime()
+        let lease = ScreenLease(idleProbe: { 1000 })
+        var settings = AppSettings()
+        settings.jobs.idleSeconds = 45
+        let idle = UserTakeoverWatch.forStep(request(jobID: "job-1"), settings: settings, runtime: runtime, lease: lease)
+        #expect(idle?.mode == .anyInput && idle?.waitSeconds == 45)
+        #expect(UserTakeoverWatch.forStep(request(), settings: settings, runtime: runtime, lease: lease) == nil,
+                "quick tasks are watched by the orchestrator")
+        settings.jobs.idleSeconds = 0
+        #expect(UserTakeoverWatch.forStep(request(jobID: "job-1"), settings: settings, runtime: runtime, lease: lease)?.waitSeconds
+                == UserTakeoverWatch.minimumIdleSeconds)
+        // "Any time": only collisions count, and the wait is a short settle, not the idle time.
+        settings.jobs.idleSeconds = 45
+        settings.jobs.screenUse = .always
+        let always = UserTakeoverWatch.forStep(request(jobID: "job-1"), settings: settings, runtime: runtime, lease: lease)
+        #expect(always?.mode == .collisions && always?.waitSeconds == UserTakeoverWatch.minimumIdleSeconds)
+        settings.safety.pauseOnUserInput = false
+        #expect(UserTakeoverWatch.forStep(request(jobID: "job-1"), settings: settings, runtime: runtime, lease: lease) == nil)
+        #expect(UserTakeoverWatch.leaseOwner(jobID: "job-1") == "job:job-1")
+    }
+
+    @Test func anyTimeCountsOnlyInputThatCollidesWithTheAgents() {
+        let lastPost = Box(Date.distantPast)
+        let monitor = FakeInputMonitor()
+        let watch = UserTakeoverWatch(monitor: monitor, mode: .collisions, idleSeconds: 3, lastAgentInput: { lastPost.value })
+        watch.start()
+        monitor.userMovedTheMouse()
+        #expect(!watch.userTookOver, "the user moving the mouse while the model thinks isn't a takeover")
+        lastPost.value = Date()
+        monitor.userMovedTheMouse()
+        #expect(watch.userTookOver)
+
+        let whenIdle = UserTakeoverWatch(monitor: FakeInputMonitor(), idleSeconds: 30)
+        whenIdle.noteUserInput()
+        #expect(whenIdle.userTookOver, "while the user is meant to be away, any input counts")
+    }
+
+    /// A step given the screen while the user is busy (the lease took their input for Glide's)
+    /// waits before it touches anything; Glide's own recent input doesn't make it wait.
+    @Test func aStepStartingWhileTheUserIsBusyWaitsFirst() {
+        func watch(idle: Double, glideLastPosted: Double, mode: UserTakeoverWatch.Mode = .anyInput) -> UserTakeoverWatch {
+            let posted = Date().addingTimeInterval(-glideLastPosted)
+            return UserTakeoverWatch(monitor: FakeInputMonitor(), mode: mode, idleSeconds: 30, idleProbe: { idle }, lastAgentInput: { posted })
+        }
+        let busy = watch(idle: 2, glideLastPosted: 60)
+        busy.noteRecentUserInput()
+        #expect(busy.userTookOver, "the user's own input 2 seconds ago")
+        let glide = watch(idle: 2, glideLastPosted: 2)
+        glide.noteRecentUserInput()
+        #expect(!glide.userTookOver, "the last input was the previous step's")
+        let away = watch(idle: 45, glideLastPosted: 600)
+        away.noteRecentUserInput()
+        #expect(!away.userTookOver)
+        let anyTime = watch(idle: 2, glideLastPosted: 60, mode: .collisions)
+        anyTime.noteRecentUserInput()
+        #expect(!anyTime.userTookOver, "with \"any time\" the user may be at the Mac")
+    }
+
+    @Test func waitsUntilTheUserIsIdleThenContinues() async throws {
+        let monitor = FakeInputMonitor()
+        let idle = Box(0.0)
+        let watch = UserTakeoverWatch(monitor: monitor, idleSeconds: 5, idleProbe: { idle.value }, pollInterval: 0.01)
+        watch.start()
+        #expect(monitor.isRunning)
+        monitor.userMovedTheMouse()
+        #expect(watch.userTookOver)
+        let finished = Box(false)
+        let wait = Task {
+            defer { finished.value = true }
+            return try await watch.waitForIdleUser(gate: ExecutionGate())
+        }
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(!finished.value, "still waiting while the user is active")
+        #expect(!monitor.isRunning, "the idle time is what's watched meanwhile")
+        idle.value = 6
+        let waited = try await wait.value
+        #expect(waited > 0.1)
+        #expect(!watch.userTookOver)
+        #expect(monitor.isRunning, "watching again once the step carries on")
+
+        // Answering an approval moves the mouse too; that's not a takeover.
+        monitor.userMovedTheMouse()
+        watch.clear()
+        #expect(!watch.userTookOver)
+        watch.stop()
+        #expect(!monitor.isRunning)
+    }
+
+    /// The reviewer's case: the user comes back and starts a quick task while a job's step
+    /// waits for them. The quick task gets the screen at once, its Stop doesn't end the job's
+    /// wait, and the job takes the screen back after the task, with the gate cleared.
+    @Test func givesTheScreenToAQuickTaskWhileWaiting() async throws {
+        let lease = ScreenLease(idleProbe: { 1000 })
+        try await lease.acquire(owner: "job:j1")
+        let monitor = FakeInputMonitor()
+        let idle = Box(0.0)
+        let gate = ExecutionGate()
+        let watch = UserTakeoverWatch(monitor: monitor, idleSeconds: 5, idleProbe: { idle.value }, lease: lease, leaseOwner: "job:j1",
+                                      pollInterval: 0.01)
+        watch.start()
+        monitor.userMovedTheMouse()
+        let finished = Box(false)
+        let wait = Task {
+            defer { finished.value = true }
+            return try await watch.waitForIdleUser(gate: gate)
+        }
+        #expect(await eventually { await lease.currentHolder == nil })
+        #expect(watch.screenHandedOver)
+        #expect(!monitor.isRunning)
+
+        // A quick task takes the screen straight away and uses the shared gate.
+        try await lease.acquire(owner: "task:1", priority: true)
+        #expect(await lease.currentHolder == "task:1")
+        gate.stop()
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(!finished.value, "the quick task's Stop is its own")
+
+        // The user goes idle; the job queues behind the quick task.
+        idle.value = 10
+        #expect(await eventually { await lease.queueLength == 1 })
+        #expect(!finished.value)
+        await lease.release(owner: "task:1")
+        _ = try await wait.value
+        #expect(await lease.currentHolder == "job:j1")
+        #expect(gate.current == .running, "the quick task's Stop is cleared before the job uses the screen")
+        #expect(!watch.screenHandedOver)
+        #expect(monitor.isRunning)
+        await lease.release(owner: "job:j1")
+    }
+
+    @Test func takesTheScreenBackOnlyOnceTheUserIsIdleAgain() async throws {
+        let lease = ScreenLease(idleProbe: { 1000 })
+        try await lease.acquire(owner: "job:j1")
+        let idle = Box(0.0)
+        let watch = UserTakeoverWatch(monitor: FakeInputMonitor(), idleSeconds: 5, idleProbe: { idle.value }, lease: lease, leaseOwner: "job:j1",
+                                      pollInterval: 0.01)
+        watch.noteUserInput()
+        let finished = Box(false)
+        let wait = Task {
+            defer { finished.value = true }
+            return try await watch.waitForIdleUser(gate: ExecutionGate())
+        }
+        #expect(await eventually { await lease.currentHolder == nil })
+        try await lease.acquire(owner: "task:1", priority: true)
+        idle.value = 10
+        #expect(await eventually { await lease.queueLength == 1 })
+        // The quick task's own input (or the user's) means the Mac wasn't left alone after all.
+        idle.value = 0
+        await lease.release(owner: "task:1")
+        #expect(await eventually {
+            let holder = await lease.currentHolder
+            let queued = await lease.queueLength
+            return holder == nil && queued == 0
+        })
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(!finished.value, "the screen went back and the wait goes on")
+        #expect(await lease.currentHolder == nil)
+        idle.value = 10
+        _ = try await wait.value
+        #expect(await lease.currentHolder == "job:j1")
+        await lease.release(owner: "job:j1")
+    }
+
+    @Test func stopAndCancellationEndTheWait() async throws {
+        let monitor = FakeInputMonitor()
+        let watch = UserTakeoverWatch(monitor: monitor, idleSeconds: 30, idleProbe: { 0 }, pollInterval: 0.01)
+        watch.start()
+        watch.noteUserInput()
+        let cancelled = Task { try await watch.waitForIdleUser(gate: ExecutionGate()) }
+        try await Task.sleep(for: .milliseconds(50))
+        cancelled.cancel()
+        await #expect(throws: AutomationError.stopped) { try await cancelled.value }
+
+        // Keeping the screen (no lease to give up), the step's own gate still counts.
+        let gate = ExecutionGate()
+        let stopped = Task { try await watch.waitForIdleUser(gate: gate) }
+        try await Task.sleep(for: .milliseconds(50))
+        gate.stop()
+        await #expect(throws: AutomationError.stopped) { try await stopped.value }
+        watch.stop()
+
+        // Stopping the job while its step waits for the screen leaves the queue and doesn't take it.
+        let lease = ScreenLease(idleProbe: { 1000 })
+        try await lease.acquire(owner: "job:j1")
+        let idle = Box(0.0)
+        let handedOver = UserTakeoverWatch(monitor: FakeInputMonitor(), idleSeconds: 5, idleProbe: { idle.value }, lease: lease,
+                                           leaseOwner: "job:j1", pollInterval: 0.01)
+        handedOver.noteUserInput()
+        let queued = Task { try await handedOver.waitForIdleUser(gate: ExecutionGate()) }
+        #expect(await eventually { await lease.currentHolder == nil })
+        try await lease.acquire(owner: "task:1", priority: true)
+        idle.value = 10
+        #expect(await eventually { await lease.queueLength == 1 })
+        queued.cancel()
+        await #expect(throws: AutomationError.stopped) { try await queued.value }
+        #expect(await eventually { await lease.queueLength == 0 })
+        await lease.release(owner: "task:1")
+        #expect(await lease.currentHolder == nil)
+    }
+
+    /// Job steps share one long-lived monitor. A step that gave the screen up and is then
+    /// stopped must not switch off the monitor of the step that holds the screen now.
+    @Test func aWaitingStepNeverStopsTheNextHoldersMonitor() async throws {
+        let shared = FakeInputMonitor()
+        let lease = ScreenLease(idleProbe: { 1000 })
+        try await lease.acquire(owner: "job:a")
+        let a = UserTakeoverWatch(monitor: shared, idleSeconds: 5, idleProbe: { 0 }, lease: lease, leaseOwner: "job:a", pollInterval: 0.01)
+        a.start()
+        a.noteUserInput()
+        let waiting = Task { try await a.waitForIdleUser(gate: ExecutionGate()) }
+        #expect(await eventually { await lease.currentHolder == nil })
+        try await lease.acquire(owner: "job:b")
+        let b = UserTakeoverWatch(monitor: shared, idleSeconds: 5)
+        b.start()
+        waiting.cancel()
+        await #expect(throws: AutomationError.stopped) { try await waiting.value }
+        a.stop() // what GUIStepRunner.execute's defer does
+        #expect(shared.isRunning, "job b's step is still watched")
+        b.stop()
+        #expect(!shared.isRunning)
+        await lease.release(owner: "job:b")
+    }
+
+    /// The runner's side: the wait is logged, reported to the job (so its time budget can leave
+    /// it out) and pushes the step's deadline out.
+    @Test func theRunnerLogsAndReportsTheWait() async throws {
+        let credentials = CredentialStore(service: "dev.glide.tests.\(UUID().uuidString)")
+        credentials.useMemoryOnly()
+        let settings = AppSettings()
+        let runner = GUIStepRunner(settings: settings, runtime: AutomationRuntime(), router: ModelRouter(settings: settings, credentials: credentials),
+                                   screenLease: ScreenLease(idleProbe: { 1000 }))
+        let idle = Box(0.0)
+        let watch = UserTakeoverWatch(monitor: FakeInputMonitor(), idleSeconds: 5, idleProbe: { idle.value }, pollInterval: 0.01)
+        let events = Ledger()
+        let callbacks = AgentCallbacks(log: { events.add($0.title) }, waitingForUser: { events.add("waiting: \($0)") })
+        let step = commandStep(route: .gui).asPlanStep
+        let session = TaskSession(deadline: Date().addingTimeInterval(60), maxTotalActions: 10)
+        let before = session.deadline
+        let run = GUIStepRunner.Run(instruction: "Test goal", plan: Plan(goal: "Test goal", steps: [step], clarification: nil), session: session,
+                                    metrics: TaskMetrics(), callbacks: callbacks, isJob: true, takeover: watch)
+        #expect(try await runner.waitForUser(step, run) == false, "nothing to wait for")
+        #expect(events.all.isEmpty)
+
+        watch.noteUserInput()
+        let wait = Task { try await runner.waitForUser(step, run) }
+        #expect(await eventually { events.all.count == 2 })
+        #expect(events.all == ["Paused because you used the mouse", "waiting: true"])
+        try await Task.sleep(for: .milliseconds(100))
+        idle.value = 10
+        #expect(try await wait.value)
+        #expect(events.all == ["Paused because you used the mouse", "waiting: true", "waiting: false", "Continuing after you've been idle"])
+        #expect(session.deadline > before.addingTimeInterval(0.05))
+
+        // A stop while waiting still reports the end of the wait.
+        idle.value = 0
+        watch.noteUserInput()
+        let stopped = Task { try await runner.waitForUser(step, run) }
+        #expect(await eventually { events.all.count == 6 })
+        stopped.cancel()
+        await #expect(throws: AutomationError.stopped) { try await stopped.value }
+        #expect(events.all.last == "waiting: false")
+    }
+
+    @Test func waitingDoesNotCountTowardTheStepTimeLimit() throws {
+        let session = TaskSession(deadline: Date().addingTimeInterval(-1), maxTotalActions: 10)
+        #expect(throws: AutomationError.self) { try session.checkLimits(gate: nil) }
+        session.extendDeadline(by: 60)
+        try session.checkLimits(gate: nil)
+    }
+}
+
+// MARK: - Quick tasks waiting for the screen
+
+@MainActor
+@Suite("TaskController and the screen lease", .serialized)
+struct TaskControllerLeaseTests {
+    final class Fixture {
+        let suite = "dev.glide.tests.\(UUID().uuidString)"
+        let runtime = AutomationRuntime()
+        let lease = ScreenLease(idleProbe: { 1000 })
+        let store: SettingsStore
+        let controller: TaskController
+
+        @MainActor init() {
+            store = SettingsStore(defaults: UserDefaults(suiteName: suite) ?? .standard)
+            var s = AppSettings()
+            s.providers = [ProviderConfig(id: "mock", kind: .openaiCompatible, name: "Mock", baseURL: "http://127.0.0.1:9", requiresKey: false, models: ["mock"])]
+            s.routing.preferredProviderID = "mock"
+            s.composio.enabled = false
+            store.settings = s
+            let credentials = CredentialStore(service: "dev.glide.tests.\(UUID().uuidString)")
+            credentials.useMemoryOnly()
+            controller = TaskController(runtime: runtime, settingsStore: store, screenLease: lease, credentials: credentials)
+        }
+
+        func cleanUp() { UserDefaults.standard.removePersistentDomain(forName: suite) }
+    }
+
+    /// Starts a quick task while a "job" holds the screen and waits until it's queued behind it.
+    func startWaiting(_ fx: Fixture) async throws {
+        try await fx.lease.acquire(owner: "job:test")
+        fx.controller.start("Rename the report")
+        let lease = fx.lease
+        #expect(await eventually { await lease.queueLength == 1 })
+        #expect(fx.controller.status == TaskController.waitingForScreenStatus)
+        #expect(fx.controller.phase == .planning)
+    }
+
+    @Test func stopWhileWaitingLeavesTheJobsStepAlone() async throws {
+        let fx = Fixture()
+        defer { fx.cleanUp() }
+        try await startWaiting(fx)
+        fx.controller.stop()
+        #expect(fx.runtime.gate.current == .running, "the job's on-screen step keeps going")
+        #expect(await eventuallyOnMain { !fx.controller.isWindingDown })
+        #expect(fx.controller.phase == .stopped)
+        #expect(fx.controller.lastResult?.status == .stopped)
+        #expect(await fx.lease.currentHolder == "job:test")
+        #expect(await fx.lease.queueLength == 0)
+        await fx.lease.release(owner: "job:test")
+    }
+
+    @Test func pauseWhileWaitingLeavesTheJobsStepAlone() async throws {
+        let fx = Fixture()
+        defer { fx.cleanUp() }
+        try await startWaiting(fx)
+        fx.controller.pause()
+        #expect(fx.controller.phase == .paused)
+        #expect(fx.runtime.gate.current == .running)
+        // The job's next on-screen step resets the gate; the quick task's pause is its own.
+        fx.runtime.gate.reset()
+        #expect(fx.controller.phase == .paused)
+        fx.controller.resume()
+        #expect(fx.controller.phase == .planning)
+        #expect(fx.controller.status == TaskController.waitingForScreenStatus)
+        #expect(fx.runtime.gate.current == .running)
+        fx.controller.stop()
+        #expect(await eventuallyOnMain { !fx.controller.isWindingDown })
+        #expect(fx.runtime.gate.current == .running)
+        await fx.lease.release(owner: "job:test")
+    }
+
+    @Test func aPauseFromTheWaitAppliesOnceTheScreenIsHeld() {
+        let fx = Fixture()
+        defer { fx.cleanUp() }
+        let c = fx.controller
+        c.previewState(phase: .planning, status: TaskController.waitingForScreenStatus)
+        c.pause()
+        #expect(fx.runtime.gate.current == .running)
+        // An earlier job step's stop is still on the gate when the lease is granted.
+        fx.runtime.gate.stop()
+        c.takeInputGate()
+        #expect(fx.runtime.gate.isPaused, "the stale stop is cleared, the user's pause applied")
+        c.resume()
+        #expect(fx.runtime.gate.current == .running)
+        #expect(c.phase == .executing)
+        c.stop()
+        #expect(fx.runtime.gate.isStopped, "holding the screen, Stop stops the gate")
+    }
+}
