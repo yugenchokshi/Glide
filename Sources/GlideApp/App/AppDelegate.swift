@@ -18,13 +18,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         NSApp.mainMenu = Self.makeMainMenu()
+        installAgentSubsystems()
         notchModel.openSettings = { [weak self] section in self?.showSettings(section) }
+        notchModel.openJob = { [weak self] id in self?.showJob(id) }
         notch = NotchWindowController(model: notchModel)
-        statusItem = StatusItemController(controller: controller, onOpen: { [weak self] in self?.toggleNotch() },
+        statusItem = StatusItemController(controller: controller, jobs: JobCenter.shared, onOpen: { [weak self] in self?.toggleNotch() },
                                           onSettings: { [weak self] in self?.showSettings(nil) },
-                                          onHistory: { [weak self] in self?.showSettings("history") })
+                                          onHistory: { [weak self] in self?.showSettings("history") },
+                                          onJobs: { [weak self] in self?.showSettings("jobs") })
         controller.onAttentionNeeded = { [weak self] in self?.notchModel.recompute() }
         controller.onFinished = { [weak self] result in self?.notchModel.taskFinished(result) }
+        startJobs()
 
         hotkeys.handler = { [weak self] action in
             guard let self else { return }
@@ -47,6 +51,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--settings") {
             showSettings(args.indices.contains(i + 1) ? args[i + 1] : nil)
+        }
+    }
+
+    /// Launch hook for the agent's subsystems, called before any UI or job runs so the first
+    /// task already sees every tool. Integration adds the call sites here:
+    /// - the tool families: `CommandTools.install()`, `BrowserTools.install()`,
+    ///   `DataTools.install()`, `WebTools.install()`, `WorkspaceTools.install()`
+    /// - the step runners: `StepRouter.install()` (fills `StepExecutorFactory.make`)
+    /// - the browser: `BrowserHub.shared.register(GlideChromeBackend(...))` and
+    ///   `ExtensionBridge.shared.start(settings: store.settings)`, which registers the
+    ///   extension backend and the pairing hooks Settings › Browser shows
+    private func installAgentSubsystems() {}
+
+    /// Background jobs: route their attention requests to the notch (and to a notification
+    /// when the notch is collapsed), then load and resume them. Callbacks are set before
+    /// `launch()` so jobs resumed at launch can already ask for approval.
+    private func startJobs() {
+        let jobs = JobCenter.shared
+        jobs.onAttentionNeeded = { [weak self] id in
+            guard let self, let job = JobCenter.shared.job(id) else { return }
+            self.announce(job) { self.notchModel.jobNeedsAttention(id) }
+        }
+        jobs.onJobFinished = { [weak self] job in
+            guard let self else { return }
+            self.announce(job) { self.notchModel.jobFinished(job) }
+        }
+        JobNotifier.shared.onOpenJob = { [weak self] id in self?.showJob(id) }
+        JobNotifier.shared.install()
+        jobs.launch()
+    }
+
+    /// Shows a job event in the notch, and also as a notification if the notch was collapsed
+    /// when it happened (you're probably looking elsewhere).
+    private func announce(_ job: JobRecord, show: () -> Void) {
+        let wasExpanded = notchModel.isExpanded
+        guard notchModel.shouldAnnounce(job) else { return }
+        show()
+        if !wasExpanded && store.settings.jobs.notifications {
+            JobNotifier.shared.notify(job, approval: JobCenter.shared.pendingApprovals[job.id])
         }
     }
 
@@ -94,8 +137,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         notchModel.toggle()
     }
 
+    /// Opens Settings › Jobs on one job (notch "View report", notifications).
+    func showJob(_ id: String) {
+        showSettings(nil)
+        settingsNav.showJob(id)
+    }
+
     func showSettings(_ section: String?) {
-        if let section, let s = SettingsSection(rawValue: section) { settingsNav.selection = s }
+        if let section, let s = SettingsSection(rawValue: section) { settingsNav.select(s) }
         if settingsWindow == nil {
             let view = SettingsRootView(nav: settingsNav, store: store,
                                         onHotkeysChanged: { [weak self] in
@@ -175,15 +224,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 final class StatusItemController: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let controller: TaskController
+    let jobs: JobCenter
     let onOpen: () -> Void
     let onSettings: () -> Void
     let onHistory: () -> Void
+    let onJobs: () -> Void
 
-    init(controller: TaskController, onOpen: @escaping () -> Void, onSettings: @escaping () -> Void, onHistory: @escaping () -> Void) {
+    init(controller: TaskController, jobs: JobCenter, onOpen: @escaping () -> Void, onSettings: @escaping () -> Void,
+         onHistory: @escaping () -> Void, onJobs: @escaping () -> Void) {
         self.controller = controller
+        self.jobs = jobs
         self.onOpen = onOpen
         self.onSettings = onSettings
         self.onHistory = onHistory
+        self.onJobs = onJobs
         super.init()
         if let button = item.button {
             button.image = NSImage(systemSymbolName: "sparkles.rectangle.stack", accessibilityDescription: "Glide")
@@ -205,7 +259,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             menu.addItem(item(controller.phase == .paused ? "Resume" : "Pause", #selector(togglePause)))
             menu.addItem(item("Stop Task", #selector(stop)))
         }
+        if let job = jobs.activeJob {
+            let line = NSMenuItem(title: "Job: \(NotchApprovalView.short(job.title, max: 40)) — \(job.displayLine)", action: nil, keyEquivalent: "")
+            line.isEnabled = false
+            menu.addItem(.separator())
+            menu.addItem(line)
+        }
         menu.addItem(.separator())
+        let unfinished = jobs.unfinishedJobs.count
+        menu.addItem(item(unfinished > 0 ? "Background Jobs (\(unfinished))…" : "Background Jobs…", #selector(showJobs)))
         menu.addItem(item("Task History…", #selector(history)))
         menu.addItem(item("Settings…", #selector(settings), key: ","))
         menu.addItem(.separator())
@@ -223,5 +285,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc func stop() { controller.stop() }
     @objc func settings() { onSettings() }
     @objc func history() { onHistory() }
+    @objc func showJobs() { onJobs() }
     @objc func quit() { controller.stop(); NSApp.terminate(nil) }
 }
