@@ -11,6 +11,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     lazy var voice = VoiceSession(recognizer: OnDeviceRecognizer(), speaker: GlideSpeaker.shared,
                                   settings: { [store] in store.settings.voice }, micAuthorized: { VoicePermissions.micAuthorized })
     lazy var notchModel = NotchModel(controller: controller, settings: store, voice: voice)
+    /// The near-real-time voice (OpenAI Realtime), with the on-device path as its fallback.
+    lazy var realtime = RealtimeLauncher(settings: store, glide: controller)
     var notch: NotchWindowController?
     var statusItem: StatusItemController?
     let hotkeys = HotkeyManager()
@@ -22,6 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.setActivationPolicy(.accessory)
         NSApp.mainMenu = Self.makeMainMenu()
         installAgentSubsystems()
+        voice.makeRealtime = { [weak self] in self?.realtime.make() ?? (nil, nil) }
+        voice.realtimeFailed = { [weak self] in self?.realtime.noteFailure() }
+        voice.prefersRealtime = { [weak self] in self?.realtime.wouldUseRealtime ?? false }
         notchModel.openSettings = { [weak self] section in self?.showSettings(section) }
         notchModel.openJob = { [weak self] id in self?.showJob(id) }
         notch = NotchWindowController(model: notchModel)
