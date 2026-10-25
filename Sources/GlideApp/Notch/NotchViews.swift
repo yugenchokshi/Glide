@@ -73,6 +73,10 @@ struct NotchRootView: View {
             case .approval: NotchApprovalView(model: model).transition(.opacity)
             case .result: NotchResultView(model: model).transition(.opacity)
             case .job: NotchJobCard(model: model).transition(.opacity)
+            case .listening: NotchListeningView(model: model).transition(.opacity.combined(with: .move(edge: .top)))
+            case .thinking: NotchThinkingView().transition(.opacity)
+            case .speaking: NotchSpeakingView(model: model).transition(.opacity)
+            case .question: NotchQuestionView(model: model).transition(.opacity)
             }
         }
     }
@@ -96,7 +100,10 @@ struct NotchRootView: View {
                 BKAgentOrb(mode: .idle, size: 10)
             }
             Spacer()
-            if c.isRunning, let plan = c.plan, model.presentation != .idle {
+            if model.voice.micLive && model.presentation != .listening {
+                // Listening for an answer or an interruption: the microphone is never on unseen.
+                MicIndicator()
+            } else if c.isRunning, let plan = c.plan, model.presentation != .idle {
                 Text("\(min(c.currentStepIndex + 1, plan.steps.count))/\(plan.steps.count)")
                     .font(.system(size: 11, weight: .semibold, design: .rounded)).foregroundStyle(BK.Notch.secondary)
             } else if let wingJob {
@@ -109,6 +116,11 @@ struct NotchRootView: View {
     }
 
     var orbMode: BKAgentOrb.Mode {
+        switch model.presentation {
+        case .listening, .thinking: return .thinking
+        case .speaking where model.voice.isSpeaking: return .acting
+        default: break
+        }
         switch model.controller.phase {
         case .planning: return .thinking
         case .executing: return .acting
@@ -125,7 +137,6 @@ struct NotchRootView: View {
 struct NotchInputView: View {
     @Bindable var model: NotchModel
     @FocusState private var focused: Bool
-    @State private var voice = VoiceInput.shared
     @State private var recents: [TaskRecord] = []
 
     var empty: Bool { model.inputText.trimmingCharacters(in: .whitespaces).isEmpty }
@@ -155,12 +166,7 @@ struct NotchInputView: View {
                     .onSubmit { model.submit() }
                     .onKeyPress(.escape) { model.close(); return .handled }
                     .accessibilityLabel("Task")
-                if model.settings.settings.enableVoiceInput {
-                    BKIconButton(systemName: voice.isListening ? "waveform" : "mic.fill", help: voice.isListening ? "Stop dictation" : "Dictate",
-                                 tone: voice.isListening ? .danger : nil, size: 30) {
-                        voice.toggle { model.inputText = $0 }
-                    }
-                }
+                BKIconButton(systemName: "mic.fill", help: "Talk instead", size: 30) { model.startListening() }
                 Button { model.submit() } label: {
                     Image(systemName: "arrow.up").font(.system(size: 13, weight: .bold)).foregroundStyle(.white)
                         .frame(width: 30, height: 30)
@@ -182,27 +188,19 @@ struct NotchInputView: View {
                 NotchJobRow(model: model, job: job, pill: true)
             }
 
-            HStack(spacing: 6) {
-                ForEach(recents.prefix(3)) { r in
-                    Button { model.inputText = r.instruction } label: {
-                        HStack(spacing: 5) {
-                            Image(systemName: "arrow.counterclockwise").font(.system(size: 9, weight: .bold)).foregroundStyle(BK.Notch.tertiary)
-                            Text(r.instruction).lineLimit(1).font(.system(size: 11.5)).foregroundStyle(BK.Notch.secondary)
-                        }
-                        .padding(.horizontal, 9).padding(.vertical, 5)
-                        .background(Capsule().fill(BK.Notch.raised))
-                        .overlay(Capsule().strokeBorder(BK.Notch.border))
-                        .contentShape(Capsule())
+            if let notice = model.voice.notice {
+                HStack(spacing: 8) {
+                    Image(systemName: "mic.slash.fill").font(.system(size: 11, weight: .semibold)).foregroundStyle(BK.Tone.warning.color)
+                    Text(notice).font(.system(size: 11.5)).foregroundStyle(BK.Notch.secondary).lineLimit(2)
+                    Spacer(minLength: 0)
+                    if notice == OnDeviceRecognizer.micOffMessage {
+                        Button("Open Settings") { NSWorkspace.shared.open(VoicePermissions.Kind.microphone.settingsURL) }
+                            .buttonStyle(BKButtonStyle(kind: .secondary, compact: true, onDark: true))
                     }
-                    .buttonStyle(.plain)
-                    .frame(maxWidth: 170)
                 }
-                Spacer()
-                BKIconButton(systemName: "clock.arrow.circlepath", help: "Recent tasks") {
-                    model.historyOpen = true
-                    model.recompute()
-                }
-                BKIconButton(systemName: "gearshape.fill", help: "Settings") { model.openSettings(nil) }
+                .frame(height: 26)
+            } else {
+                recentsRow
             }
         }
         .padding(.top, 8)
@@ -212,6 +210,32 @@ struct NotchInputView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { focused = true }
         }
         .onChange(of: model.focusToken) { _, _ in focused = true }
+        .onDisappear { model.voice.clearNotice() }
+    }
+
+    var recentsRow: some View {
+        HStack(spacing: 6) {
+            ForEach(recents.prefix(3)) { r in
+                Button { model.inputText = r.instruction } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.counterclockwise").font(.system(size: 9, weight: .bold)).foregroundStyle(BK.Notch.tertiary)
+                        Text(r.instruction).lineLimit(1).font(.system(size: 11.5)).foregroundStyle(BK.Notch.secondary)
+                    }
+                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .background(Capsule().fill(BK.Notch.raised))
+                    .overlay(Capsule().strokeBorder(BK.Notch.border))
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: 170)
+            }
+            Spacer()
+            BKIconButton(systemName: "clock.arrow.circlepath", help: "Recent tasks") {
+                model.historyOpen = true
+                model.recompute()
+            }
+            BKIconButton(systemName: "gearshape.fill", help: "Settings") { model.openSettings(nil) }
+        }
     }
 }
 
@@ -226,9 +250,11 @@ struct NotchRunningView: View {
             if c.phase == .planning {
                 BKShimmerText(text: c.status.isEmpty ? "Understanding your task…" : c.status)
             } else {
-                Text(c.status).font(.system(size: 13, weight: .medium)).foregroundStyle(BK.Notch.text).lineLimit(1)
+                // What Glide just said, while it's on show; otherwise the task's status.
+                let line = model.voice.caption ?? c.status
+                Text(line).font(.system(size: 13, weight: .medium)).foregroundStyle(BK.Notch.text).lineLimit(1)
                     .contentTransition(.opacity)
-                    .animation(.easeInOut(duration: 0.2), value: c.status)
+                    .animation(.easeInOut(duration: 0.2), value: line)
             }
             Spacer(minLength: 6)
             if model.jobApprovalWaiting {
