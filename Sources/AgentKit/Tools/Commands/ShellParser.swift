@@ -56,12 +56,18 @@ struct ShellCommand: Sendable, Hashable {
     /// The raw expression text of a `(( … ))` command, so the checker can see which variables
     /// it reads (`(( x ))` reads `x`, whose value zsh re-evaluates as an arithmetic expression).
     var arithmeticText: String?
+    /// The command is `name()`, the start of a function definition (its body follows).
+    var definesFunction = false
 
     var isEmpty: Bool { words.isEmpty && redirects.isEmpty && groups.isEmpty && hereString == nil && !arithmetic }
 }
 
 struct ShellPipeline: Sendable, Hashable {
     var commands: [ShellCommand] = []
+    /// What joins this pipeline to the next one: `&&`, `||`, `;`, `&`, a newline, or "" at the
+    /// end of a list. With `&&` the next pipeline runs only if this one succeeded, which is what
+    /// lets the checker trust that a `cd` took effect.
+    var connector = ""
 }
 
 struct ShellList: Sendable, Hashable {
@@ -151,9 +157,12 @@ final class ShellParser {
             if !cmd.isEmpty { pipeline.commands.append(cmd) }
             cmd = newCommand()
         }
-        func endPipeline() {
+        func endPipeline(_ connector: String) {
             endCommand()
-            if !pipeline.commands.isEmpty { list.pipelines.append(pipeline) }
+            if !pipeline.commands.isEmpty {
+                pipeline.connector = connector
+                list.pipelines.append(pipeline)
+            }
             pipeline = ShellPipeline()
         }
 
@@ -163,23 +172,23 @@ final class ShellParser {
             case " ", "\t", "\r":
                 endWord(); i += 1
             case "\n":
-                endPipeline(); i += 1
+                endPipeline("\n"); i += 1
                 readHeredocBodies()
             case "#" where !buf.started:
                 // Inside parentheses a `#` may be glob text (zsh's `ls (#x|*)`), not a
                 // comment, so stop at `)` rather than hide what follows on the line.
                 while i < c.count, c[i] != "\n", !(close == ")" && c[i] == ")") { i += 1 }
             case ";":
-                endPipeline(); i += 1
+                endPipeline(";"); i += 1
                 if let n = peek(), n == ";" || n == "&" || n == "|" { i += 1 } // ;; ;& ;| in case
             case "&":
-                if peek(1) == "&" { endPipeline(); i += 2 }
+                if peek(1) == "&" { endPipeline("&&"); i += 2 }
                 else if peek(1) == ">" {
                     endWord()
                     if peek(2) == ">" { pendingOp = "&>>"; i += 3 } else { pendingOp = "&>"; i += 2 }
-                } else { endPipeline(); i += 1 }
+                } else { endPipeline("&"); i += 1 }
             case "|":
-                if peek(1) == "|" { endPipeline(); i += 2 }
+                if peek(1) == "|" { endPipeline("||"); i += 2 }
                 else { endCommand(); i += (peek(1) == "&" ? 2 : 1) }
             case "<", ">":
                 // A word made only of digits right before the operator is a file descriptor (2>).
@@ -222,7 +231,7 @@ final class ShellParser {
                     }
                     endWord()
                     // name() function definition: the body that follows is its own command.
-                    if peek(1) == ")" { i += 2; endPipeline(); continue }
+                    if peek(1) == ")" { i += 2; cmd.definesFunction = true; endPipeline(";"); continue }
                 }
                 if cmd.words.isEmpty && peek(1) == "(" {
                     // (( arithmetic )) — evaluates numbers; look only for substitutions inside.
@@ -238,9 +247,9 @@ final class ShellParser {
                 i += 1
                 if let inner = nested({ parseList(until: ")") }) { cmd.groups.append(inner) }
             case ")":
-                if close == ")" { i += 1; endPipeline(); return list }
+                if close == ")" { i += 1; endPipeline(""); return list }
                 // Stray ")" (e.g. a case pattern): treat as a separator, never as text.
-                endPipeline(); i += 1
+                endPipeline(";"); i += 1
             case "'":
                 buf.started = true; buf.word.quoted = true
                 i += 1
@@ -261,7 +270,7 @@ final class ShellParser {
                 buf.append(ch); i += 1
             }
         }
-        endPipeline()
+        endPipeline("")
         return list
     }
 

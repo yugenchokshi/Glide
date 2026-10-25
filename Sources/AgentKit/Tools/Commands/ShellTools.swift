@@ -42,11 +42,15 @@ struct ShellRunTool: AgentTool {
     private func assessment(_ arguments: JSONValue, context: ToolContext) -> (verdict: ToolVerdict, readsClipboard: Bool, runsScript: Bool) {
         let command = arguments.optionalString("command") ?? ""
         let cwd = ToolArgs.pathForAssessment(arguments.optionalString("cwd"), context)?.path ?? context.workingDirectory.path
-        let (verdict, programs, readsClipboard) = CommandSafety.analyze(command, cwd: cwd)
-        // A script interpreter can read the clipboard through an obscured name built at run time,
-        // so the concealed-item guard runs whenever one is used, not only on an obvious read.
-        let runsScript = !programs.isDisjoint(with: ShellRiskChecker.scriptInterpreters)
-        var v = verdict
+        let analysis = CommandSafety.analyze(command, cwd: cwd)
+        let programs = analysis.programs
+        // A script interpreter given code to run (inline, a script file, standard input) can read
+        // the clipboard through a name built at run time, so the concealed-item guard covers it
+        // too, not only an obvious read. `swift build`, `python3 -m pytest` or `node --version`
+        // run no script of the line's, no more than `make` does, so they aren't refused.
+        let readsClipboard = analysis.readsClipboard
+        let runsScript = analysis.runsScript
+        var v = analysis.verdict
         // Turning AppleScript or Shortcuts off also covers reaching them through the shell.
         let settings = context.settings.tools
         if !settings.allowAppleScript, programs.contains("osascript") {
@@ -163,9 +167,9 @@ struct OSAScriptTool: AgentTool {
         let script = try arguments.requiredString("script")
         try CommandFamilyGate.enforce(assess(arguments, context: context))
         // AppleScript and JXA can read the clipboard through a name built at run time (string
-        // pieces, the ObjC bridge), so the concealed-item guard runs for every script, not only
-        // when the source visibly mentions the clipboard.
-        try await ConcealedClipboardGuard.check(pasteboardName)
+        // pieces, the ObjC bridge, a shell command), so the concealed-item guard runs for any
+        // script that has a way to; `return 1 + 1` doesn't (see `ScriptSafety.mayReadClipboard`).
+        if ScriptSafety.mayReadClipboard(script, language: language) { try await ConcealedClipboardGuard.check(pasteboardName) }
         try context.gate.checkStopped()
         let timeout = ToolArgs.seconds(arguments, "timeout_s", default: Self.defaultTimeout, max: ShellRunTool.maxTimeout)
         let args = (language == .javaScript ? ["-l", "JavaScript"] : []) + ["-e", script]

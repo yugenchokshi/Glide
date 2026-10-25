@@ -23,8 +23,12 @@ struct PathPattern: Sendable, Hashable {
 
     enum Component: Sendable, Hashable {
         case name([Token])
-        /// zsh's `**/`: zero or more folders.
+        /// zsh's `**/`: zero or more folders. Like `*`, it skips folders whose names start with a
+        /// dot unless dot-globbing is on (zsh and bash's globstar both do).
         case anyDepth
+        /// Zero or more folders of any name, hidden ones included: the fail-closed stand-in for a
+        /// path too complex to work out ("could be anywhere"), never written by the user.
+        case anywhere
 
         /// The name when it's all literal characters (`com.vendor.app`), else nil.
         var literalName: String? {
@@ -45,6 +49,18 @@ struct PathPattern: Sendable, Hashable {
     var components: [Component]
     /// Some part comes from a variable or command output rather than only from a glob.
     var dynamic: Bool
+    /// Wildcards in this pattern match names starting with a dot, as zsh's `(D)` qualifier
+    /// makes them do for one word (on top of the line-wide `dotGlob` the matchers take).
+    var dots = false
+
+    /// A path that could be anywhere, hidden folders included: what a check falls back to when
+    /// the real paths are too many or too complex to work out.
+    static let anywhere = PathPattern(components: [.anywhere], dynamic: true)
+
+    /// Most brace alternatives `make` enumerates, and the deepest brace nesting it follows;
+    /// beyond either it returns nil and the caller fails closed.
+    static let braceLimit = 64
+    static let maxBraceDepth = 16
 
     // MARK: Building
 
@@ -53,10 +69,10 @@ struct PathPattern: Sendable, Hashable {
     /// wildcards; `extendedGlob` adds zsh's `^`, `#` and `~`. Run-time parts (`$x`, `$(…)`,
     /// backticks) are wildcards either way. Nil when brace expansion would produce too many
     /// alternatives to check.
-    static func make(base: [Component], text: String, glob: Bool, extendedGlob: Bool) -> [PathPattern]? {
+    static func make(base: [Component], text: String, glob: Bool, extendedGlob: Bool, dots: Bool = false) -> [PathPattern]? {
         guard let alternatives = glob ? expandBraces(text) : [text] else { return nil }
         return alternatives.map { alt in
-            var dynamic = false
+            var dynamic = base.contains(.anywhere)
             let tokens = tokenize(alt, glob: glob, extendedGlob: extendedGlob, dynamic: &dynamic)
             var comps = base
             var current: [Token] = []
@@ -66,7 +82,16 @@ struct PathPattern: Sendable, Hashable {
                 guard pending else { return }
                 if current == [.char(".")] { return }
                 if current == [.char("."), .char(".")] {
-                    if !comps.isEmpty { comps.removeLast() }
+                    guard let last = comps.last else { return }
+                    if last == .anywhere { return } // anywhere, one folder up, is still anywhere
+                    var starStar = last == .anyDepth
+                    if case .name(let t) = last, t.count >= 2, t.allSatisfy({ $0 == .star }) { starStar = true }
+                    comps.removeLast()
+                    if starStar {
+                        // `**/..` may climb above where `**` started: anything under its parent.
+                        if !comps.isEmpty { comps.removeLast() }
+                        comps.append(.anywhere)
+                    }
                     return
                 }
                 comps.append(.name(current))
@@ -82,7 +107,16 @@ struct PathPattern: Sendable, Hashable {
             for i in comps.indices.dropLast() {
                 if case .name(let t) = comps[i], t.count >= 2, t.allSatisfy({ $0 == .star }) { comps[i] = .anyDepth }
             }
-            return PathPattern(components: comps, dynamic: dynamic)
+            // `**/**/` is the same as one `**/`; collapsing runs keeps matching linear.
+            var collapsed: [Component] = []
+            collapsed.reserveCapacity(comps.count)
+            for comp in comps {
+                let deep = comp == .anyDepth || comp == .anywhere
+                if deep, let last = collapsed.last, last == .anywhere || (last == .anyDepth && comp == .anyDepth) { continue }
+                if comp == .anywhere, collapsed.last == .anyDepth { collapsed.removeLast() }
+                collapsed.append(comp)
+            }
+            return PathPattern(components: collapsed, dynamic: dynamic, dots: dots)
         }
     }
 
@@ -93,45 +127,74 @@ struct PathPattern: Sendable, Hashable {
 
     /// Expands `{a,b}` alternatives (zsh and bash brace expansion). `{1..9}` ranges become
     /// `*`; braces without a comma stay literal, as zsh leaves them. `${…}` is skipped.
-    static func expandBraces(_ text: String, limit: Int = 64) -> [String]? {
+    ///
+    /// Linear in the text apart from the (bounded) output: brackets are matched once up front,
+    /// nesting deeper than `maxBraceDepth` or more than `limit` alternatives returns nil, so a
+    /// long run of `{1..2}` or `{a,{a,…}}` can neither recurse without bound nor take long.
+    static func expandBraces(_ text: String, limit: Int = PathPattern.braceLimit) -> [String]? {
         let chars = Array(text)
-        var i = 0
-        while i < chars.count {
-            if chars[i] == "$", i + 1 < chars.count, chars[i + 1] == "{" {
-                i = matchingClose(chars, from: i + 1, open: "{", close: "}") + 1
-                continue
-            }
-            guard chars[i] == "{" else { i += 1; continue }
-            let end = matchingClose(chars, from: i, open: "{", close: "}")
-            guard end < chars.count else { return [text] }
-            let inner = Array(chars[(i + 1)..<end])
-            var parts: [String] = []
-            var depth = 0
-            var piece = ""
-            for ch in inner {
-                if ch == "{" { depth += 1 } else if ch == "}" { depth -= 1 }
-                if ch == ",", depth == 0 { parts.append(piece); piece = ""; continue }
-                piece.append(ch)
-            }
-            parts.append(piece)
-            let prefix = String(chars[..<i]), suffix = String(chars[(end + 1)...])
-            if parts.count == 1 {
-                if String(inner).contains("..") {
-                    return expandBraces(prefix + "*" + suffix, limit: limit)
-                }
-                // Literal braces: keep them and look further on.
-                i = end + 1
-                continue
-            }
-            var out: [String] = []
-            for p in parts {
-                guard let more = expandBraces(prefix + p + suffix, limit: limit) else { return nil }
-                out += more
-                if out.count > limit { return nil }
-            }
-            return out
+        guard chars.contains("{") else { return [text] }
+        // The `}` matching each `{` (an unmatched `{` is literal text).
+        var close = [Int](repeating: -1, count: chars.count)
+        var open: [Int] = []
+        for (k, ch) in chars.enumerated() {
+            if ch == "{" { open.append(k) } else if ch == "}", let o = open.popLast() { close[o] = k }
         }
-        return [text]
+
+        /// Alternatives for chars[lo..<hi]; nil once over the limit or too deep.
+        func expand(_ lo: Int, _ hi: Int, depth: Int) -> [String]? {
+            if depth > maxBraceDepth { return nil }
+            var results = [""]
+            var literal = ""
+            var i = lo
+            func flush() {
+                guard !literal.isEmpty else { return }
+                for k in results.indices { results[k] += literal }
+                literal = ""
+            }
+            while i < hi {
+                let ch = chars[i]
+                // `${…}` is a parameter expansion, copied as written.
+                if ch == "$", i + 1 < hi, chars[i + 1] == "{" {
+                    let end = close[i + 1] >= 0 && close[i + 1] < hi ? close[i + 1] : hi - 1
+                    literal += String(chars[i...end])
+                    i = end + 1
+                    continue
+                }
+                guard ch == "{", close[i] >= 0, close[i] < hi else { literal.append(ch); i += 1; continue }
+                let end = close[i]
+                // Split the inside at commas that aren't inside a nested group.
+                var parts: [(Int, Int)] = []
+                var start = i + 1
+                var k = i + 1
+                while k < end {
+                    if chars[k] == "{", close[k] >= 0, close[k] < end { k = close[k] + 1; continue }
+                    if chars[k] == "," { parts.append((start, k)); start = k + 1 }
+                    k += 1
+                }
+                parts.append((start, end))
+                if parts.count == 1 {
+                    // `{1..9}` becomes `*`; other braces without a comma stay literal, inside too.
+                    let inner = String(chars[(i + 1)..<end])
+                    literal += inner.contains("..") ? "*" : "{" + inner + "}"
+                    i = end + 1
+                    continue
+                }
+                var alternatives: [String] = []
+                for (a, b) in parts {
+                    guard let more = expand(a, b, depth: depth + 1) else { return nil }
+                    alternatives += more
+                    if alternatives.count > limit { return nil }
+                }
+                flush()
+                guard results.count * alternatives.count <= limit else { return nil }
+                results = results.flatMap { r in alternatives.map { r + $0 } }
+                i = end + 1
+            }
+            flush()
+            return results
+        }
+        return expand(0, chars.count, depth: 0)
     }
 
     /// Index of the bracket closing the one at `from` (or `chars.count` when unbalanced).
@@ -220,39 +283,93 @@ struct PathPattern: Sendable, Hashable {
 
     // MARK: Matching
 
+    /// Lowercased components of an absolute path, the form the matchers compare against.
+    static func splitPath(_ path: String) -> [String] {
+        path.lowercased().split(separator: "/").map(String.init)
+    }
+
     /// Could some name the shell produces be inside `root` (or `root` itself)?
     func mayReachInside(_ root: String, dotGlob: Bool) -> Bool {
-        let target = root.lowercased().split(separator: "/").map(String.init)
-        func reach(_ pi: Int, _ ti: Int) -> Bool {
-            if ti == target.count { return true }
-            guard pi < components.count else { return false }
-            switch components[pi] {
-            case .anyDepth: return reach(pi + 1, ti) || reach(pi, ti + 1)
-            case .name(let t): return Self.matches(t, target[ti], dotGlob: dotGlob) && reach(pi + 1, ti + 1)
+        mayReachInside(Self.splitPath(root), dotGlob: dotGlob)
+    }
+
+    /// `mayReachInside` for a root already split by `splitPath`.
+    ///
+    /// Matching runs left to right over the components, keeping the set of target positions
+    /// reached so far, so it takes components × target length steps however many `**/` the
+    /// pattern has (a recursive search was exponential in them).
+    func mayReachInside(_ target: [String], dotGlob: Bool) -> Bool {
+        let dots = dotGlob || self.dots
+        let m = target.count
+        if m == 0 { return true }
+        // Without `**/` every component names one folder: too few can't get inside.
+        if !hasDeepComponent, components.count < m { return false }
+        var cur = [Bool](repeating: false, count: m + 1)
+        var next = cur
+        cur[0] = true
+        for comp in components {
+            for k in next.indices { next[k] = false }
+            switch comp {
+            case .anyDepth, .anywhere:
+                for ti in 0...m {
+                    next[ti] = cur[ti] || (ti > 0 && next[ti - 1] && Self.deepStep(comp, target[ti - 1], dots: dots))
+                }
+            case .name(let t):
+                for ti in 0..<m where cur[ti] && Self.matches(t, target[ti], dotGlob: dots) { next[ti + 1] = true }
             }
+            // Every target folder matched: whatever follows is inside the root.
+            if next[m] { return true }
+            swap(&cur, &next)
+            if !cur.contains(true) { return false }
         }
-        return reach(0, 0)
+        return false
     }
 
     /// Could some name the shell produces be exactly `path`? A nil component in `path` stands
-    /// for any name (`/Users/<anyone>`).
+    /// for any name (`/Users/<anyone>`). Same left-to-right matching as `mayReachInside`.
     func mayBe(_ path: [String?], dotGlob: Bool) -> Bool {
+        let dots = dotGlob || self.dots
+        // Without `**/` the pattern names exactly as many folders as it has components.
+        if !hasDeepComponent, components.count != path.count { return false }
         let target = path.map { $0?.lowercased() }
-        func exact(_ pi: Int, _ ti: Int) -> Bool {
-            guard pi < components.count else { return ti == target.count }
-            switch components[pi] {
-            case .anyDepth: return exact(pi + 1, ti) || (ti < target.count && exact(pi, ti + 1))
+        let m = target.count
+        var cur = [Bool](repeating: false, count: m + 1)
+        var next = cur
+        cur[0] = true
+        for comp in components {
+            for k in next.indices { next[k] = false }
+            switch comp {
+            case .anyDepth, .anywhere:
+                for ti in 0...m {
+                    next[ti] = cur[ti] || (ti > 0 && next[ti - 1] && Self.deepStep(comp, target[ti - 1], dots: dots))
+                }
             case .name(let t):
-                guard ti < target.count else { return false }
-                if let name = target[ti], !Self.matches(t, name, dotGlob: dotGlob) { return false }
-                return exact(pi + 1, ti + 1)
+                for ti in 0..<m where cur[ti] {
+                    if let name = target[ti], !Self.matches(t, name, dotGlob: dots) { continue }
+                    next[ti + 1] = true
+                }
             }
+            swap(&cur, &next)
+            if !cur.contains(true) { return false }
         }
-        return exact(0, 0)
+        return cur[m]
     }
 
     func mayBe(_ path: String, dotGlob: Bool) -> Bool {
         mayBe(path.split(separator: "/").map { String($0) }, dotGlob: dotGlob)
+    }
+
+    /// Some component is `**/` or the "anywhere" stand-in, which match any number of folders.
+    var hasDeepComponent: Bool {
+        components.contains { $0 == .anyDepth || $0 == .anywhere }
+    }
+
+    /// Whether `**/` (or the "anywhere" stand-in) can pass through a folder called `name`:
+    /// `**/` skips hidden folders unless dots match, as zsh and bash's globstar do.
+    static func deepStep(_ comp: Component, _ name: String?, dots: Bool) -> Bool {
+        if comp == .anywhere || dots { return true }
+        guard let name else { return true }
+        return !name.hasPrefix(".")
     }
 
     /// The folder before the first wildcard, e.g. `/Users/me/Documents` for `~/Documents/*.txt`.
@@ -288,29 +405,47 @@ struct PathPattern: Sendable, Hashable {
             default: return false
             }
         }
-        // memo[ti][ni]: tokens[ti...] can match n[ni...]
-        var memo = [[Bool?]](repeating: [Bool?](repeating: nil, count: n.count + 1), count: tokens.count + 1)
-        func go(_ ti: Int, _ ni: Int) -> Bool {
-            if let m = memo[ti][ni] { return m }
-            let r: Bool
-            if ti == tokens.count {
-                r = ni == n.count
-            } else {
-                switch tokens[ti] {
-                case .star, .any:
-                    r = go(ti + 1, ni) || (ni < n.count && go(ti, ni + 1))
-                case .one:
-                    r = ni < n.count && go(ti + 1, ni + 1)
-                case .char(let ch):
-                    r = ni < n.count && n[ni] == ch && go(ti + 1, ni + 1)
-                case .set(let s):
-                    r = ni < n.count && setMatches(s, n[ni]) && go(ti + 1, ni + 1)
-                }
-            }
-            memo[ti][ni] = r
-            return r
+        // All literal (the usual case): a plain comparison.
+        if tokens.allSatisfy({ if case .char = $0 { return true }; return false }) {
+            guard tokens.count == n.count else { return false }
+            for (t, ch) in zip(tokens, n) { if case .char(let c) = t, c != ch { return false } }
+            return true
         }
-        return go(0, 0)
+        // Left to right over the tokens, keeping which name positions can be reached: tokens ×
+        // name length steps, no recursion (a long run of `*` once recursed once per token).
+        var cur = [Bool](repeating: false, count: n.count + 1)
+        var next = cur
+        cur[0] = true
+        var afterWildcard = false
+        for tok in tokens {
+            switch tok {
+            case .star, .any:
+                // Runs of `*` match like one.
+                if afterWildcard { continue }
+                afterWildcard = true
+                var seen = false
+                for k in cur.indices {
+                    if cur[k] { seen = true }
+                    cur[k] = seen
+                }
+            default:
+                afterWildcard = false
+                for k in next.indices { next[k] = false }
+                for k in 0..<n.count where cur[k] {
+                    let hit: Bool
+                    switch tok {
+                    case .one: hit = true
+                    case .char(let ch): hit = n[k] == ch
+                    case .set(let s): hit = setMatches(s, n[k])
+                    case .star, .any: hit = true
+                    }
+                    if hit { next[k + 1] = true }
+                }
+                swap(&cur, &next)
+                if !cur.contains(true) { return false }
+            }
+        }
+        return cur[n.count]
     }
 
     /// `[abc]`, `[a-z]`, `[!x]`; character classes like `[[:alpha:]]` match anything.
