@@ -52,7 +52,7 @@ Tools, browser and jobs (no Accessibility needed):
                                              run one tool, safety-checked like the agent
   browser status                             which Chrome backend is available
   job run "<task>" [--yes] [--mock-url <url>]  plan a background job and follow it (Ctrl-C halts)
-  job list | job show <id> | job resume <id> [--mock-url <url>]
+  job list | job show <id> | job resume <id> [--yes] [--mock-url <url>]
 
 Driving apps (needs Accessibility for this terminal):
   run "<task>" [--yes] [--mock-url <url>] [--model <id>]   full agent as a quick task

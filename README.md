@@ -78,11 +78,11 @@ When a request is long or repetitive (many items, waits or schedules, or more th
 
 - **Resumable.** Progress is saved after every item. A job that was running when Glide quit continues when Glide starts again (or waits, paused, if you turn off *Resume interrupted jobs*).
 - **Parallel where it's safe.** Loops run up to 4 items at once for command, web and data steps, 2 for browser steps, and 1 when a step needs the screen. Failed items are retried, and the job pauses to ask when too many fail.
-- **One cursor.** Only one thing uses the screen at a time, and tasks you start go first. By default a job's on-screen steps wait until you've left the mouse and keyboard alone for 30 seconds.
+- **One cursor.** Only one thing uses the screen at a time, and tasks you start go first: a task waits only for a job's on-screen step that is already running, and its Stop and Pause affect only the task while it waits. By default a job's on-screen steps wait until you've left the mouse and keyboard alone for 30 seconds. If you start using the Mac during such a step, it stops before its next action, gives the screen back, and carries on once you've been idle again (pausing the job meanwhile ends the wait). Waiting for the screen doesn't count against the job's time budget.
 - **Budgets.** Each job has a cost, time and model-call budget (by default $5, 4 hours of work and 2,000 calls). It pauses and asks before going past one, and also when it seems stuck. Jobs estimated above $1 or 15 minutes wait for you to press **Start**.
-- **Results.** Item results go into a table you can export as CSV. When you ask Glide to fill in your spreadsheet, it asks once before writing and keeps a `.bak` copy of the original. A finished job writes a `report.md` in its folder.
-- **Control.** The notch shows progress with pause and stop. Settings › Jobs has the plan, items, activity log, usage and the job folder, plus Start, Pause, Resume, Stop, Retry failed, Export CSV and Delete. The emergency stop pauses every job so you can resume it later.
-- **Awake.** While a job runs, Glide keeps the Mac from idle-sleeping (the display can still turn off).
+- **Results.** Item results go into a table you can export as CSV. When you ask Glide to fill in your spreadsheet, it asks once before writing, writes into the sheet the items came from, and keeps a `.bak` copy of the original, even across pauses and relaunches. A file without a header row is left alone, and its results stay in the job for export. A finished job writes a `report.md` in its folder.
+- **Control.** The notch shows progress with pause and stop. Settings › Jobs has the plan, items, activity log, usage and the job folder, plus Start, Pause, Resume, Stop, Retry failed, Export CSV and Delete. *Retry failed* redoes the failed items, then picks up where the job was, without repeating the steps it had finished (a wait it was sleeping in keeps its wake time). *Export CSV* lists every file it writes: other tables go next to the file you pick, under a new name when a file by that name is already there. The emergency stop pauses every job so you can resume it later.
+- **Awake.** While a job runs, Glide keeps the Mac from idle-sleeping (the display can still turn off). Switching *Keep my Mac awake* in Settings › Jobs takes effect at once.
 
 Jobs live in `~/Library/Application Support/Glide/` (the `glide.sqlite` database, plus one folder per job under `Jobs/<id>/`).
 
@@ -105,9 +105,9 @@ To install the extension:
 1. Open **Settings › Browser** and click **Reveal in Finder**. In the app the folder is `Glide.app/Contents/Resources/ChromeExtension`; when you run from a checkout it's `Extensions/chrome`.
 2. In Chrome, go to `chrome://extensions`. Chrome won't open that address from another app, so Glide copies it for you to paste.
 3. Turn on **Developer mode**, click **Load unpacked** and choose the folder.
-4. Back in Glide, click **Pair**. Chrome opens the extension's pairing page and connects. If that page doesn't open, click **Copy pairing code** and paste it into the extension's toolbar popup.
+4. Back in Glide, click **Pair**. Chrome opens the extension's pairing page, which shows the port it will connect to. Click **Pair** there to confirm. If that page doesn't open, click **Copy pairing code** and paste it into the extension's toolbar popup.
 
-The extension connects only to Glide on `127.0.0.1` (port 47823 by default), and both sides prove they know the pairing secret before any command runs. While Glide works in one of your tabs, Chrome shows its "started debugging this browser" bar. Closing that bar stops Glide from working in your tabs until you click **Allow again** in the extension's popup. See [SECURITY.md](SECURITY.md#browser) and [Extensions/chrome/README.md](Extensions/chrome/README.md).
+The extension connects only to Glide on `127.0.0.1` (port 47823 by default; change it with **Bridge port** in Settings › Browser, then pair again), and both sides prove they know the pairing secret before any command runs. While Glide works in one of your tabs, Chrome shows its "started debugging this browser" bar. The extension lets go of your tabs 45 seconds after Glide's last command there. Closing that bar stops Glide from working in your tabs until you click **Allow again** in the extension's popup. Page dialogs in your own tabs are left for you to answer unless they open while Glide is working there. See [SECURITY.md](SECURITY.md#browser) and [Extensions/chrome/README.md](Extensions/chrome/README.md).
 
 ![browser settings](docs/images/settings-browser.png)
 
@@ -138,6 +138,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the module map and [docs/LONG_TASKS_D
 
 ```bash
 swift build
+.build/debug/glidectl help                   # every command and its options
 .build/debug/glidectl inspect Notes          # print the indexed UI skeleton of Notes
 .build/debug/glidectl click "New Note" --app Notes
 .build/debug/glidectl workflow               # Finder + Notes deterministic workflow
@@ -158,7 +159,8 @@ swift build
 
 - `tool run` checks the call like the agent would: blocked calls don't run, and calls that need approval ask first (`--yes` approves them). `--json` also prints the tool's structured result.
 - The app owns the extension's port, so `glidectl` always uses Glide's own Chrome. `--headless` uses a throwaway headless profile instead and closes it afterwards.
-- `glidectl run` always runs a request as a quick task; `job run` plans it as a background job. `job run` and `job resume` accept `--mock-url` and `--yes` like `run`. Press Ctrl-C to halt a job: it ends paused, and `job resume <id>` continues it. Job ids can be shortened to the first 8 characters `job list` prints.
+- `glidectl run` always runs a request as a quick task; `job run` plans it as a background job. `job run` and `job resume` accept `--mock-url` and `--yes` like `run`. Press Ctrl-C to halt a job: it ends paused, and `job resume <id>` continues it. Press Ctrl-C again to quit without waiting for the step to finish; the job is still saved as paused. Job ids can be shortened to the first 8 characters `job list` prints.
+- A job runs in one process at a time. `glidectl` looks after only the job it runs: it doesn't wake the app's sleeping jobs, and Ctrl-C halts only its own job. While it runs a job, the app shows that job as *Running in another Glide process*, without controls, and `job resume` refuses a job the app (or another `glidectl`) is running.
 
 Regenerate these images with `.build/debug/Glide --snapshot docs/images` (notch) and `.build/debug/Glide --snapshot-settings <dir>` (settings and onboarding).
 
@@ -169,15 +171,16 @@ swift build && swift test        # unit + integration tests (no UI control, no p
 .build/debug/glidectl bench         # live benchmark: moves your real cursor on disposable fixtures
 ```
 
-The browser tests start headless Chrome with a temporary profile when Chrome is installed, and skip otherwise. [docs/TESTING.md](docs/TESTING.md) also shows how to run a whole background job against the scripted mock model, including halting and resuming it.
+The browser tests start headless Chrome with a temporary profile when Chrome is installed, and skip otherwise. A few load the real extension and need Chrome for Testing. [docs/TESTING.md](docs/TESTING.md) also shows how to run a whole background job against the scripted mock model, including halting and resuming it.
 
 ## Privacy and security
 
 - API keys live only in the Keychain. They are never logged, written to SQLite, or put in prompts.
 - Screenshots are taken only when accessibility and local OCR can't find a control, after you allow it. Password fields are blacked out, and nothing is retained unless you turn on debug recording.
-- Password fields, payment card numbers and apps on your exclusion list are never touched. The browser tools also refuse to type into password fields or enter card numbers.
+- Password fields, payment card numbers and apps on your exclusion list are never touched. The browser tools also refuse to type into password fields or enter card numbers, whether by typing, pasting or pressing keys one at a time.
 - Commands, scripts, file operations and browser actions are judged by fixed rules before they run, never by the model. Deleting, overwriting, sending and uploading ask first. `sudo`, erasing disks and piping downloads into a shell are always blocked.
-- The Chrome extension talks only to Glide on `127.0.0.1`, and the pairing secret never goes over the connection.
+- The agent can't click Glide's own controls. Glide ignores input its agent posts, and Approve, Reject and Stop answer the exact request on screen.
+- The Chrome extension talks only to Glide on `127.0.0.1`, pairs only after you confirm it on its pairing page, and the pairing secret never goes over the connection.
 
 Details are in [SECURITY.md](SECURITY.md).
 
