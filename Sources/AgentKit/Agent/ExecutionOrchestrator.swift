@@ -73,10 +73,9 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
     /// What the conversation so far established, for the planner (the previous task within the
     /// follow-up window, what an instant action just opened).
     var conversationContext: String?
-    /// A step running longer than this gets a spoken progress line, then one every
-    /// `progressEvery` seconds at most.
-    var progressAfter: TimeInterval = 20
-    var progressEvery: TimeInterval = 30
+    /// A task still running after this long says "Still on it." once (0 = never). Glide is
+    /// otherwise quiet while it works: the notch shows progress.
+    var progressAfter: TimeInterval = SpokenLine.progressAfter
 
     /// Notes, action count, deadline and screenshot consent shared by this task's steps.
     /// Replaced at the start of each run; only read and written by the run itself.
@@ -173,7 +172,7 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
         }
         emit(ActivityEntry(kind: status == .completed ? .result : .error, title: status == .completed ? summary : (error ?? summary), success: status == .completed, durationMs: duration))
         var result = TaskResult(status: status, summary: summary, error: error, plan: plan, metrics: snapshot, durationMs: duration, jobID: jobID)
-        if status == .completed { result.spoken = finalSpoken ?? UtteranceInterpreter.spokenSummary(summary) }
+        if status == .completed { result.spoken = SpokenLine.result(summary: summary, spoken: finalSpoken, instruction: instruction) }
         if status != .stopped { result.front = frontDescription() }
         return result
     }
@@ -213,10 +212,11 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
         if let question = plan.clarification, plan.steps.isEmpty {
             return await finish(.needsInput, summary: question, plan: plan)
         }
-        // Say it's on it, then ask what the plan needs to know; the steps that don't depend on
-        // the answers start right away.
+        // Ask what the plan needs to know (the question is the acknowledgement), or say "On it."
+        // when the work will take a while; quick tasks go quietly. The steps that don't depend
+        // on the answers start right away.
         if let conversation {
-            if let ack = plan.ack { conversation.speak(.ack(ack)) }
+            if let ack = SpokenLine.ack(for: plan) { conversation.speak(.ack(ack)) }
             for q in plan.questions { conversation.post(q) }
             if !plan.questions.isEmpty {
                 emit(ActivityEntry(kind: .info, title: plan.questions.count == 1 ? "Asked a question" : "Asked \(plan.questions.count) questions",
@@ -236,6 +236,9 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
         guard !plan.steps.isEmpty else { return await finish(.failed, summary: "The plan was empty", error: "The planner returned no steps.", plan: plan) }
         emit(ActivityEntry(kind: .plan, title: "Planned \(plan.steps.count) steps", detail: plan.steps.map { "\($0.id). \($0.title) [\($0.route.rawValue)]" }.joined(separator: "\n")))
 
+        // One "Still on it." if the whole task runs past `progressAfter` (planning included).
+        let ticker = progressTicker()
+        defer { ticker?.cancel() }
         var index = 0
         var completed: [PlanStep] = []
         var replans = 0
@@ -255,11 +258,8 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
             emit(ActivityEntry(kind: .step, title: step.title, detail: step.instruction, route: step.route, stepID: step.id))
             let stepStart = Date()
             let outcome: StepResult.Status
-            let ticker = progressTicker(for: step)
-            defer { ticker?.cancel() }
             do {
                 outcome = try await runStep(step, plan: plan)
-                ticker?.cancel()
             } catch is CancellationError {
                 return await finish(.stopped, summary: "Stopped", plan: plan)
             } catch AutomationError.stopped {
@@ -386,18 +386,19 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
         for note in conversation.takeNotes() { session.appendNote("From the user: \(note)") }
     }
 
-    /// Says how a long step is going: once it has run `progressAfter` seconds, then at most
-    /// every `progressEvery`. Quiet while paused or while a question is open.
-    private func progressTicker(for step: PlanStep) -> Task<Void, Never>? {
+    /// Says "Still on it." once when the task has run `progressAfter` seconds. Skipped while
+    /// paused or while a question is open (then it waits until neither is true); the
+    /// conversation drops it once the task has ended.
+    private func progressTicker() -> Task<Void, Never>? {
         guard let conversation, progressAfter > 0 else { return nil }
-        let after = progressAfter, every = max(progressEvery, 1), gate = runtime.gate
-        let line = "Still \(UtteranceInterpreter.lowerFirst(step.title))…"
+        let after = max(0, progressAfter - Date().timeIntervalSince(start)), gate = runtime.gate
         return Task {
             try? await Task.sleep(for: .seconds(after))
-            while !Task.isCancelled {
-                if !gate.isPaused, conversation.current == nil { conversation.speak(.progress(line)) }
-                try? await Task.sleep(for: .seconds(every))
+            while !Task.isCancelled, gate.isPaused || conversation.current != nil {
+                try? await Task.sleep(for: .seconds(1))
             }
+            guard !Task.isCancelled else { return }
+            conversation.speak(.progress(SpokenLine.progressLine))
         }
     }
 

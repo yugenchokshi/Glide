@@ -294,14 +294,14 @@ public struct ActionSelector: Sendable {
 
     static let answerSchema: JSONValue = Schema.object([
         ("message", Schema.string("The answer for the user, concise and complete.")),
-        ("spoken", Schema.nullableString("The answer said out loud: at most 25 words, plain and warm.")),
+        ("spoken", Schema.nullableString("The result said out loud in at most 8 words, casual and confident, like a sharp friend (\"Draft's in Gmail.\"). Never read out search results, lists, URLs, element ids or prices unless the user asked for that information; if they asked a question, say the answer itself briefly.")),
     ])
 
     /// Writes the final answer for `answer` steps from gathered notes, with a short version to
     /// say out loud.
     public func answer(instruction: String, step: PlanStep, notes: String) async throws -> (message: String, spoken: String?) {
         let route = try router.route(.planner)
-        let req = LLMRequest(model: route.model, system: "You write the final answer for a macOS agent's task using only the notes gathered while operating the computer. Be concise. In spoken, say it as you would out loud, in at most 25 words.",
+        let req = LLMRequest(model: route.model, system: "You write the final answer for a macOS agent's task using only the notes gathered while operating the computer. Be concise. \(Prompts.voice)",
                              messages: [.user("Task: \(instruction)\nStep: \(step.instruction)\nNotes:\n\(notes.isEmpty ? "(none)" : notes)")],
                              schema: Self.answerSchema, schemaName: "answer", maxTokens: 3000, effort: "low", timeout: 60)
         let r = try await route.provider.complete(req)

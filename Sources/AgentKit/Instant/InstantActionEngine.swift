@@ -293,7 +293,7 @@ public final class InstantActionEngine: Sendable {
         var followUp: AgentQuestion?
         if !continues, settings.conversation.offerNextStep, plan.kind == .openApp || plan.kind == .openSite {
             let prep = plan.kind == .openApp ? "in" : "on"
-            followUp = AgentQuestion(text: "Want me to do anything \(prep) \(plan.name)?", lowRisk: true)
+            followUp = AgentQuestion(text: "Want me to do anything \(prep) \(plan.name)?", spoken: "Anything \(prep) \(plan.name)?", lowRisk: true)
         }
         return InstantResult(ack: plan.ack, summary: plan.summary, followUp: followUp, remainder: plan.remainder,
                              context: continues ? context : nil)

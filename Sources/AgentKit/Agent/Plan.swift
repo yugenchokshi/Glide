@@ -95,7 +95,7 @@ public struct Plan: Codable, Sendable, Hashable {
     public var clarification: String?
     /// How the request should run. Plans saved before this existed decode as `.quick`.
     public var mode: PlanMode
-    /// Said the moment work starts ("On it — opening Amazon."), at most about 8 words.
+    /// "On it." — said when the work will take a while (`SpokenLine.ack(for:)`), at most 4 words.
     public var ack: String?
     /// Questions asked while the task works ("Which socks?"). They're posted at once; only the
     /// steps that list a question in `needs` wait for its answer.
@@ -133,14 +133,14 @@ enum PlanSchema {
 
     static let schema: JSONValue = Schema.object([
         ("goal", Schema.string("One sentence restating the user's goal.")),
-        ("ack", Schema.string("What Glide says the moment it starts, at most 8 words, warm and plain, e.g. 'On it — opening Amazon.'")),
+        ("ack", Schema.string("What Glide says when it starts long work, at most 4 words, casual and confident: 'On it.' or 'Got it.'")),
         ("mode", Schema.string("quick = do it now step by step; job = long or repetitive work that runs in the background (many items, more than ~15 steps, waits or schedules, or more than ~10 minutes).",
                                enum: PlanMode.allCases.map(\.rawValue))),
         ("clarification", Schema.nullableString("Only when NOTHING can be started without an answer, or the task is impossible: one question, with no steps. Else null.")),
         ("questions", Schema.array(Schema.object([
             ("id", Schema.string("Short id steps refer to in needs, e.g. q1.")),
             ("text", Schema.string("The question as shown, short and friendly, e.g. 'Which socks — athletic crew, no-show or wool?'")),
-            ("spoken", Schema.nullableString("Shorter version to say out loud, or null to say text.")),
+            ("spoken", Schema.nullableString("The question said out loud in a few words, e.g. 'Which socks?' or 'Which size?'. Never read out the options, prices or links.")),
             ("options", Schema.array(Schema.string(), description: "Up to \(maxOptions) short concrete options, or empty for a free answer.")),
             ("default", Schema.nullableString("The option to use if the user doesn't answer (only for low_risk questions), else null.")),
             ("low_risk", Schema.boolean("True only for preferences (size, color, which result). False for anything that buys, sends, deletes or can't be undone.")),
@@ -242,7 +242,7 @@ public struct ActorDecision: Sendable, Hashable {
     public var followUps: [ActorDecision] = []
     /// The step's output fields (jobs), returned with `step_done`.
     public var resultFields: [String: JSONValue]? = nil
-    /// With `task_done`: the result to say out loud (at most about 25 words).
+    /// With `task_done`: the result to say out loud (a few words).
     public var spoken: String? = nil
 }
 
@@ -283,7 +283,7 @@ enum ActorSchema {
         ("actions", Schema.array(followUpSchema, description: "Optional follow-up actions (up to \(maxFollowUps)) performed in order AFTER the main action, on this same screen (e.g. fill the next field, then click Save). Only targets from the current list. Null when none.", nullable: true)),
         ("remember", Schema.nullableString("Facts read from the screen worth keeping for later steps (e.g. extracted text), else null.")),
         ("message", Schema.nullableString("For task_done: the result summary for the user. For blocked: why, or the one question to ask the user.")),
-        ("spoken", Schema.nullableString("For task_done: the result said out loud, at most 25 words, plain and warm. Else null.")),
+        ("spoken", Schema.nullableString("For task_done: the result said out loud in at most 8 words, casual and confident, like a sharp friend (\"Draft's in Gmail.\"). Never read out search results, lists, URLs, element ids or prices unless the user asked for that information; if they asked a question, say the answer itself briefly. Else null.")),
         ("tool_name", Schema.nullableString("For call_tool: exact tool name.")),
         ("tool_arguments_json", Schema.nullableString("For call_tool: arguments as a JSON object string.")),
         ("result_fields_json", Schema.nullableString("With step_done, when the step lists output fields: a JSON object string with exactly those fields, else null.")),

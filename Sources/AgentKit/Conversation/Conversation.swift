@@ -23,7 +23,7 @@ public struct AgentQuestion: Codable, Sendable, Hashable, Identifiable {
     public var id: String
     /// Shown in the notch.
     public var text: String
-    /// Shorter version to say out loud; nil means say `text`.
+    /// A few words to say out loud ("Which size?"); nil means say `text`.
     public var spoken: String?
     /// 0–4 short options, shown as chips and accepted when said.
     public var options: [String]
@@ -53,22 +53,23 @@ public struct AgentQuestion: Codable, Sendable, Hashable, Identifiable {
 /// Something Glide wants to say. The voice layer speaks it according to `VoiceSettings.speakMode`
 /// and always shows it in the notch.
 public enum SpeechCue: Sendable, Hashable {
-    /// Immediate acknowledgement when work starts: "On it — opening Amazon."
+    /// "On it." — only for planned work expected to take a while (at most 4 words). Instant
+    /// actions say nothing: the user sees the app open.
     case ack(String)
-    /// Rare spoken progress for long work: "Still checking out — almost there."
+    /// At most once per task, after about 45 seconds: "Still on it."
     case progress(String)
     /// A question; after speaking it, the voice layer listens for the answer without a tap.
     case question(AgentQuestion)
-    /// A short spoken result: "Added Hanes crew socks, size L. Your cart is $14.98."
+    /// The result in a few words: "Socks are in your cart." (`SpokenLine` keeps it short.)
     case result(String)
-    /// Glide stopped and needs the user (a login, a CAPTCHA, a locked screen).
+    /// Glide stopped and needs the user: "I need you to log in to Gmail."
     case needsYou(String)
     case error(String)
 }
 
 /// What an instant action did. Instant actions run before any model, in milliseconds.
 public struct InstantResult: Sendable, Hashable {
-    /// Said right away: "Opening ChatGPT."
+    /// A 1–3 word line for the screen only ("Opening ChatGPT."); instant actions aren't spoken.
     public var ack: String
     /// One line for the activity log and history.
     public var summary: String

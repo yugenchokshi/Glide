@@ -987,14 +987,14 @@ enum ToolDecisionSchema {
             ("result_fields_json", Schema.nullableString("With step_done: a JSON object string with the step's output fields, else null.")),
             ("message", Schema.nullableString("With step_done: what the step produced (facts, numbers, paths). With task_done: the final answer. With blocked: why. Else null.")),
             ("remember", Schema.nullableString("Short facts worth keeping for later steps, else null.")),
-            ("spoken", Schema.nullableString("With task_done: the result said out loud, at most 25 words, plain and warm. Else null.")),
+            ("spoken", Schema.nullableString("With task_done: the result said out loud in at most 8 words, casual and confident, like a sharp friend (\"Draft's in Gmail.\"). Never read out search results, lists, URLs, element ids or prices unless the user asked for that information; if they asked a question, say the answer itself briefly. Else null.")),
         ])
     }
 
     static let answerSchema: JSONValue = Schema.object([
         ("message", Schema.string("The answer or result, concise and complete.")),
         ("result_fields_json", Schema.nullableString("A JSON object string with the step's output fields when any are listed, else null.")),
-        ("spoken", Schema.nullableString("The result said out loud, at most 25 words, plain and warm.")),
+        ("spoken", Schema.nullableString("The result said out loud in at most 8 words, casual and confident, like a sharp friend (\"Draft's in Gmail.\"). Never read out search results, lists, URLs, element ids or prices unless the user asked for that information; if they asked a question, say the answer itself briefly.")),
     ])
 
     /// Tolerant decoding: models sometimes send arguments as an object instead of a string, or
