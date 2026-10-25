@@ -225,5 +225,5 @@ public final class TaskConversation: @unchecked Sendable {
     }
 
     /// What Glide says when silence picks a low-risk default.
-    static func goingWith(_ option: String) -> String { "Going with \(option) — say stop to change." }
+    static func goingWith(_ option: String) -> String { "Going with \(option)." }
 }

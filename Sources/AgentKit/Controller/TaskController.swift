@@ -164,16 +164,16 @@ public final class TaskController {
                 switch control {
                 case .stop:
                     stop()
-                    speak(.ack("Okay, stopped."))
+                    speak(.ack("Stopped."))
                 case .pause:
                     if phase == .executing || phase == .planning {
                         pause()
-                        speak(.ack("Paused — say continue when you're ready."))
+                        speak(.ack("Paused."))
                     }
                 case .resume:
                     if phase == .paused {
                         resume()
-                        speak(.ack("Continuing."))
+                        speak(.ack("Back on it."))
                     }
                 }
                 return
@@ -251,7 +251,7 @@ public final class TaskController {
         Task { @MainActor in
             defer { self.routing -= 1 }
             if let handler, let result = await handler(text) {
-                self.speak(.ack(result.ack))
+                // No spoken ack: the user sees the app open.
                 self.append(ActivityEntry(kind: .result, title: result.summary, success: true))
                 if let rest = result.remainder, !rest.isEmpty {
                     self.queuedRequest = (rest, result.context)
@@ -294,8 +294,8 @@ public final class TaskController {
 
     /// Shows and says what an instant action did, then plans what it left over or asks its
     /// follow-up question.
+    /// Instant actions are silent: the user sees the app open, and `result.ack` is only shown.
     private func finishInstant(_ text: String, _ result: InstantResult, context: String?) async {
-        speak(.ack(result.ack))
         let entry = ActivityEntry(kind: .result, title: result.summary, success: true)
         if let rest = result.remainder?.trimmingCharacters(in: .whitespacesAndNewlines), !rest.isEmpty {
             start(rest, context: Self.join(context, result.context ?? result.summary))
@@ -389,10 +389,13 @@ public final class TaskController {
 
     private func speak(_ cue: SpeechCue) { outgoing.yield(.speech(cue)) }
 
+    /// Every cue leaves through here, cleaned up by `SpokenLine.tidy` (no URLs, element refs,
+    /// markdown or long lines, whatever a model wrote).
+
     private func deliver(_ event: Outgoing) {
         switch event {
         case .speech(let cue):
-            onSpeech?(cue)
+            onSpeech?(SpokenLine.tidy(cue))
         case .questionChanged(let token):
             guard token == conversationToken else { return }
             refreshQuestion()
@@ -633,14 +636,14 @@ public final class TaskController {
     private func speakOutcome(_ result: TaskResult) {
         switch result.status {
         case .completed:
-            speak(.result(result.spoken ?? UtteranceInterpreter.spokenSummary(result.summary)))
+            speak(.result(SpokenLine.result(summary: result.summary, spoken: result.spoken, instruction: instruction)))
         case .failed:
-            speak(.error(UtteranceInterpreter.spokenSummary(result.summary)))
+            speak(.error(SpokenLine.error(result.summary)))
         case .needsInput:
             if let plan = result.plan, plan.steps.isEmpty, let question = plan.clarification, question == result.summary, result.jobID == nil {
                 askIdle(AgentQuestion(text: question), kind: .clarify(instruction: instruction))
             } else {
-                speak(.needsYou(UtteranceInterpreter.spokenSummary(result.summary, maxWords: 30)))
+                speak(.needsYou(SpokenLine.needsYou(result.summary)))
             }
         case .stopped:
             break

@@ -278,7 +278,7 @@ struct TaskConversationTests {
         #expect(await eventually { c.answer(for: "size") == "L" })
         #expect(c.wasDefaulted("size"))
         #expect(events.acks == [TaskConversation.goingWith("L")])
-        #expect(TaskConversation.goingWith("L") == "Going with L — say stop to change.")
+        #expect(TaskConversation.goingWith("L") == "Going with L.")
     }
 
     @Test func aPauseHoldsTheDefaultBack() async {
@@ -384,7 +384,7 @@ struct ConversationControllerTests {
     static func socksModel() -> ScriptedLLM {
         taskModel(plan: socksPlan, steps: [
             1: [toolReply(calls: [("shop.search", ["q": "socks"])]), toolReply("step_done", message: "Found athletic crew, no-show and wool socks")],
-            2: [toolReply(calls: [("cart.add", [:])]), spokenDone("Added the socks to your cart.", spoken: "Added wool socks — your cart is $14.98.")],
+            2: [toolReply(calls: [("cart.add", [:])]), spokenDone("Added the socks to your cart.", spoken: "Wool socks are in your cart.")],
         ])
     }
 
@@ -411,10 +411,13 @@ struct ConversationControllerTests {
         #expect(fx.controller.pendingQuestion == nil)
         let addPrompt = try #require(fx.llm.userMessages.last { $0.contains("STEP 2:") })
         #expect(addPrompt.contains("The user answered “Which socks — athletic crew, no-show or wool?”: Wool"))
-        // Said in order: ack, the question, the result.
-        #expect(fx.cues.first == .ack("On it — opening Amazon."))
+        // The question is the acknowledgement (no "On it." before it); then just the result.
         #expect(fx.questionCues == ["Which socks — athletic crew, no-show or wool?"])
-        #expect(fx.cues.last == .result("Added wool socks — your cart is $14.98."))
+        #expect(fx.cues.first.map { if case .question = $0 { true } else { false } } == true)
+        #expect(!fx.cues.contains { if case .ack = $0 { true } else { false } })
+        // Cues arrive through the controller's stream: wait for the result.
+        #expect(await eventuallyOnMain { fx.cues.last == .result("Wool socks are in your cart.") })
+        #expect(fx.cues.count == 2)
     }
 
     @Test func aLowRiskDefaultKicksInAfterTheTimeout() async throws {
@@ -426,7 +429,7 @@ struct ConversationControllerTests {
         #expect(await fx.finished())
         #expect(fx.controller.lastResult?.status == .completed)
         #expect(add.calls.count == 1)
-        #expect(fx.cues.contains(.ack("Going with Athletic crew — say stop to change.")))
+        #expect(fx.cues.contains(.ack("Going with Athletic crew.")))
         let addPrompt = try #require(fx.llm.userMessages.last { $0.contains("STEP 2:") })
         #expect(addPrompt.contains("going with the default: Athletic crew"))
     }
@@ -513,7 +516,7 @@ struct ConversationControllerTests {
         #expect(fx.controller.phase == .stopped && fx.runtime.gate.isStopped)
         #expect(await eventuallyOnMain { !fx.controller.isBusy })
         #expect(fx.controller.lastResult?.status == .stopped)
-        #expect(fx.cues.contains(.ack("Okay, stopped.")))
+        #expect(fx.cues == [.ack("Paused."), .ack("Back on it."), .ack("Stopped.")])
     }
 
     @Test func instantActionsComeFirstAndTheirRemainderIsPlannedWithContext() async throws {
@@ -527,7 +530,8 @@ struct ConversationControllerTests {
         defer { Task { await fx.cleanUp() } }
         fx.say("open ChatGPT and ask it to write a haiku")
         #expect(await fx.finished())
-        #expect(fx.cues.first == .ack("Opening ChatGPT."))
+        // The instant part is silent (ChatGPT visibly opens); only the result is said.
+        #expect(await eventuallyOnMain { fx.cues == [.result("Here's your haiku.")] })
         let planning = try #require(llm.requests.first { $0.schemaName == "plan" }?.messages.last?.text)
         #expect(planning.contains("User request: ask it to write a haiku"))
         #expect(planning.contains("ChatGPT (desktop app) is open and in front."))
@@ -547,7 +551,7 @@ struct ConversationControllerTests {
         #expect(await eventuallyOnMain { fx.controller.pendingQuestion?.id == "next" })
         #expect(fx.controller.phase == .completed && fx.controller.status == "Opened ChatGPT")
         #expect(llm.requests.isEmpty, "no model for an instant action")
-        #expect(fx.cues == [.ack("Opening ChatGPT."), .question(followUp)])
+        #expect(fx.cues == [.question(followUp)], "no spoken ack for an instant action")
         fx.say("ask it to write a haiku")
         #expect(await eventuallyOnMain { fx.controller.lastResult?.summary == "Done." && !fx.controller.isBusy })
         let planning = try #require(llm.requests.first?.messages.last?.text)
@@ -611,7 +615,7 @@ struct ConversationControllerTests {
         #expect(await eventuallyOnMain { fx.questionCues == ["Which city?", "Which month?"] })
         fx.say("May")
         #expect(await fx.finished())
-        #expect(fx.cues.first == .ack("Sure — planning the trip."))
+        #expect(!fx.cues.contains { if case .ack = $0 { true } else { false } })
         #expect(fx.cues.last == .result("Planned."))
     }
 
@@ -643,6 +647,70 @@ struct ConversationControllerTests {
         fx.say("check my balance")
         #expect(await fx.finished())
         #expect(fx.controller.lastResult?.status == .needsInput)
-        #expect(fx.cues.last == .needsYou("Please log in to your bank first."))
+        #expect(fx.cues.last == .needsYou("I need you to log in to your bank."))
     }
+
+    @Test func slowWorkGetsAShortAckAndQuickWorkNone() async throws {
+        let slow = taskModel(plan: planJSON(ack: "On it — opening Amazon and searching for socks.", steps: [
+            planStepJSON("Searching", "Search for socks"), planStepJSON("Reading", "Read the results"),
+        ]), steps: [2: [spokenDone("Found socks.", spoken: "Found some good ones.")]])
+        let fx = try ConversationFixture(llm: slow)
+        defer { Task { await fx.cleanUp() } }
+        fx.say("find socks")
+        #expect(await fx.finished())
+        #expect(await eventuallyOnMain { fx.cues == [.ack("On it."), .result("Found some good ones.")] })
+
+        let quick = taskModel(plan: planJSON(ack: "On it — checking.", steps: [planStepJSON("Listing", "List the files")]),
+                              steps: [1: [toolReply("task_done", message: "Listed 3 files.")]])
+        let qx = try ConversationFixture(llm: quick)
+        defer { Task { await qx.cleanUp() } }
+        qx.say("list my files")
+        #expect(await qx.finished())
+        #expect(await eventuallyOnMain { qx.cues == [.result("Listed 3 files.")] })
+    }
+
+    @Test func aLongTaskSaysStillOnItOnce() async throws {
+        let working = Latch()
+        let work = FakeTool("shop.search") { _, _ in await working.wait(); return ToolOutput(ok: true, text: "ok") }
+        let llm = taskModel(plan: planJSON(steps: [planStepJSON("Working", "Do the work"), planStepJSON("More", "More work")]),
+                            steps: [1: [toolReply(calls: [("shop.search", [:])])], 2: [toolReply("task_done", message: "Did it.")]])
+        let fx = try ConversationFixture(llm: llm, tools: [work])
+        defer { Task { working.open(); await fx.cleanUp() } }
+        fx.controller.configureOrchestrator = { [unowned fx] o in
+            o.screenContext = false
+            o.testModel = (fx.llm, "scripted")
+            o.screenAvailable = { true }
+            o.progressAfter = 0.2
+        }
+        fx.say("do the work")
+        #expect(await eventually { work.calls.count == 1 })
+        #expect(await eventuallyOnMain { fx.cues.contains(.progress("Still on it.")) })
+        try? await Task.sleep(for: .milliseconds(600))
+        working.open()
+        #expect(await fx.finished())
+        #expect(fx.cues.filter { if case .progress = $0 { true } else { false } } == [.progress("Still on it.")])
+    }
+
+    @Test func aChattyResultIsTidiedBeforeItIsSpoken() async throws {
+        let llm = taskModel(plan: planJSON(steps: [planStepJSON("Searching", "Search the web for running shoes")]),
+                            steps: [1: [spokenDone("""
+                            Top results:
+                            1. Nike Pegasus 41 — https://www.nike.com/pegasus
+                            2. Brooks Ghost 16 — https://www.brooksrunning.com/ghost
+                            """, spoken: "Done. Here are the best picks (see https://www.nike.com/pegasus), led by **Pegasus**.")]])
+        let fx = try ConversationFixture(llm: llm)
+        defer { Task { await fx.cleanUp() } }
+        fx.say("search for running shoes")
+        #expect(await fx.finished())
+        #expect(await eventuallyOnMain { fx.cues.last == .result("Here are the best picks, led by Pegasus.") })
+        // Without a spoken line, a list result is never read out.
+        let plain = taskModel(plan: planJSON(steps: [planStepJSON("Searching", "Search the web for running shoes")]),
+                              steps: [1: [toolReply("task_done", message: "Top results:\n1. Nike Pegasus 41 — $130\n2. Brooks Ghost 16 — $140")]])
+        let px = try ConversationFixture(llm: plain)
+        defer { Task { await px.cleanUp() } }
+        px.say("search for running shoes")
+        #expect(await px.finished())
+        #expect(await eventuallyOnMain { px.cues.last == .result(SpokenLine.listResult) })
+    }
+
 }
