@@ -1,9 +1,9 @@
 import AVFoundation
 import os
 
-/// Microphone in and speech out for a realtime conversation. The real one runs one
-/// voice-processing `AVAudioEngine` for both, so echo cancellation removes Glide's own voice
-/// from what the microphone hears; tests use a fake.
+/// Microphone in and speech out for a realtime conversation. The real one mutes the mic while
+/// Glide speaks, or (with `VoiceAudio.echoCancellationEnabled`) runs one voice-processing
+/// `AVAudioEngine` for both so the user can talk over it; tests use a fake.
 @MainActor
 protocol RealtimeAudioIO: AnyObject {
     /// Asks for (or checks) microphone access.
@@ -104,6 +104,8 @@ final class RealtimeMicTap: @unchecked Sendable {
 final class RealtimeAudioEngine: RealtimeAudioIO {
     private var engine: AVAudioEngine?
     private var player: AVAudioPlayerNode?
+    /// The engine the player is attached to (the mic engine, or the app's output engine).
+    private var playerEngine: AVAudioEngine?
     private var tap: RealtimeMicTap?
     private var ledger: RealtimePlaybackLedger?
     private let playFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: RealtimeProtocol.sampleRate, channels: 1, interleaved: false)
@@ -119,51 +121,83 @@ final class RealtimeAudioEngine: RealtimeAudioIO {
     func start(onAudio: @escaping @Sendable (Data) -> Void, onLevel: @escaping @Sendable (Float) -> Void,
                onPlaying: @escaping @Sendable (Bool) -> Void) throws {
         stop()
-        do {
-            try start(voiceProcessing: true, onAudio: onAudio, onLevel: onLevel, onPlaying: onPlaying)
-            echoCancelled = true
-        } catch {
-            // Echo cancellation can't run on some setups (Bluetooth headsets, mismatched input and
-            // output rates). Without it the mic would hear Glide, so it's muted while Glide speaks.
-            stop()
-            let muted = HalfDuplexGate()
+        RealtimeDiagnostics.note("releasing other audio before opening the mic: \(VoiceAudio.shared.releaseAll())")
+        if VoiceAudio.echoCancellationEnabled {
             do {
-                try start(voiceProcessing: false, onAudio: { pcm in if !muted.isMuted { onAudio(pcm) } }, onLevel: onLevel,
-                          onPlaying: { playing in muted.set(playing); onPlaying(playing) })
-                echoCancelled = false
+                try start(voiceProcessing: true, onAudio: onAudio, onLevel: onLevel, onPlaying: onPlaying)
+                echoCancelled = true
+                RealtimeDiagnostics.note("mic started with echo cancellation")
+                return
             } catch {
-                let ns = error as NSError
-                throw RealtimeError.closed("\(ns.localizedDescription) (\(ns.domain) \(ns.code))")
+                // A failed attempt leaves this process's mic unusable, so don't try again.
+                UserDefaults.standard.set(false, forKey: "glide.voice.echoCancellation")
+                RealtimeDiagnostics.note("mic with echo cancellation failed: \(Self.describe(error))")
+                stop()
+                Thread.sleep(forTimeInterval: 0.25)
             }
+        }
+        // Without echo cancellation the mic would hear Glide, so it's muted while Glide speaks.
+        let muted = HalfDuplexGate()
+        do {
+            try start(voiceProcessing: false, onAudio: { pcm in if !muted.isMuted { onAudio(pcm) } }, onLevel: onLevel,
+                      onPlaying: { playing in muted.set(playing); onPlaying(playing) })
+            echoCancelled = false
+            RealtimeDiagnostics.note("mic started")
+        } catch {
+            RealtimeDiagnostics.note("mic failed: \(Self.describe(error))")
+            stop()
+            let ns = error as NSError
+            throw RealtimeError.closed("\(ns.localizedDescription) (\(ns.domain) \(ns.code))")
         }
     }
 
+    nonisolated static func describe(_ error: Error) -> String {
+        if let e = error as? RealtimeError { return "RealtimeError.\(e) — \(e.description)" }
+        let ns = error as NSError
+        return "\(ns.domain) \(ns.code): \(ns.localizedDescription) \(ns.userInfo)"
+    }
+
     /// False when the mic runs without echo cancellation (and so is muted while Glide speaks).
-    private(set) var echoCancelled = true
+    private(set) var echoCancelled = false
 
     private func start(voiceProcessing: Bool, onAudio: @escaping @Sendable (Data) -> Void, onLevel: @escaping @Sendable (Float) -> Void,
                        onPlaying: @escaping @Sendable (Bool) -> Void) throws {
         guard let playFormat else { throw RealtimeError.badURL }
+        // Open the mic the same way on-device listening does, which works on setups where
+        // wiring playback into the engine before it starts fails (kAUInitialize / -10875).
         let engine = AVAudioEngine()
         let input = engine.inputNode
         if voiceProcessing {
             try input.setVoiceProcessingEnabled(true)
             // Keep the user's other audio at its volume while the conversation is open.
             input.voiceProcessingOtherAudioDuckingConfiguration = .init(enableAdvancedDucking: false, duckingLevel: .min)
+            _ = engine.mainMixerNode
         }
-        let player = AVAudioPlayerNode()
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: playFormat)
         let micFormat = input.outputFormat(forBus: 0)
+        RealtimeDiagnostics.note("mic format (voice processing \(voiceProcessing)): \(micFormat)")
         guard micFormat.sampleRate > 0, micFormat.channelCount > 0 else { throw RealtimeError.closed("no microphone") }
         let tap = try RealtimeMicTap(micFormat: micFormat, onAudio: onAudio, onLevel: onLevel)
         Self.install(tap, on: input, format: micFormat)
         engine.prepare()
-        try engine.start()
-        player.play()
+        do { try engine.start() } catch { input.removeTap(onBus: 0); throw error }
         self.engine = engine
-        self.player = player
         self.tap = tap
+
+        // Then Glide's voice: on the same engine when it's echo-cancelled (so the user can talk
+        // over it), otherwise on the app's output-only engine.
+        let player = AVAudioPlayerNode()
+        let output: AVAudioEngine
+        if voiceProcessing {
+            output = engine
+        } else {
+            output = try VoiceAudio.shared.playbackEngine().engine
+        }
+        output.attach(player)
+        output.connect(player, to: output.mainMixerNode, format: playFormat)
+        if !output.isRunning { try output.start() }
+        player.play()
+        self.player = player
+        self.playerEngine = output
         self.ledger = RealtimePlaybackLedger(onPlaying: onPlaying)
     }
 
@@ -209,12 +243,15 @@ final class RealtimeAudioEngine: RealtimeAudioIO {
         ledger?.reset()
         ledger = nil
         player?.stop()
+        if let player, let playerEngine, playerEngine !== engine { playerEngine.detach(player) }
         if let engine {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
-            if let player { engine.detach(player) }
+            try? engine.inputNode.setVoiceProcessingEnabled(false)
+            if let player, playerEngine === engine { engine.detach(player) }
         }
         engine = nil
+        playerEngine = nil
         player = nil
         tap = nil
     }

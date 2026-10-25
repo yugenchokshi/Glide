@@ -113,7 +113,8 @@ final class RealtimeConversation {
                                 DispatchQueue.main.async { MainActor.assumeIsolated { self?.playbackChanged(playing) } }
                             })
         } catch {
-            finish(.failed("Couldn't open the microphone: \(error.localizedDescription)", fallback: false))
+            RealtimeDiagnostics.note("audio start threw: \(RealtimeAudioEngine.describe(error))")
+            finish(.failed("Couldn't start voice: \((error as? RealtimeError)?.description ?? error.localizedDescription)", fallback: false))
             return
         }
         emit(.micLive)
@@ -137,7 +138,12 @@ final class RealtimeConversation {
         transport.close()
         responseActive = false
         userSpeaking = false
-        if case .failed(let why, _) = reason { log.error("realtime ended: \(why, privacy: .public)") }
+        if case .failed(let why, _) = reason {
+            log.error("realtime ended: \(why, privacy: .public)")
+            RealtimeDiagnostics.note("ended: \(why)")
+        } else {
+            RealtimeDiagnostics.note("ended: \(reason)")
+        }
         onEvent(.ended(reason))
     }
 
@@ -180,6 +186,7 @@ final class RealtimeConversation {
     // MARK: Server → Glide
 
     func receive(_ frame: String) {
+        RealtimeDiagnostics.event(frame)
         guard isOpen, let event = RealtimeServerEvent.decode(frame) else { return }
         handle(event)
     }
@@ -253,6 +260,7 @@ final class RealtimeConversation {
                 return
             }
             log.error("realtime error \(type ?? "", privacy: .public) \(code ?? "", privacy: .public): \(message, privacy: .public)")
+            RealtimeDiagnostics.note("server error \(type ?? "") \(code ?? ""): \(message)")
             if state == .connecting { finish(.failed(message, fallback: true)) }
         case .other:
             break
@@ -263,7 +271,9 @@ final class RealtimeConversation {
         guard handledCalls.insert(call.callID).inserted else { return }
         let output = RealtimeGlide.dispatch(call, to: glide)
         send(.functionOutput(callID: call.callID, output: output))
-        toolOutputsSent = true
+        // An opened app speaks for itself (and Glide may ask a follow-up), and an answer is
+        // Glide's to act on, so only the other tools get a spoken reply to their output.
+        if !["open_app_or_site", "answer_glide"].contains(call.name) { toolOutputsSent = true }
         armIdle()
     }
 
@@ -291,6 +301,7 @@ final class RealtimeConversation {
     }
 
     private func playbackChanged(_ playing: Bool) {
+        RealtimeDiagnostics.note(playing ? "playback started" : "playback drained")
         emit(.speaking(playing))
         if !playing { armIdle() }
     }

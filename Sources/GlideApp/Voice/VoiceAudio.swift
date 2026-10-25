@@ -63,6 +63,35 @@ final class VoiceAudio {
         return (engine, false)
     }
 
+    /// Whether Glide turns on the system's voice processing (echo cancellation). Off unless
+    /// `glide.voice.echoCancellation` is set: on some Macs it fails at kAUInitialize (-10875),
+    /// and one failed attempt leaves the process's microphone unusable until relaunch. Without
+    /// it the mic is muted while Glide speaks, so the user can't talk over it.
+    static var echoCancellationEnabled: Bool { UserDefaults.standard.bool(forKey: "glide.voice.echoCancellation") }
+
+    /// Frees the microphone and speakers for another owner (the realtime conversation): the
+    /// on-device listener and the output-only engine stop, and voice processing is released.
+    /// Returns what was holding them, for diagnostics.
+    @discardableResult
+    func releaseAll() -> String {
+        var held: [String] = []
+        if let input = inputEngine {
+            held.append("on-device mic (running: \(input.isRunning), echo-cancelled: \(inputEchoCancelled))")
+            player?.engineWillStop(input)
+            input.inputNode.removeTap(onBus: 0)
+            input.stop()
+            try? input.inputNode.setVoiceProcessingEnabled(false)
+            inputEngine = nil
+            inputEchoCancelled = false
+        }
+        if let output = outputEngine {
+            held.append("output engine (running: \(output.isRunning))")
+            output.stop()
+            outputEngine = nil
+        }
+        return held.isEmpty ? "nothing" : held.joined(separator: ", ")
+    }
+
     /// Stops the output-only engine when nothing plays, so the audio device can sleep.
     func releaseOutput(_ engine: AVAudioEngine) {
         guard engine === outputEngine else { return }

@@ -104,7 +104,7 @@ final class WebSocketTransport: NSObject, RealtimeTransport, URLSessionWebSocket
             return h
         }
         guard let handler else { return }
-        if let error { log.error("realtime socket closed: \(String(describing: error), privacy: .public)") }
+        if let error { log.error("realtime socket closed: \(String(describing: error), privacy: .public)"); RealtimeDiagnostics.note("socket closed: \(String(describing: error))") }
         handler(error ?? RealtimeError.closed("closed by server"))
         session?.invalidateAndCancel()
     }

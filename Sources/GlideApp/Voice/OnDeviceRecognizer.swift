@@ -259,7 +259,8 @@ final class OnDeviceRecognizer: VoiceRecognizer {
                          sink: @escaping @Sendable (AVAudioPCMBuffer) -> Void) throws {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
-        if request.echoCancellation {
+        let echoCancelled = request.echoCancellation && VoiceAudio.echoCancellationEnabled
+        if echoCancelled {
             try inputNode.setVoiceProcessingEnabled(true)
             // Keep the user's other audio at its volume while Glide listens.
             inputNode.voiceProcessingOtherAudioDuckingConfiguration = .init(enableAdvancedDucking: false, duckingLevel: .min)
@@ -278,7 +279,7 @@ final class OnDeviceRecognizer: VoiceRecognizer {
         engine.prepare()
         try engine.start()
         self.engine = engine
-        audio.registerInput(engine, echoCancelled: request.echoCancellation)
+        audio.registerInput(engine, echoCancelled: echoCancelled)
         emit(.started, gen)
     }
 
