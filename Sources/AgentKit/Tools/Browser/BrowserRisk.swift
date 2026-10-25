@@ -261,6 +261,12 @@ enum BrowserRisk {
         return ToolVerdict(risk: risk, reasons: reasons, summary: summary)
     }
 
+    /// Finding only reads the page and scrolls it; acting on what it found is judged when the
+    /// click or typing comes.
+    static func find(text: String) -> ToolVerdict {
+        ToolVerdict(risk: .low, summary: "Find “\(PageSnapshot.clip(text, 60))” in the browser tab")
+    }
+
     static func closeTab(tabID: String, isGlideTab: Bool) -> ToolVerdict {
         let summary = "Close browser tab \(PageSnapshot.clip(tabID, 40))"
         if isGlideTab { return ToolVerdict(risk: .low, summary: summary) }

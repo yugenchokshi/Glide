@@ -136,12 +136,23 @@ public struct PageSnapshot: Codable, Sendable, Hashable {
         public var y: Double
         public var width: Double
         public var height: Double
+        /// In the part of the page you can see: inside the viewport and not cut off by a
+        /// scrolled panel or dialog it sits in.
         public var inViewport: Bool
+        /// Inside the open dialog or popup (`PageSnapshot.modal`).
+        public var inModal: Bool?
+        /// Which way it lies when it isn't in view: "below", "above", "right" or "left".
+        public var offscreen: String?
+        /// Listed only because `find` asked for it (beyond the cap, or not a control at all).
+        /// The fingerprint and change summaries leave such elements out, so a later snapshot
+        /// without them doesn't look like a change.
+        public var pinned: Bool?
 
         public init(ref: String, role: String, name: String, value: String? = nil, inputType: String? = nil, checked: Bool? = nil,
                     selected: Bool? = nil, expanded: Bool? = nil, disabled: Bool = false, focused: Bool = false, secure: Bool = false,
                     href: String? = nil, options: [String]? = nil, context: String? = nil,
-                    x: Double = 0, y: Double = 0, width: Double = 0, height: Double = 0, inViewport: Bool = true) {
+                    x: Double = 0, y: Double = 0, width: Double = 0, height: Double = 0, inViewport: Bool = true,
+                    inModal: Bool? = nil, offscreen: String? = nil, pinned: Bool? = nil) {
             self.ref = ref
             self.role = role
             self.name = name
@@ -161,6 +172,92 @@ public struct PageSnapshot: Codable, Sendable, Hashable {
             self.width = width
             self.height = height
             self.inViewport = inViewport
+            self.inModal = inModal
+            self.offscreen = offscreen
+            self.pinned = pinned
+        }
+    }
+
+    /// A dialog or popup open in front of the page: a `<dialog>` or role=dialog under the
+    /// viewport center, a modal one anywhere, or a fixed overlay covering the center.
+    public struct Modal: Codable, Sendable, Hashable {
+        /// One of its interactive elements beyond its visible area, with the heading above it.
+        public struct Hint: Codable, Sendable, Hashable {
+            public var name: String
+            public var group: String
+
+            public init(name: String, group: String = "") {
+                self.name = name
+                self.group = group
+            }
+        }
+
+        public var name: String
+        /// "dialog", or "popup" for an overlay that doesn't say it's a dialog.
+        public var kind: String
+        /// Its main scrollable region: how far it's scrolled and how tall it is.
+        public var scrollTop: Double
+        public var scrollLeft: Double
+        public var scrollHeight: Double
+        public var clientHeight: Double
+        /// The first of its interactive elements further down, and how many there are in all.
+        public var below: [Hint]
+        public var belowCount: Int
+        /// Its interactive elements scrolled past (above or to the side of its visible area).
+        public var aboveCount: Int
+        /// Its readable text, without the lines that are just its controls' names (capped).
+        public var text: String
+
+        public init(name: String, kind: String = "dialog", scrollTop: Double = 0, scrollLeft: Double = 0, scrollHeight: Double = 0,
+                    clientHeight: Double = 0, below: [Hint] = [], belowCount: Int? = nil, aboveCount: Int = 0, text: String = "") {
+            self.name = name
+            self.kind = kind
+            self.scrollTop = scrollTop
+            self.scrollLeft = scrollLeft
+            self.scrollHeight = scrollHeight
+            self.clientHeight = clientHeight
+            self.below = below
+            self.belowCount = belowCount ?? below.count
+            self.aboveCount = aboveCount
+            self.text = text
+        }
+
+        /// “the “Filters” dialog”, or “the popup” when it has no name.
+        public var title: String { name.isEmpty ? "the \(kind)" : "the “\(PageSnapshot.clip(name, 60))” \(kind)" }
+    }
+
+    /// Interactive elements a snapshot or its rendering left out, by where they are.
+    public struct Offscreen: Codable, Sendable, Hashable {
+        public var below = 0
+        public var above = 0
+        public var right = 0
+        public var left = 0
+        public var onScreen = 0
+
+        public init(below: Int = 0, above: Int = 0, right: Int = 0, left: Int = 0, onScreen: Int = 0) {
+            self.below = below
+            self.above = above
+            self.right = right
+            self.left = left
+            self.onScreen = onScreen
+        }
+
+        public var total: Int { below + above + right + left + onScreen }
+
+        mutating func add(_ direction: String?) {
+            switch direction {
+            case "below": below += 1
+            case "above": above += 1
+            case "right": right += 1
+            case "left": left += 1
+            default: onScreen += 1
+            }
+        }
+
+        /// “120 below, 30 to the right”.
+        var description: String {
+            [(below, "below"), (right, "to the right"), (above, "above"), (left, "to the left"), (onScreen, "on screen")]
+                .filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }.joined(separator: ", ")
         }
     }
 
@@ -193,10 +290,18 @@ public struct PageSnapshot: Codable, Sendable, Hashable {
     /// Visible frames from other sites whose contents couldn't be included.
     public var skippedFrames: Int
     public var timestamp: Date
+    /// The dialog or popup open in front of the page, if any.
+    public var modal: Modal?
+    /// Interactive elements beyond the element cap, by where they are (not counting the
+    /// modal's own elements further down, which `modal` summarizes).
+    public var cut: Offscreen?
+    /// Why the page looks like a CAPTCHA or bot check, when it does.
+    public var botCheck: String?
 
     public init(tabID: String, url: String, title: String, viewportWidth: Double = 0, viewportHeight: Double = 0, scrollX: Double = 0,
                 scrollY: Double = 0, pageWidth: Double = 0, pageHeight: Double = 0, elements: [Element] = [], headings: [Heading] = [],
-                text: String = "", textTotal: Int? = nil, totalInteractive: Int? = nil, skippedFrames: Int = 0, timestamp: Date = Date()) {
+                text: String = "", textTotal: Int? = nil, totalInteractive: Int? = nil, skippedFrames: Int = 0, timestamp: Date = Date(),
+                modal: Modal? = nil, cut: Offscreen? = nil, botCheck: String? = nil) {
         self.tabID = tabID
         self.url = url
         self.title = title
@@ -213,50 +318,94 @@ public struct PageSnapshot: Codable, Sendable, Hashable {
         self.totalInteractive = totalInteractive ?? elements.count
         self.skippedFrames = skippedFrames
         self.timestamp = timestamp
+        self.modal = modal
+        self.cut = cut
+        self.botCheck = botCheck
     }
 
     public func element(_ ref: String) -> Element? { elements.first { $0.ref == ref } }
 
     public var focusedElement: Element? { elements.first { $0.focused } }
 
+    /// What `compact` says first on a page that looks like a CAPTCHA or bot check.
+    public static let botCheckNotice = "The page is asking to verify you're human (a CAPTCHA or bot check). Glide can't do that; the person has to complete it in Chrome."
+
     /// Model-facing rendering, in the same style as the accessibility skeleton:
-    /// `b12 button "Sign in" [disabled]`. Elements in the viewport come first; the readable text
-    /// fills whatever budget is left (at least ~1,000 characters when there is text).
-    public func compact(maxChars: Int = 8000) -> String {
+    /// `b12 button "Sign in" [disabled]`. Elements in the viewport come first — with a dialog
+    /// open, its own elements before those behind it, and the ones further down inside it as a
+    /// short list of names. The readable text fills whatever budget is left (at least ~1,000
+    /// characters when there is text). Elements in `skip` are left out (the caller shows them).
+    public func compact(maxChars: Int = 8000, skip: Set<String> = []) -> String {
         var lines: [String] = []
         lines.append("page: \"\(Self.clip(title.isEmpty ? "(untitled)" : title, 100))\" \(Self.clip(url, 200))")
         let maxScrollY = max(0, pageHeight - viewportHeight)
-        var where_ = "viewport \(Int(viewportWidth))×\(Int(viewportHeight))"
+        var where_ = "viewport \(Self.whole(viewportWidth))×\(Self.whole(viewportHeight))"
         if maxScrollY > 1 {
             let position = scrollY <= 1 ? " (top)" : (scrollY >= maxScrollY - 1 ? " (bottom)" : "")
-            where_ += ", scrolled \(Int(scrollY)) of \(Int(maxScrollY))\(position)"
+            where_ += ", scrolled \(Self.whole(scrollY)) of \(Self.whole(maxScrollY))\(position)"
         }
         lines.append(where_)
+        if botCheck != nil { lines.append(Self.botCheckNotice) }
+        if let m = modal {
+            var l = "\(m.kind) open: \"\(Self.clip(m.name.isEmpty ? "(untitled)" : m.name, 60))\""
+            let maxScroll = max(0, m.scrollHeight - m.clientHeight)
+            if maxScroll > 1 {
+                let position = m.scrollTop <= 1 ? " (top)" : (m.scrollTop >= maxScroll - 1 ? " (bottom)" : "")
+                l += ", scrolled \(Self.whole(m.scrollTop)) of \(Self.whole(maxScroll))\(position)"
+            }
+            lines.append(l)
+        }
         if let f = focusedElement { lines.append("focused: \(f.ref)") }
 
+        let hint = modal.flatMap(Self.furtherDown)
         let textReserve = text.isEmpty ? 0 : min(text.count + 10, max(1000, maxChars / 4))
-        let elementBudget = max(600, maxChars - textReserve - 300)
+        let elementBudget = max(600, maxChars - textReserve - 300 - (hint?.count ?? 0))
         var used = lines.reduce(0) { $0 + $1.count + 1 }
-        var listed = 0
-        let inView = elements.filter(\.inViewport), outside = elements.filter { !$0.inViewport }
+        var printed = Set<String>()
         func add(_ group: [Element]) {
             for e in group {
                 let l = line(for: e)
                 guard used + l.count + 1 <= elementBudget else { return }
                 lines.append(l)
                 used += l.count + 1
-                listed += 1
+                printed.insert(e.ref)
             }
         }
+        let shown = elements.filter { !skip.contains($0.ref) }
+        /// A modal's elements further down are named in the hint instead of listed.
+        func inHint(_ e: Element) -> Bool { modal != nil && e.inModal == true && !e.inViewport && e.offscreen == "below" }
         if elements.isEmpty { lines.append("(no interactive elements)") }
-        add(inView)
+        let outside: [Element]
+        if let m = modal {
+            add(shown.filter { $0.inModal == true && $0.inViewport })
+            if let hint {
+                lines.append(hint)
+                used += hint.count + 1
+            }
+            let behind = shown.filter { $0.inModal != true && $0.inViewport }
+            if !behind.isEmpty, used < elementBudget - 40 {
+                lines.append("behind the \(m.kind):")
+                used += 20
+                add(behind)
+            }
+            let hidden = shown.filter { !$0.inViewport && !inHint($0) }
+            outside = hidden.filter { $0.inModal == true } + hidden.filter { $0.inModal != true }
+        } else {
+            add(shown.filter(\.inViewport))
+            outside = shown.filter { !$0.inViewport }
+        }
         if !outside.isEmpty, used < elementBudget - 40 {
             lines.append("outside the viewport (scroll to reach):")
             used += 40
             add(outside)
         }
-        let unlisted = totalInteractive - listed
-        if unlisted > 0 { lines.append("(\(unlisted) more elements not listed — scroll, or use browser.read for text)") }
+        var more = cut ?? Offscreen()
+        for e in shown where !printed.contains(e.ref) && !inHint(e) {
+            more.add(e.inViewport ? nil : e.offscreen ?? direction(of: e))
+        }
+        if more.total > 0 {
+            lines.append("(\(more.total) more interactive element\(more.total == 1 ? "" : "s") not listed: \(more.description) — use browser.find to reach one, or scroll)")
+        }
         if skippedFrames > 0 { lines.append("(\(skippedFrames) embedded frame(s) from other sites aren't included)") }
         used = lines.reduce(0) { $0 + $1.count + 1 }
 
@@ -266,6 +415,14 @@ public struct PageSnapshot: Codable, Sendable, Hashable {
             let clipped = Self.clip(joined, max(80, min(900, maxChars - used - 100)))
             lines.append(clipped)
             used += clipped.count + 1
+        }
+        if let m = modal, !m.text.isEmpty {
+            let room = min(1500, maxChars - used - 200)
+            if room > 80 {
+                let body = m.text.count > room ? String(m.text.prefix(room)) + "…" : m.text
+                lines.append("\(m.kind) text:\n" + body)
+                used += body.count + 14
+            }
         }
         if !text.isEmpty {
             let room = maxChars - used - 8
@@ -278,7 +435,44 @@ public struct PageSnapshot: Codable, Sendable, Hashable {
         return lines.joined(separator: "\n")
     }
 
-    func line(for e: Element) -> String {
+    /// Which way an element outside the viewport lies, from its box.
+    func direction(of e: Element) -> String {
+        if e.y >= viewportHeight { return "below" }
+        if e.y + e.height <= 0 { return "above" }
+        return e.x >= viewportWidth ? "right" : "left"
+    }
+
+    /// “Further down in this dialog (24): Property type: House, Cabin; Amenities: Wifi…”, so
+    /// the model knows what scrolling the dialog would reveal without listing every element.
+    static func furtherDown(_ m: Modal) -> String? {
+        guard m.belowCount > 0 else { return nil }
+        var groups: [(group: String, names: [String])] = []
+        for h in m.below {
+            let name = clip(h.name, 40)
+            guard !name.isEmpty else { continue }
+            if let last = groups.last, last.group == h.group {
+                if !last.names.contains(name) { groups[groups.count - 1].names.append(name) }
+            } else {
+                groups.append((h.group, [name]))
+            }
+        }
+        let listing = groups.map { ($0.group.isEmpty ? "" : clip($0.group, 40) + ": ") + $0.names.joined(separator: ", ") }.joined(separator: "; ")
+        var summary = listing
+        if summary.count > 420 {
+            summary = String(summary.prefix(420))
+            if let cut = summary.range(of: ", ", options: .backwards) ?? summary.range(of: "; ", options: .backwards) {
+                summary = String(summary[..<cut.lowerBound])
+            }
+            summary += "…"
+        }
+        let count = m.belowCount == 1 ? "1 element" : "\(m.belowCount) elements"
+        let place = m.kind == "dialog" ? "this dialog" : "this \(m.kind)"
+        let body = summary.isEmpty ? "" : ": " + summary
+        return "Further down in \(place) (\(count))\(body). Scroll it with browser.scroll, or use browser.find to reach one."
+    }
+
+    /// One element as the model sees it: `b12 button "Sign in" [disabled]`.
+    public func line(for e: Element) -> String {
         var s = "\(e.ref) \(e.role)"
         if !e.name.isEmpty { s += " \"\(Self.clip(e.name, 80))\"" }
         if e.secure { s += " [secure]" }
@@ -320,7 +514,7 @@ public struct PageSnapshot: Codable, Sendable, Hashable {
         }
         var parts: [String] = []
         if old.title != title, !title.isEmpty { parts.append("title is now “\(Self.clip(title, 80))”") }
-        let oldRefs = Set(old.elements.map(\.ref)), newRefs = Set(elements.map(\.ref))
+        let oldRefs = Set(old.elements.filter { $0.pinned != true }.map(\.ref)), newRefs = Set(elements.filter { $0.pinned != true }.map(\.ref))
         let added = newRefs.subtracting(oldRefs).count, removed = oldRefs.subtracting(newRefs).count
         if added > 0 { parts.append("\(added) new element\(added == 1 ? "" : "s")") }
         if removed > 0 { parts.append("\(removed) gone") }
@@ -331,23 +525,66 @@ public struct PageSnapshot: Codable, Sendable, Hashable {
         }.count
         if changed > 0 { parts.append("\(changed) element\(changed == 1 ? "" : "s") changed") }
         if old.text != text { parts.append("the text changed") }
-        if abs(old.scrollY - scrollY) >= 1 { parts.append("scrolled to \(Int(scrollY))") }
+        if abs(old.scrollY - scrollY) >= 1 { parts.append("scrolled to \(Self.whole(scrollY))") }
+        switch (old.modal, modal) {
+        case (nil, let m?): parts.append("\(m.title) opened")
+        case (let m?, nil): parts.append("\(m.title) closed")
+        case (let a?, let b?):
+            if a.name != b.name || a.kind != b.kind { parts.append("\(b.title) is open now") }
+            else if abs(a.scrollTop - b.scrollTop) >= 1 { parts.append("\(b.title) scrolled to \(Self.whole(b.scrollTop))") }
+        case (nil, nil): break
+        }
         if parts.isEmpty { return "No visible change on the page." }
         return "Same page; " + parts.joined(separator: ", ") + "."
     }
 
-    /// Small structured form for step runners: refs with roles and names (no text).
+    /// A short hash of what a person would notice changing: the address and title, the names
+    /// and states of the interactive elements in view, the headings, whether a dialog is open,
+    /// and how far the page and that dialog are scrolled. Focus, element refs, text that isn't
+    /// a control's and timing don't count, so the same page looked at twice hashes the same and
+    /// a runner can tell an action that changed nothing.
+    public var fingerprint: String {
+        var parts = [url, title, "\(Self.whole(scrollX)),\(Self.whole(scrollY))"]
+        if let m = modal { parts.append("\(m.kind)|\(m.name)|\(Self.whole(m.scrollTop)),\(Self.whole(m.scrollLeft))") }
+        if botCheck != nil { parts.append("bot-check") }
+        parts += headings.map { "h\($0.level) \($0.text)" }
+        parts += elements.filter { $0.inViewport && $0.pinned != true }.map { e in
+            let flags = [e.checked.map { $0 ? "c" : "u" }, e.selected == true ? "s" : nil, e.expanded.map { $0 ? "x" : "z" }, e.disabled ? "d" : nil]
+            return [e.role, e.name, e.value ?? "", flags.compactMap { $0 }.joined()].joined(separator: "\u{1F}")
+        }.sorted()
+        // FNV-1a: stable across launches, unlike Hasher.
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in parts.joined(separator: "\u{1E}").utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        let hex = String(hash, radix: 16)
+        return String(repeating: "0", count: max(0, 16 - hex.count)) + hex
+    }
+
+    /// Small structured form for step runners: refs with roles and names (no text), the page's
+    /// `fingerprint`, and `botCheck: true` on a CAPTCHA or bot check.
     public var modelData: JSONValue {
-        .object([
+        var o: [String: JSONValue] = [
             "tab_id": .string(tabID),
             "url": .string(url),
             "title": .string(title),
+            "fingerprint": .string(fingerprint),
             "elements": .array(elements.map { e in
                 var o: [String: JSONValue] = ["ref": .string(e.ref), "role": .string(e.role), "name": .string(Self.clip(e.name, 80))]
                 if e.secure { o["secure"] = true }
                 return .object(o)
             }),
-        ])
+        ]
+        if botCheck != nil { o["botCheck"] = true }
+        if let m = modal { o["dialog"] = .string(m.name) }
+        return .object(o)
+    }
+
+    /// A page-supplied number as a whole number, without trapping on huge or non-finite values.
+    static func whole(_ d: Double) -> Int {
+        guard d.isFinite else { return 0 }
+        return Int(max(-1e15, min(1e15, d.rounded())))
     }
 
     static func stripFragment(_ s: String) -> String {
@@ -379,12 +616,59 @@ public struct BrowserActionOutcome: Sendable, Hashable {
     public var notes: [String]
     /// The field's value after typing, or the option chosen.
     public var value: String?
+    /// For a scroll: whether anything moved.
+    public var moved: Bool
+    /// For a scroll: what moved, or what Glide tried to move ("the page", "the “Filters” dialog").
+    public var scrolled: String?
 
-    public init(settled: Bool = true, notes: [String] = [], value: String? = nil) {
+    public init(settled: Bool = true, notes: [String] = [], value: String? = nil, moved: Bool = true, scrolled: String? = nil) {
         self.settled = settled
         self.notes = notes
         self.value = value
+        self.moved = moved
+        self.scrolled = scrolled
     }
+}
+
+/// What `BrowserDriver.find` found: the best match, scrolled into view and listed in `snapshot`
+/// with a ref, and where the other matches are.
+public struct BrowserFindResult: Sendable {
+    public struct Match: Sendable, Hashable {
+        public var ref: String
+        public var role: String
+        public var name: String
+        /// Where it was when Glide looked, e.g. "in dialog “Filters”, further down".
+        public var location: String
+        /// Its rank among the matches: the `nth` that picks it.
+        public var nth: Int
+
+        public init(ref: String, role: String, name: String, location: String, nth: Int) {
+            self.ref = ref
+            self.role = role
+            self.name = name
+            self.location = location
+            self.nth = nth
+        }
+    }
+
+    /// The page after scrolling; the match and the other matches are in it (refs Glide could
+    /// keep: hidden ones may be missing).
+    public var snapshot: PageSnapshot
+    /// Nil when nothing matched (or `nth` was beyond the matches).
+    public var match: Match?
+    /// True when the match was out of view and Glide scrolled to it.
+    public var scrolled: Bool
+    /// True when it's still out of view after scrolling (hidden, or in a part of the page that
+    /// doesn't scroll).
+    public var stillOutOfView: Bool
+    /// The next best matches (up to eight).
+    public var others: [Match]
+    /// Matches in all, for the role asked for.
+    public var total: Int
+    /// When nothing had the role asked for: the roles of the elements with that text.
+    public var otherRoles: [String]
+    /// When nothing matched at all: labels on the page that look close.
+    public var suggestions: [String]
 }
 
 /// What `browser.wait` waits for.
@@ -463,14 +747,17 @@ public final class BrowserDriver: Sendable {
 
     // MARK: Snapshot
 
-    public func snapshot(tabID: String, maxElements: Int = 300, maxTextChars: Int = 6000) async throws -> PageSnapshot {
+    /// `pin` lists refs that must be in the snapshot even beyond `maxElements` or when they
+    /// aren't ordinary controls (what `find` found).
+    public func snapshot(tabID: String, maxElements: Int = 300, maxTextChars: Int = 6000, pin: [String] = []) async throws -> PageSnapshot {
         let seq = tabState.withLock { $0[tabID]?.nextRef ?? 0 }
-        let args: JSONValue = ["seq": .number(Double(seq)), "max": .number(Double(max(1, maxElements))), "maxText": .number(Double(max(0, maxTextChars)))]
+        let args: JSONValue = ["seq": .number(Double(seq)), "max": .number(Double(max(1, maxElements))), "maxText": .number(Double(max(0, maxTextChars))),
+                               "pin": .array(pin.prefix(20).map { .string($0) })]
         let v = try await evaluate(tabID: tabID, Self.call(Self.snapshotFunction, args), timeout: 25)
         guard v.objectValue != nil else { throw BrowserError.cdp("The page didn't return a snapshot.") }
         let snap = Self.decodeSnapshot(v, tabID: tabID)
         if Self.isRestricted(url: snap.url) { throw BrowserError.restrictedPage(snap.url) }
-        let newSeq = v["seq"]?.intValue ?? seq
+        let newSeq = Self.count(v["seq"]) ?? seq
         tabState.withLock { state in
             var s = state[tabID] ?? TabState()
             s.nextRef = max(s.nextRef, newSeq)
@@ -482,6 +769,50 @@ public final class BrowserDriver: Sendable {
             }
         }
         return snap
+    }
+
+    // MARK: Find
+
+    /// Looks through the whole page — off-screen parts, scrolled panels and dialogs, open shadow
+    /// roots, same-origin frames — for elements whose text, label, placeholder, title, alt text
+    /// or (non-secret) value contains `text`, case-insensitively. Controls rank first, then
+    /// visible before hidden, exact before partial, in view before out of view. The `nth` best
+    /// is scrolled into view (nested panels too) and gets a ref in the same space as snapshots,
+    /// so `click` and `type` accept it; the next few get refs as well.
+    ///
+    /// `role` keeps only elements of that role ("textbox" also takes search boxes and
+    /// comboboxes, "checkbox" switches).
+    public func find(tabID: String, text: String, role: String? = nil, nth: Int = 1) async throws -> BrowserFindResult {
+        let seq = tabState.withLock { $0[tabID]?.nextRef ?? 0 }
+        let args: JSONValue = ["seq": .number(Double(seq)), "text": .string(text), "role": role.map { .string($0) } ?? .null,
+                               "nth": .number(Double(min(1000, max(1, nth))))]
+        let r = try await evaluate(tabID: tabID, Self.call(Self.findFunction, args), timeout: 25)
+        guard r.objectValue != nil else { throw BrowserError.cdp("The page didn't answer the search.") }
+        if let url = r["url"]?.stringValue, Self.isRestricted(url: url) { throw BrowserError.restrictedPage(url) }
+        if let newSeq = Self.count(r["seq"]) {
+            tabState.withLock { state in
+                var s = state[tabID] ?? TabState()
+                s.nextRef = max(s.nextRef, newSeq)
+                state[tabID] = s
+            }
+        }
+        func decode(_ v: JSONValue?) -> BrowserFindResult.Match? {
+            guard let v, let ref = v["ref"]?.stringValue, (try? Self.validate(ref: ref)) != nil else { return nil }
+            return BrowserFindResult.Match(ref: ref, role: v["role"]?.stringValue ?? "element", name: v["name"]?.stringValue ?? "",
+                                           location: v["where"]?.stringValue ?? "", nth: Self.count(v["nth"]) ?? 1)
+        }
+        let match = r["found"]?.boolValue == true ? decode(r["match"]) : nil
+        let others = (r["others"]?.arrayValue ?? []).compactMap { decode($0) }
+        let scrolled = match != nil && r["scrolled"]?.boolValue == true
+        // Scrolling can load lazy content; give it a moment, but don't wait for a busy page.
+        if scrolled { _ = try await waitForSettle(tabID: tabID, timeout: 1) }
+        let pins = (match.map { [$0.ref] } ?? []) + others.map(\.ref)
+        let snap = try await snapshot(tabID: tabID, pin: pins)
+        let stillOut = match.map { m in snap.element(m.ref).map { !$0.inViewport } ?? true } ?? false
+        return BrowserFindResult(snapshot: snap, match: match, scrolled: scrolled, stillOutOfView: stillOut, others: others,
+                                 total: Self.count(r["total"]) ?? 0,
+                                 otherRoles: (r["roles"]?.arrayValue ?? []).compactMap(\.stringValue),
+                                 suggestions: (r["suggestions"]?.arrayValue ?? []).compactMap(\.stringValue))
     }
 
     // MARK: Actions
@@ -568,21 +899,51 @@ public final class BrowserDriver: Sendable {
         return BrowserActionOutcome(settled: settled, notes: notes)
     }
 
-    /// Scrolls the scrollable area under the viewport center (or under `ref`) by `amount`
-    /// screens. Uses script scrolling, which also works in background tabs.
+    /// Scrolls by `amount` screens: the scrollable panel around `ref` when given; otherwise the
+    /// open dialog or popup when there is one (the page behind it is usually locked, and what
+    /// the person is looking for is in the dialog), else the panel the focused element is in,
+    /// else the panel under the viewport center, else the page. Uses script scrolling, which
+    /// also works in background tabs; a dialog that only scrolls by script of its own gets a
+    /// real mouse wheel over it.
     public func scroll(tabID: String, direction: ScrollDirection, amount: Double = 1, ref: String? = nil) async throws -> BrowserActionOutcome {
         if let ref { try Self.validate(ref: ref) }
-        let args: JSONValue = ["dir": .string(direction.rawValue), "amount": .number(min(20, max(0.1, amount))), "ref": ref.map { .string($0) } ?? .null]
+        let amount = amount.isFinite ? min(20, max(0.1, amount)) : 1
+        let args: JSONValue = ["dir": .string(direction.rawValue), "amount": .number(amount), "ref": ref.map { .string($0) } ?? .null]
         let r = try await evaluate(tabID: tabID, Self.call(Self.scrollFunction, args))
         try Self.throwIfError(r, ref: ref ?? "")
+        var moved = r["moved"]?.boolValue == true
+        let scope = r["scope"]?.stringValue ?? "the page"
+        if !moved, let wheel = r["wheel"], let x = wheel["x"]?.doubleValue, let y = wheel["y"]?.doubleValue, x.isFinite, y.isFinite {
+            let span = (wheel["span"]?.doubleValue).flatMap { $0.isFinite ? min(5000, max(50, $0)) : nil } ?? 400
+            let delta = (direction == .up || direction == .left ? -1 : 1) * amount * span * 0.85
+            let vertical = direction == .up || direction == .down
+            moved = try await wheelScroll(tabID: tabID, x: x, y: y, dx: vertical ? 0 : delta, dy: vertical ? delta : 0)
+        }
         let settled = try await waitForSettle(tabID: tabID, timeout: 3)
         var notes: [String] = []
-        if r["moved"]?.boolValue != true {
-            notes.append("Nothing scrolled — already at the \(direction == .up ? "top" : direction == .down ? "bottom" : "edge").")
-        } else if let scope = r["scope"]?.stringValue, scope != "page" {
-            notes.append("Scrolled \(scope).")
+        if !moved {
+            let edge = direction == .up ? "top" : direction == .down ? "bottom" : "edge"
+            if r["stuck"]?.boolValue == true {
+                notes.append("Nothing scrolled — \(scope) doesn't scroll.")
+            } else {
+                notes.append(scope == "the page" ? "Nothing scrolled — already at the \(edge)." : "Nothing scrolled — \(scope) is already at the \(edge).")
+            }
         }
-        return BrowserActionOutcome(settled: settled, notes: notes)
+        return BrowserActionOutcome(settled: settled, notes: notes, moved: moved, scrolled: scope)
+    }
+
+    /// A real mouse wheel at (x, y), for dialogs that scroll by script (wheel handlers moving
+    /// their content) rather than by overflow. True when the dialog's content moved.
+    private func wheelScroll(tabID: String, x: Double, y: Double, dx: Double, dy: Double) async throws -> Bool {
+        let signature = Self.call(Self.modalSignatureFunction, .null)
+        let before = try await evaluate(tabID: tabID, signature)
+        let event: JSONValue = ["type": "mouseWheel", "x": .number(x), "y": .number(y), "deltaX": .number(dx), "deltaY": .number(dy)]
+        _ = try await send(tabID: tabID, "Input.dispatchMouseEvent", event, timeout: 10)
+        for _ in 0..<5 {
+            try await Task.sleep(for: .milliseconds(60))
+            if try await evaluate(tabID: tabID, signature) != before { return true }
+        }
+        return false
     }
 
     /// Loads `url` in the tab and waits for it to settle.
@@ -927,8 +1288,16 @@ public final class BrowserDriver: Sendable {
         "(() => {\n\(library)\nreturn (\(function))(\(args.jsonString()));\n})()"
     }
 
+    /// A non-negative count from the page, or nil (never traps on huge or odd values the way
+    /// `Int(Double)` would).
+    static func count(_ v: JSONValue?) -> Int? {
+        guard let d = v?.doubleValue, d.isFinite, d >= 0 else { return nil }
+        return Int(min(d, 1e12))
+    }
+
     static func decodeSnapshot(_ v: JSONValue, tabID: String) -> PageSnapshot {
-        func d(_ key: String) -> Double { v[key]?.doubleValue ?? 0 }
+        func num(_ value: JSONValue?) -> Double { value?.doubleValue.flatMap { $0.isFinite ? $0 : nil } ?? 0 }
+        func d(_ key: String) -> Double { num(v[key]) }
         let elements: [PageSnapshot.Element] = (v["elements"]?.arrayValue ?? []).compactMap { e in
             guard let ref = e["ref"]?.stringValue else { return nil }
             let secure = e["secure"]?.boolValue ?? false
@@ -938,19 +1307,37 @@ public final class BrowserDriver: Sendable {
                 checked: e["checked"]?.boolValue, selected: e["selected"]?.boolValue, expanded: e["expanded"]?.boolValue,
                 disabled: e["disabled"]?.boolValue ?? false, focused: e["focused"]?.boolValue ?? false, secure: secure,
                 href: e["href"]?.stringValue, options: e["options"]?.arrayValue?.compactMap(\.stringValue), context: e["context"]?.stringValue,
-                x: e["x"]?.doubleValue ?? 0, y: e["y"]?.doubleValue ?? 0, width: e["w"]?.doubleValue ?? 0, height: e["h"]?.doubleValue ?? 0,
-                inViewport: e["inView"]?.boolValue ?? true)
+                x: num(e["x"]), y: num(e["y"]), width: num(e["w"]), height: num(e["h"]),
+                inViewport: e["inView"]?.boolValue ?? true, inModal: e["inModal"]?.boolValue, offscreen: e["dir"]?.stringValue,
+                pinned: e["pinned"]?.boolValue)
         }
         let headings: [PageSnapshot.Heading] = (v["headings"]?.arrayValue ?? []).compactMap { h in
             guard let t = h["text"]?.stringValue else { return nil }
-            return PageSnapshot.Heading(level: h["level"]?.intValue ?? 2, text: t)
+            return PageSnapshot.Heading(level: min(6, max(1, count(h["level"]) ?? 2)), text: t)
         }
+        var modal: PageSnapshot.Modal?
+        if let m = v["modal"], m.objectValue != nil {
+            let hints = (m["below"]?.arrayValue ?? []).compactMap { h -> PageSnapshot.Modal.Hint? in
+                guard let name = h["name"]?.stringValue else { return nil }
+                return PageSnapshot.Modal.Hint(name: name, group: h["group"]?.stringValue ?? "")
+            }
+            modal = PageSnapshot.Modal(name: m["name"]?.stringValue ?? "", kind: m["kind"]?.stringValue == "popup" ? "popup" : "dialog",
+                                       scrollTop: num(m["st"]), scrollLeft: num(m["sl"]), scrollHeight: num(m["sh"]), clientHeight: num(m["ch"]),
+                                       below: hints, belowCount: count(m["belowCount"]) ?? hints.count, aboveCount: count(m["aboveCount"]) ?? 0,
+                                       text: m["text"]?.stringValue ?? "")
+        }
+        var cut: PageSnapshot.Offscreen?
+        if let c = v["cut"], c.objectValue != nil {
+            cut = PageSnapshot.Offscreen(below: count(c["below"]) ?? 0, above: count(c["above"]) ?? 0, right: count(c["right"]) ?? 0,
+                                         left: count(c["left"]) ?? 0, onScreen: count(c["on"]) ?? 0)
+        }
+        let bot = v["bot"]?.stringValue ?? ""
         let text = v["text"]?.stringValue ?? ""
         return PageSnapshot(tabID: tabID, url: v["url"]?.stringValue ?? "", title: v["title"]?.stringValue ?? "",
                             viewportWidth: d("vw"), viewportHeight: d("vh"), scrollX: d("sx"), scrollY: d("sy"),
                             pageWidth: d("pw"), pageHeight: d("ph"), elements: elements, headings: headings, text: text,
-                            textTotal: v["textTotal"]?.intValue ?? text.count, totalInteractive: v["total"]?.intValue ?? elements.count,
-                            skippedFrames: v["skippedFrames"]?.intValue ?? 0)
+                            textTotal: count(v["textTotal"]) ?? text.count, totalInteractive: count(v["total"]) ?? elements.count,
+                            skippedFrames: count(v["skippedFrames"]) ?? 0, modal: modal, cut: cut, botCheck: bot.isEmpty ? nil : bot)
     }
 }
 
@@ -1123,31 +1510,56 @@ extension BrowserDriver {
     G.text = function (el) { return G.clean(el.innerText !== undefined ? el.innerText : el.textContent); };
     G.win = function (el) { return (el && el.ownerDocument && el.ownerDocument.defaultView) || window; };
     G.style = function (el) { return G.win(el).getComputedStyle(el); };
+    // gridcell: date pickers' days, which take focus one at a time (tabindex -1 on the rest).
     G.ROLES = new Set(['button', 'link', 'checkbox', 'radio', 'tab', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'switch',
-      'textbox', 'combobox', 'searchbox', 'slider', 'spinbutton', 'listbox', 'treeitem']);
+      'textbox', 'combobox', 'searchbox', 'slider', 'spinbutton', 'listbox', 'treeitem', 'gridcell']);
     G.FIELD_TYPES = new Set(['text', 'search', 'email', 'url', 'tel', 'number', 'password', 'date', 'datetime-local', 'month', 'time', 'week']);
     G.isField = function (el) { return el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && G.FIELD_TYPES.has(el.type)); };
     G.editable = function (el) { return G.isField(el) || el.isContentEditable === true; };
     G.isToggle = function (el) { return !!el && el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio'); };
     G.explicitRole = function (el) { return G.clean(el.getAttribute('role')).split(' ')[0].toLowerCase(); };
-    G.walk = function (root, ox, oy, depth, visit, stats) {
+    G.walk = function (root, ox, oy, depth, visit, stats, clip) {
       const all = root.querySelectorAll('*');
       for (let i = 0; i < all.length; i++) {
         const el = all[i];
-        if (visit(el, ox, oy) === false) return false;
-        if (el.shadowRoot && G.walk(el.shadowRoot, ox, oy, depth, visit, stats) === false) return false;
+        if (visit(el, ox, oy, clip || null) === false) return false;
+        if (el.shadowRoot && G.walk(el.shadowRoot, ox, oy, depth, visit, stats, clip) === false) return false;
         if ((el.tagName === 'IFRAME' || el.tagName === 'FRAME') && depth < 5) {
           let doc = null;
           try { doc = el.contentDocument; } catch (e) { doc = null; }
           const r = el.getBoundingClientRect();
           if (doc && doc.documentElement) {
-            if (G.walk(doc, ox + r.left + el.clientLeft, oy + r.top + el.clientTop, depth + 1, visit, stats) === false) return false;
+            // Visit the frame's contents with its offset and the part of the page it shows.
+            const fx = ox + r.left + el.clientLeft, fy = oy + r.top + el.clientTop;
+            let fc = { l: fx, t: fy, r: fx + el.clientWidth, b: fy + el.clientHeight };
+            if (clip) fc = G.meet(fc, clip);
+            if (G.walk(doc, fx, fy, depth + 1, visit, stats, fc) === false) return false;
           } else if (stats && r.width > 20 && r.height > 20) {
             stats.skippedFrames += 1;
           }
         }
       }
       return true;
+    };
+    G.meet = function (a, b) { return { l: Math.max(a.l, b.l), t: Math.max(a.t, b.t), r: Math.min(a.r, b.r), b: Math.min(a.b, b.b) }; };
+    G.up = function (n) {
+      if (n.parentElement) return n.parentElement;
+      const p = n.parentNode;
+      return p && p.nodeType === 11 && p.host ? p.host : null;
+    };
+    G.upDeep = function (n) {
+      const p = G.up(n);
+      if (p) return p;
+      const doc = n.ownerDocument;
+      if (doc && doc !== document && n === doc.documentElement) {
+        try { return doc.defaultView.frameElement; } catch (e) { return null; }
+      }
+      return null;
+    };
+    G.inside = function (root, el) {
+      if (!root || !el) return false;
+      if (root === el || root.contains(el)) return true;
+      return (el.ownerDocument !== root.ownerDocument || el.getRootNode() !== el.ownerDocument) && G.containsDeep(root, el);
     };
     G.find = function (ref) {
       const matches = [];
@@ -1299,12 +1711,16 @@ extension BrowserDriver {
       if (el.isContentEditable === true) return 'textbox';
       return 'clickable';
     };
+    G.dialogName = function (dlg) {
+      let n = G.clean(dlg.getAttribute('aria-label')) || G.labelledBy(dlg);
+      if (!n) { const h = dlg.querySelector('h1,h2,h3,[role="heading"]'); if (h) n = G.text(h); }
+      return n.slice(0, 60);
+    };
     G.context = function (el) {
       const dlg = el.closest('dialog,[role="dialog"],[role="alertdialog"]');
       if (dlg) {
-        let n = G.clean(dlg.getAttribute('aria-label')) || G.labelledBy(dlg);
-        if (!n) { const h = dlg.querySelector('h1,h2,h3,[role="heading"]'); if (h) n = G.text(h); }
-        return 'dialog' + (n ? ' ' + n.slice(0, 60) : '');
+        const n = G.dialogName(dlg);
+        return 'dialog' + (n ? ' ' + n : '');
       }
       const form = el.form || el.closest('form');
       if (!form) return '';
@@ -1400,6 +1816,276 @@ extension BrowserDriver {
       }
       return root;
     };
+    G.isDialog = function (el) {
+      if (!el || el.nodeType !== 1) return false;
+      if (el.tagName === 'DIALOG') return el.open === true;
+      const r = G.explicitRole(el);
+      return r === 'dialog' || r === 'alertdialog' || el.getAttribute('aria-modal') === 'true';
+    };
+    G.closestDialog = function (el) {
+      for (let n = el, i = 0; n && i < 400; n = G.upDeep(n), i++) { if (G.isDialog(n)) return n; }
+      return null;
+    };
+    // The dialog or popup in front of the page: a dialog under the viewport center, else a
+    // modal one anywhere on screen (big enough not to be a cookie strip), else a fixed overlay
+    // with a z-index that covers the center (a drawer or lightbox that doesn't say it's a dialog).
+    G.modal = function () {
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const hit = G.hit(vw / 2, vh / 2);
+      for (let n = hit, i = 0; n && i < 400; n = G.upDeep(n), i++) {
+        if (G.isDialog(n) && G.visible(n)) return { el: n, kind: 'dialog' };
+      }
+      const list = document.querySelectorAll('dialog[open],[aria-modal="true"]');
+      for (let i = list.length - 1; i >= 0; i--) {
+        const d = list[i];
+        if (!G.visible(d) || d.closest('[aria-hidden="true"],[inert]')) continue;
+        const r = d.getBoundingClientRect();
+        if (r.right <= 0 || r.bottom <= 0 || r.left >= vw || r.top >= vh) continue;
+        let modal = false;
+        try { modal = d.matches(':modal'); } catch (e) { modal = false; }
+        if (modal || (d.getAttribute('aria-modal') === 'true' && r.width * r.height >= vw * vh * 0.2)) return { el: d, kind: 'dialog' };
+      }
+      for (let n = hit, i = 0; n && i < 400; n = G.up(n), i++) {
+        const doc = n.ownerDocument;
+        if (n === doc.body || n === doc.documentElement) break;
+        const s = G.style(n);
+        if (s.position === 'fixed') {
+          const r = n.getBoundingClientRect(), z = parseInt(s.zIndex, 10);
+          if (z > 0 && r.width * r.height >= vw * vh * 0.15) return { el: n, kind: 'popup' };
+          break;
+        }
+      }
+      return null;
+    };
+    G.modalTitle = function (m) {
+      const n = G.dialogName(m.el);
+      return n ? 'the “' + n + '” ' + m.kind : 'the ' + m.kind;
+    };
+    G.canScroll = function (el, vertical) {
+      if (vertical ? el.scrollHeight <= el.clientHeight + 1 : el.scrollWidth <= el.clientWidth + 1) return false;
+      const s = G.style(el);
+      return /(auto|scroll|overlay)/.test(vertical ? s.overflowY : s.overflowX);
+    };
+    // Scrollable regions of a dialog, best first: the one under `hit`, the dialog itself, its largest.
+    G.scrollersIn = function (root, vertical, hit) {
+      const out = [];
+      if (hit && G.inside(root, hit)) {
+        for (let n = hit, i = 0; n && n !== root && i < 300; n = G.up(n), i++) {
+          if (n.nodeType === 1 && G.canScroll(n, vertical)) { out.push(n); break; }
+        }
+      }
+      if (G.canScroll(root, vertical) && out.indexOf(root) < 0) out.push(root);
+      let best = null, area = 0;
+      const all = root.querySelectorAll('*');
+      for (let i = 0; i < all.length && i < 5000; i++) {
+        const el = all[i];
+        if (el.clientHeight < 20 || el.clientWidth < 20 || !G.canScroll(el, vertical)) continue;
+        const size = el.clientWidth * el.clientHeight;
+        if (size > area) { area = size; best = el; }
+      }
+      if (best && out.indexOf(best) < 0) out.push(best);
+      return out;
+    };
+    // clip(el): the box (in el's frame) its scrollable ancestors let it show in, or null. Each
+    // ancestor is measured once per call of G.clipper, so a whole snapshot stays linear.
+    G.clipper = function () {
+      const memo = new Map();
+      const eff = function (el) {
+        if (!el || el.nodeType !== 1) return null;
+        if (memo.has(el)) return memo.get(el);
+        const doc = el.ownerDocument, s = G.style(el);
+        let c = s.position === 'fixed' ? null : eff(G.up(el));
+        if (el !== doc.documentElement && el !== doc.body && (s.overflowX !== 'visible' || s.overflowY !== 'visible') &&
+            (el.scrollHeight > el.clientHeight + 1 || el.scrollWidth > el.clientWidth + 1)) {
+          const r = el.getBoundingClientRect(), l = r.left + el.clientLeft, t = r.top + el.clientTop;
+          const box = { l: l, t: t, r: l + el.clientWidth, b: t + el.clientHeight };
+          c = c ? G.meet(c, box) : box;
+        }
+        memo.set(el, c);
+        return c;
+      };
+      return function (el) { return G.style(el).position === 'fixed' ? null : eff(G.up(el)); };
+    };
+    // The part of the top viewport the frames around el show, or null outside frames.
+    G.frameBox = function (el) {
+      let box = null, win = G.win(el);
+      for (let i = 0; win && win !== window && i < 10; i++) {
+        let fe = null;
+        try { fe = win.frameElement; } catch (e) { fe = null; }
+        if (!fe) break;
+        const r = fe.getBoundingClientRect(), o = G.frameOffset(fe);
+        const l = o.x + r.left + fe.clientLeft, t = o.y + r.top + fe.clientTop;
+        const b = { l: l, t: t, r: l + fe.clientWidth, b: t + fe.clientHeight };
+        box = box ? G.meet(box, b) : b;
+        win = G.win(fe);
+      }
+      return box;
+    };
+    // Where el is relative to what's visible: dir 'in', 'below', 'above', 'right' or 'left';
+    // inner when a scrolled panel or frame cuts it off rather than the window's edge; dist how
+    // far (in CSS pixels) it is from coming into view.
+    G.placement = function (el, clipOf) {
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const r = G.rect(el), o = G.frameOffset(el);
+      const x = r.left + o.x, y = r.top + o.y, w = r.width, h = r.height;
+      let inner = G.frameBox(el);
+      const c = clipOf(el);
+      if (c) {
+        const cb = { l: c.l + o.x, t: c.t + o.y, r: c.r + o.x, b: c.b + o.y };
+        inner = inner ? G.meet(inner, cb) : cb;
+      }
+      const box = inner ? G.meet({ l: 0, t: 0, r: vw, b: vh }, inner) : { l: 0, t: 0, r: vw, b: vh };
+      if (x < box.r && y < box.b && x + w > box.l && y + h > box.t) return { dir: 'in', inner: false, screens: 0, dist: 0 };
+      const dir = y >= box.b - 1 ? 'below' : y + h <= box.t + 1 ? 'above' : x >= box.r - 1 ? 'right' : 'left';
+      const dist = dir === 'below' ? y - box.b : dir === 'above' ? box.t - (y + h) : dir === 'right' ? x - box.r : box.l - (x + w);
+      const inWindow = x < vw && y < vh && x + w > 0 && y + h > 0;
+      const cutByPanel = !!inner && (inWindow || (dir === 'below' ? y >= inner.b - 1 : dir === 'above' ? y + h <= inner.t + 1 :
+        dir === 'right' ? x >= inner.r - 1 : x + w <= inner.l + 1));
+      const screens = dir === 'below' ? Math.round((y - vh) / vh) + 1 : dir === 'above' ? Math.round(-(y + h) / vh) + 1 : 0;
+      return { dir: dir, inner: cutByPanel, screens: screens, dist: Math.max(0, dist) };
+    };
+    // Scrolls el to the middle of every scrollable box around it, then makes sure the frames
+    // it sits in are on screen too.
+    G.reveal = function (el) {
+      try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) {}
+      let win = G.win(el);
+      for (let i = 0; win && win !== window && i < 10; i++) {
+        let fe = null;
+        try { fe = win.frameElement; } catch (e) { fe = null; }
+        if (!fe) break;
+        const r = G.rect(el), o = G.frameOffset(el);
+        const x = o.x + r.left + r.width / 2, y = o.y + r.top + r.height / 2;
+        if (x >= 0 && y >= 0 && x < window.innerWidth && y < window.innerHeight) break;
+        try { fe.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) {}
+        win = G.win(fe);
+      }
+    };
+    G.fold = function (s) {
+      return G.clean(s).toLowerCase().replace(/[‘’ʼ′]/g, "'").replace(/[“”″]/g, '"');
+    };
+    // How well hay contains needle (already folded): 0 exactly, 1 as its first words, 2 as
+    // whole words elsewhere, 3 inside a word, -1 not at all.
+    G.quality = function (hay, needle) {
+      if (hay == null) return -1;
+      const h = G.fold(hay);
+      if (!h) return -1;
+      if (h === needle) return 0;
+      const i = h.indexOf(needle);
+      if (i < 0) return -1;
+      const W = /[\p{L}\p{N}]/u;
+      const start = i === 0 || !W.test(h.charAt(i - 1));
+      const end = i + needle.length >= h.length || !W.test(h.charAt(i + needle.length));
+      if (start && end) return i === 0 ? 1 : 2;
+      return 3;
+    };
+    G.fieldValue = function (el) {
+      const tag = el.tagName;
+      if (tag === 'INPUT') {
+        if (el.type === 'password' || el.type === 'hidden' || G.isToggle(el) || ['button', 'submit', 'reset', 'image', 'file'].indexOf(el.type) >= 0) return '';
+        return el.value || '';
+      }
+      if (tag === 'TEXTAREA') return el.value || '';
+      if (tag === 'SELECT') return Array.from(el.selectedOptions).map(function (op) { return G.clean(op.label || op.text); }).join(', ');
+      return '';
+    };
+    // What acting on a piece of text means: the control it belongs to (a label's input), else
+    // the element that shows a pointer over it, else the text's own element.
+    G.target = function (el) {
+      for (let n = el, i = 0; n && i < 8; n = G.up(n), i++) {
+        const doc = n.ownerDocument;
+        if (n === doc.body || n === doc.documentElement) break;
+        if (n.tagName === 'LABEL' && n.control) return { el: G.candidate(n) ? n : n.control, kind: 'control' };
+        if (G.candidate(n)) return { el: n, kind: 'control' };
+      }
+      for (let n = el, i = 0; n && i < 4; n = G.up(n), i++) {
+        const doc = n.ownerDocument;
+        if (n === doc.body || n === doc.documentElement) break;
+        if (G.style(n).cursor === 'pointer') {
+          let root = n;
+          for (let j = 0; j < 6; j++) {
+            const p = G.up(root);
+            if (!p || p === p.ownerDocument.body || G.style(p).cursor !== 'pointer') break;
+            root = p;
+          }
+          return { el: root, kind: 'clickable' };
+        }
+      }
+      return { el: el, kind: 'text' };
+    };
+    // Edit distance of at most 2 (short words only).
+    G.near = function (s, t) {
+      if (s.length > 24 || t.length > 24 || Math.abs(s.length - t.length) > 2) return false;
+      let prev = [];
+      for (let j = 0; j <= t.length; j++) prev[j] = j;
+      for (let i = 1; i <= s.length; i++) {
+        const cur = [i];
+        let low = i;
+        for (let j = 1; j <= t.length; j++) {
+          cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (s[i - 1] === t[j - 1] ? 0 : 1));
+          if (cur[j] < low) low = cur[j];
+        }
+        if (low > 2) return false;
+        prev = cur;
+      }
+      return prev[t.length] <= 2;
+    };
+    // Control names that look like what was asked for: shared words, prefixes, small typos.
+    G.suggest = function (names, needle) {
+      const split = function (s) { return s.split(/[^\p{L}\p{N}]+/u).filter(Boolean); };
+      const words = split(needle).filter(function (w) { return w.length >= 3; });
+      if (!words.length) return [];
+      const seen = new Set(), scored = [];
+      for (let k = 0; k < names.length; k++) {
+        const name = G.clean(names[k]);
+        if (!name || name.length > 80) continue;
+        const key = G.fold(name);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const own = split(key);
+        let score = 0;
+        for (const w of words) {
+          let best = 0;
+          for (const nw of own) {
+            if (nw === w) { best = 3; break; }
+            if (nw.length >= 3 && (nw.indexOf(w) === 0 || w.indexOf(nw) === 0)) best = Math.max(best, 2);
+            else if (w.length >= 4 && G.near(nw, w)) best = Math.max(best, 2);
+          }
+          score += best;
+        }
+        if (score > 0) scored.push({ name: name, score: score });
+      }
+      scored.sort(function (p, q) { return (q.score - p.score) || (p.name.length - q.name.length); });
+      return scored.slice(0, 5).map(function (s) { return s.name; });
+    };
+    // CAPTCHA and bot-check pages: a challenge frame, or their wording on a short page.
+    G.captchaFrame = function (src) {
+      const s = String(src || '').toLowerCase();
+      if (/\/recaptcha\/(api2|enterprise)\/bframe/.test(s)) return { name: 'reCAPTCHA', strong: true };
+      if (/\/recaptcha\/(api2|enterprise)\/anchor/.test(s)) return s.indexOf('size=invisible') >= 0 ? null : { name: 'reCAPTCHA', strong: false };
+      if (s.indexOf('hcaptcha.com') >= 0) return s.indexOf('size=invisible') >= 0 ? null : { name: 'hCaptcha', strong: false };
+      if (s.indexOf('challenges.cloudflare.com') >= 0) return { name: 'Cloudflare', strong: false };
+      if (s.indexOf('captcha-delivery.com') >= 0) return { name: 'DataDome', strong: true };
+      if (s.indexOf('arkoselabs.com') >= 0 || s.indexOf('funcaptcha.com') >= 0) return { name: 'Arkose', strong: true };
+      return null;
+    };
+    G.BOT_PHRASES = ['verify you are human', "verify you're human", 'verify you are a human', 'verifying you are human',
+      'confirm you are human', "confirm you're human", "prove you're human", 'prove you are human', 'are you a robot', 'not a robot',
+      'press and hold', 'press & hold', 'unusual traffic from your computer', 'enter the characters you see',
+      'type the characters you see', 'checking if the site connection is secure', 'checking your browser before accessing',
+      'complete the security check', 'human verification', 'solve this puzzle'];
+    G.BOT_TITLES = ['just a moment', 'attention required', 'robot check', 'are you a robot', 'security check', 'pardon our interruption',
+      'human verification', 'verify you are human'];
+    // A checkbox CAPTCHA on a sign-in form counts only when the page is little else; the
+    // wording only on a short page with few controls (an article about robots isn't one).
+    G.botCheck = function (title, text, total, frame) {
+      if (frame && (frame.strong || total < 15)) return 'a ' + frame.name + ' challenge';
+      if (text.length >= 6000 || total >= 80) return '';
+      const t = G.fold(text.slice(0, 4000));
+      for (const p of G.BOT_PHRASES) { if (t.indexOf(p) >= 0) return 'the page says “' + p + '”'; }
+      const ti = G.fold(title);
+      for (const p of G.BOT_TITLES) { if (total < 40 && ti.indexOf(p) === 0) return 'its title is “' + G.clean(title).slice(0, 60) + '”'; }
+      return '';
+    };
     """#
 
     static let snapshotFunction = #"""
@@ -1409,28 +2095,87 @@ extension BrowserDriver {
       const stats = { skippedFrames: 0 };
       const cands = [], headings = [];
       const active = G.deepActive();
-      G.walk(document, 0, 0, 0, function (el, ox, oy) {
+      const pin = new Set(a.pin || []);
+      const modal = G.modal(), M = modal ? modal.el : null;
+      const clipOf = G.clipper();
+      const below = [], controlNames = new Set();
+      let group = '', belowCount = 0, aboveCount = 0, frame = null;
+      G.walk(document, 0, 0, 0, function (el, ox, oy, fclip) {
         const tag = el.tagName;
-        if (headings.length < 40 && (/^H[1-6]$/.test(tag) || G.explicitRole(el) === 'heading') && G.visible(el)) {
+        const heading = /^H[1-6]$/.test(tag) || G.explicitRole(el) === 'heading';
+        if ((heading || tag === 'LEGEND') && (headings.length < 40 || M) && G.visible(el)) {
           const t = G.text(el);
-          if (t) headings.push({ level: parseInt(tag.slice(1), 10) || parseInt(el.getAttribute('aria-level'), 10) || 2, text: t.slice(0, 150) });
+          if (t && heading && headings.length < 40) {
+            const level = parseInt(tag.slice(1), 10) || parseInt(el.getAttribute('aria-level'), 10) || 2;
+            headings.push({ level: Math.min(6, Math.max(1, level)), text: t.slice(0, 150) });
+          }
+          // The heading over a dialog's elements, to group the ones further down by it.
+          if (t && M && G.inside(M, el)) group = t.slice(0, 40);
         }
-        if (cands.length >= 4000 || !G.candidate(el)) return;
-        if (el.closest('[aria-hidden="true"],[inert]')) return;
-        if (!G.visible(el)) return;
-        if (G.isToggle(el) && G.drawnByLabel(el) && G.visibleLabel(el)) return;
+        if (tag === 'IFRAME' && !(frame && frame.strong)) {
+          const f = G.captchaFrame(el.src);
+          if (f) {
+            const r = el.getBoundingClientRect();
+            if (r.width >= 60 && r.height >= 40 && G.visible(el)) frame = f;
+          }
+        }
+        const own = el.getAttribute('data-glide-ref');
+        const pinned = !!own && pin.has(own);
+        // An element a snapshot lists anyway; pinned ones that aren't are added at the end.
+        const normal = cands.length < 4000 && G.candidate(el) && !el.closest('[aria-hidden="true"],[inert]') && G.visible(el) &&
+          !(G.isToggle(el) && G.drawnByLabel(el) && G.visibleLabel(el));
+        if (!normal && !pinned) return;
+        const shown = normal || G.visible(el);
         const r = G.rect(el);
         const x = r.left + ox, y = r.top + oy;
-        const inView = x < vw && y < vh && x + r.width > 0 && y + r.height > 0;
-        cands.push({ el: el, x: x, y: y, w: r.width, h: r.height, inView: inView, idx: cands.length });
+        // What's visible of the page: the viewport, cut down by the frames and scrolled panels
+        // (a dialog's list, a carousel) the element sits in.
+        let box = { l: 0, t: 0, r: vw, b: vh };
+        if (fclip) box = G.meet(box, fclip);
+        const c = clipOf(el);
+        if (c) box = G.meet(box, { l: c.l + ox, t: c.t + oy, r: c.r + ox, b: c.b + oy });
+        const inView = shown && x < box.r && y < box.b && x + r.width > box.l && y + r.height > box.t;
+        const dir = inView ? '' : y >= box.b - 1 ? 'below' : y + r.height <= box.t + 1 ? 'above' : x >= box.r - 1 ? 'right' : 'left';
+        const inModal = !!M && G.inside(M, el);
+        if (inModal && normal && controlNames.size < 2000) controlNames.add(G.fold(G.name(el)));
+        if (inModal && !inView && normal) {
+          if (dir === 'below') {
+            belowCount += 1;
+            if (below.length < 60) below.push({ name: G.name(el).slice(0, 60), group: group });
+          } else {
+            aboveCount += 1;
+          }
+        }
+        cands.push({ el: el, x: x, y: y, w: r.width, h: r.height, inView: inView, dir: dir, inModal: inModal, pinned: pinned, normal: normal,
+          idx: cands.length });
       }, stats);
       const distance = function (c) { return c.y + c.h <= 0 ? -(c.y + c.h) : Math.max(0, c.y - vh); };
-      let picked = cands.filter(function (c) { return c.inView; });
-      if (picked.length >= a.max) {
-        picked = picked.slice(0, a.max);
-      } else {
-        const outside = cands.filter(function (c) { return !c.inView; }).sort(function (p, q) { return distance(p) - distance(q); });
-        picked = picked.concat(outside.slice(0, a.max - picked.length));
+      const near = function (p, q) { return distance(p) - distance(q); };
+      const free = cands.filter(function (c) { return c.normal; });
+      // With a dialog open, its elements come before the page behind it.
+      const tiers = M ? [
+        free.filter(function (c) { return c.inModal && c.inView; }),
+        free.filter(function (c) { return c.inModal && !c.inView; }).sort(near),
+        free.filter(function (c) { return !c.inModal && c.inView; }),
+        free.filter(function (c) { return !c.inModal && !c.inView; }).sort(near),
+      ] : [free.filter(function (c) { return c.inView; }), free.filter(function (c) { return !c.inView; }).sort(near)];
+      let picked = [];
+      const limit = Math.max(1, a.max);
+      for (let t = 0; t < tiers.length && picked.length < limit; t++) {
+        picked = picked.concat(tiers[t].slice(0, limit - picked.length));
+      }
+      const kept = new Set(picked);
+      const cut = { below: 0, above: 0, right: 0, left: 0, on: 0 };
+      for (let i = 0; i < free.length; i++) {
+        const c = free[i];
+        if (kept.has(c) || c.pinned || (c.inModal && c.dir === 'below')) continue;
+        if (c.inView) cut.on += 1; else cut[c.dir] += 1;
+      }
+      // What find asked for, beyond what the snapshot would list anyway (marked, so the
+      // fingerprint and change summaries ignore it).
+      for (let i = 0; i < cands.length; i++) {
+        const c = cands[i];
+        if (c.pinned && !kept.has(c)) { c.extra = true; picked.push(c); }
       }
       picked.sort(function (p, q) { return p.idx - q.idx; });
       const used = new Set();
@@ -1438,7 +2183,7 @@ extension BrowserDriver {
       for (let i = 0; i < picked.length; i++) {
         const c = picked[i], el = c.el, tag = el.tagName;
         let ref = el.getAttribute('data-glide-ref');
-        if (ref && /^b\d+$/.test(ref) && !used.has(ref)) {
+        if (ref && /^b\d{1,10}$/.test(ref) && !used.has(ref)) {
           const n = parseInt(ref.slice(1), 10);
           if (n > seq) seq = n;
         } else {
@@ -1448,7 +2193,11 @@ extension BrowserDriver {
         }
         used.add(ref);
         const ctl = tag === 'LABEL' && el.control ? el.control : el;
-        const o = { ref: ref, role: G.role(el), name: G.name(el), x: Math.round(c.x), y: Math.round(c.y), w: Math.round(c.w), h: Math.round(c.h), inView: c.inView };
+        const role = G.candidate(el) ? G.role(el) : (G.style(el).cursor === 'pointer' ? 'clickable' : 'text');
+        const o = { ref: ref, role: role, name: G.name(el), x: Math.round(c.x), y: Math.round(c.y), w: Math.round(c.w), h: Math.round(c.h), inView: c.inView };
+        if (c.dir) o.dir = c.dir;
+        if (c.inModal) o.inModal = true;
+        if (c.extra) o.pinned = true;
         if (tag === 'INPUT' && el.type !== 'text') o.type = el.type;
         if (tag === 'INPUT' && el.type === 'password') {
           o.secure = true;
@@ -1492,11 +2241,19 @@ extension BrowserDriver {
       let text = root ? G.norm(root.innerText) : '';
       if ((!root || text.length < 200) && document.body) { text = G.norm(document.body.innerText); source = 'body'; }
       const total = text.length;
+      const bot = G.botCheck(document.title || '', text, free.length, frame);
       if (text.length > a.maxText) text = text.slice(0, a.maxText);
+      let info = null;
+      if (M) {
+        const sc = G.scrollersIn(M, true, null)[0] || null;
+        info = { name: G.dialogName(M), kind: modal.kind, st: sc ? sc.scrollTop : 0, sl: sc ? sc.scrollLeft : 0,
+          sh: sc ? sc.scrollHeight : 0, ch: sc ? sc.clientHeight : 0, below: below, belowCount: belowCount, aboveCount: aboveCount,
+          text: G.norm(M.innerText || '').split('\n').filter(function (l) { return l && !controlNames.has(G.fold(l)); }).join('\n').slice(0, 1500) };
+      }
       const se = document.scrollingElement || document.documentElement;
       return { url: location.href, title: document.title || '', seq: seq, vw: vw, vh: vh, sx: window.scrollX, sy: window.scrollY,
-        pw: se ? se.scrollWidth : vw, ph: se ? se.scrollHeight : vh, total: cands.length, skippedFrames: stats.skippedFrames,
-        elements: elements, headings: headings, text: text, textTotal: total, textSource: source };
+        pw: se ? se.scrollWidth : vw, ph: se ? se.scrollHeight : vh, total: free.length, skippedFrames: stats.skippedFrames,
+        elements: elements, headings: headings, text: text, textTotal: total, textSource: source, modal: info, cut: cut, bot: bot };
     }
     """#
 
@@ -1514,7 +2271,7 @@ extension BrowserDriver {
       try { disabled = el.matches(':disabled'); } catch (e) { disabled = false; }
       disabled = disabled || el.getAttribute('aria-disabled') === 'true';
       G.armNav();
-      el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      G.reveal(el);
       const r = G.rect(el), o = G.frameOffset(el);
       const x = o.x + r.left + r.width / 2, y = o.y + r.top + r.height / 2;
       const onScreen = r.width > 0 && r.height > 0 && x >= 0 && y >= 0 && x < window.innerWidth && y < window.innerHeight;
@@ -1540,7 +2297,7 @@ extension BrowserDriver {
       try { disabled = el.matches(':disabled'); } catch (e) { disabled = false; }
       if (disabled || el.readOnly) return { error: 'readonly' };
       G.armNav();
-      el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+      G.reveal(el);
       try { el.focus({ preventScroll: true }); } catch (e) {}
       const active = G.deepActive();
       const focused = active === el || G.containsDeep(el, active);
@@ -1633,20 +2390,12 @@ extension BrowserDriver {
     function (a) {
       const vertical = a.dir === 'up' || a.dir === 'down';
       const sign = (a.dir === 'up' || a.dir === 'left') ? -1 : 1;
-      let target = null;
-      if (a.ref) {
-        const f = G.find(a.ref);
-        if (!f) return { error: 'notfound' };
-        if (f.ambiguous) return { error: 'ambiguous' };
-        target = f.el;
-      } else {
-        target = G.hit(window.innerWidth / 2, window.innerHeight / 2);
-      }
       const pos = function (el) { return vertical ? el.scrollTop : el.scrollLeft; };
-      const scrollable = function (el) {
-        const s = G.style(el);
-        if (!/(auto|scroll|overlay)/.test(vertical ? s.overflowY : s.overflowX)) return false;
-        return vertical ? el.scrollHeight > el.clientHeight + 1 : el.scrollWidth > el.clientWidth + 1;
+      const step = function (el) {
+        const before = pos(el);
+        const d = sign * a.amount * (vertical ? el.clientHeight : el.clientWidth) * 0.85;
+        el.scrollBy({ left: vertical ? 0 : d, top: vertical ? d : 0, behavior: 'instant' });
+        return Math.abs(pos(el) - before) >= 1;
       };
       const scrollWindow = function (w) {
         const before = vertical ? w.scrollY : w.scrollX;
@@ -1654,29 +2403,236 @@ extension BrowserDriver {
         w.scrollBy({ left: vertical ? 0 : d, top: vertical ? d : 0, behavior: 'instant' });
         return Math.abs((vertical ? w.scrollY : w.scrollX) - before) >= 1;
       };
-      let node = target;
-      for (let i = 0; node && i < 500; i++) {
-        if (node.nodeType === 1) {
-          const doc = node.ownerDocument;
-          if (node === doc.body || node === doc.documentElement) {
-            const w = doc.defaultView;
-            if (w !== window && scrollWindow(w)) return { moved: true, scope: 'an embedded frame' };
-            if (w === window) break;
-            let fe = null;
-            try { fe = w.frameElement; } catch (e) { fe = null; }
-            node = fe;
-            continue;
+      // From `start` up to the top document: the first panel (or frame) that moves, or null.
+      const climb = function (start) {
+        let node = start;
+        for (let i = 0; node && i < 500; i++) {
+          if (node.nodeType === 1) {
+            const doc = node.ownerDocument;
+            if (node === doc.body || node === doc.documentElement) {
+              const w = doc.defaultView;
+              if (w === window) return null;
+              if (scrollWindow(w)) return { moved: true, scope: 'an embedded frame' };
+              let fe = null;
+              try { fe = w.frameElement; } catch (e) { fe = null; }
+              node = fe;
+              continue;
+            }
+            if (G.canScroll(node, vertical) && step(node)) return { moved: true, scope: 'the ' + G.short(node) + ' panel' };
           }
-          if (scrollable(node)) {
-            const before = pos(node);
-            const d = sign * a.amount * (vertical ? node.clientHeight : node.clientWidth) * 0.85;
-            node.scrollBy({ left: vertical ? 0 : d, top: vertical ? d : 0, behavior: 'instant' });
-            if (Math.abs(pos(node) - before) >= 1) return { moved: true, scope: 'the ' + G.short(node) + ' panel' };
+          node = node.parentNode || node.host || null;
+        }
+        return null;
+      };
+      if (a.ref) {
+        const f = G.find(a.ref);
+        if (!f) return { error: 'notfound' };
+        if (f.ambiguous) return { error: 'ambiguous' };
+        return climb(f.el) || { moved: scrollWindow(window), scope: 'the page' };
+      }
+      const center = G.hit(window.innerWidth / 2, window.innerHeight / 2);
+      // An open dialog first: the page behind it is usually locked, and what's wanted is in it.
+      const m = G.modal();
+      if (m) {
+        const what = G.modalTitle(m);
+        const regions = G.scrollersIn(m.el, vertical, center);
+        for (let i = 0; i < regions.length; i++) { if (step(regions[i])) return { moved: true, scope: what }; }
+        if (regions.length) return { moved: false, scope: what };
+        // Nothing in it scrolls by overflow: it may scroll by script, so ask for a real wheel.
+        const r = m.el.getBoundingClientRect(), o = G.frameOffset(m.el);
+        const x = Math.min(window.innerWidth - 2, Math.max(1, o.x + r.left + r.width / 2));
+        const y = Math.min(window.innerHeight - 2, Math.max(1, o.y + r.top + r.height / 2));
+        return { moved: false, stuck: true, scope: what, wheel: { x: x, y: y, span: vertical ? r.height : r.width } };
+      }
+      // Then the panel the focused element is in, then the one under the viewport center.
+      const f = G.deepActive();
+      if (f && f.nodeType === 1 && f !== f.ownerDocument.body && f !== f.ownerDocument.documentElement) {
+        const got = climb(f);
+        if (got) return got;
+      }
+      return climb(center) || { moved: scrollWindow(window), scope: 'the page' };
+    }
+    """#
+
+    /// What a dialog's content looks like right now (scroll offsets and where its first
+    /// controls are), to tell whether a wheel moved it.
+    static let modalSignatureFunction = #"""
+    function () {
+      const m = G.modal();
+      if (!m) return '';
+      let sum = 0;
+      const parts = [];
+      const all = m.el.querySelectorAll('*');
+      for (let i = 0; i < all.length && i < 3000; i++) {
+        const n = all[i];
+        sum += n.scrollTop + n.scrollLeft;
+        if (parts.length < 12 && G.candidate(n)) {
+          const r = n.getBoundingClientRect();
+          parts.push(Math.round(r.top) + ',' + Math.round(r.left));
+        }
+      }
+      return Math.round(sum) + '|' + parts.join(';');
+    }
+    """#
+
+    /// Finds elements by text across the page, scrolls the chosen one into view and gives it
+    /// and the runners-up refs (see `BrowserDriver.find`).
+    static let findFunction = #"""
+    function (a) {
+      let seq = Math.max(a.seq | 0, window.__glideSeq | 0);
+      const needle = G.fold(a.text);
+      if (!needle) return { found: false, total: 0, url: location.href, roles: [], suggestions: [] };
+      const want = G.fold(a.role || '');
+      const KIN = { textbox: ['searchbox', 'combobox'], checkbox: ['switch', 'menuitemcheckbox'], radio: ['menuitemradio'],
+        menuitem: ['menuitemcheckbox', 'menuitemradio'] };
+      const fits = function (role) { return !want || role === want || (KIN[want] || []).indexOf(role) >= 0; };
+      const modal = G.modal(), M = modal ? modal.el : null;
+      const clipOf = G.clipper();
+      const found = new Map(), refs = new Map(), names = [];
+      const SKIP = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, TEMPLATE: 1, HEAD: 1, TITLE: 1, META: 1, LINK: 1 };
+      const consider = function (el, kind, q, len) {
+        if (!el || q < 0) return;
+        const m = found.get(el);
+        if (!m) { found.set(el, { el: el, kind: kind, q: q, len: len, idx: found.size }); return; }
+        if (q < m.q || (q === m.q && len < m.len)) { m.q = q; m.len = len; }
+      };
+      const best = function (list) {
+        let q = -1, len = 0;
+        for (let i = 0; i < list.length; i++) {
+          if (!list[i]) continue;
+          const v = G.quality(list[i], needle), l = G.clean(list[i]).length;
+          if (v >= 0 && (q < 0 || v < q || (v === q && l < len))) { q = v; len = l; }
+        }
+        return { q: q, len: len };
+      };
+      G.walk(document, 0, 0, 0, function (el) {
+        if (SKIP[el.tagName]) return;
+        const own = el.getAttribute('data-glide-ref');
+        if (own) refs.set(own, (refs.get(own) || 0) + 1);
+        if (found.size >= 2000) return;
+        if (G.candidate(el)) {
+          // Everything a control goes by; never a password's value.
+          const name = G.name(el);
+          if (name && names.length < 3000) names.push(name);
+          const hay = [name, el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('title'), G.fieldValue(el)];
+          if (el.hasAttribute('aria-label') || el.hasAttribute('aria-labelledby')) hay.push(G.text(el));
+          const b = best(hay);
+          consider(el, 'control', b.q, b.len);
+          return;
+        }
+        // Text straight in the body or root isn't something to point at.
+        if (el === el.ownerDocument.body || el === el.ownerDocument.documentElement) return;
+        let hit = best([el.getAttribute('aria-label'), el.getAttribute('title'), el.getAttribute('alt'), el.getAttribute('placeholder')]).q >= 0;
+        for (let n = el.firstChild; n && !hit; n = n.nextSibling) {
+          if (n.nodeType === 3 && n.data.length < 5000 && G.fold(n.data).indexOf(needle) >= 0) hit = true;
+        }
+        if (!hit) return;
+        const t = G.target(el);
+        // Judge by the visible text of short elements only (innerText of a big container is slow).
+        const short = function (n) { return (n.textContent || '').length <= 600 ? G.text(n) : ''; };
+        const shown = t.el === el ? '' : short(t.el), mine = short(el);
+        let b = best([shown.length <= 300 ? shown : '', mine.length <= 300 ? mine : '', el.getAttribute('aria-label'),
+          el.getAttribute('title'), el.getAttribute('alt'), el.getAttribute('placeholder')]);
+        // Hidden text, or text too long to judge: a plain substring match.
+        if (b.q < 0) b = { q: 3, len: mine.length || 1000 };
+        consider(t.el, t.kind, b.q, b.len);
+      }, null);
+      let list = Array.from(found.values());
+      // Text that only labels a control already found (a button's caption beside it) isn't another match.
+      const controls = list.filter(function (m) { return m.kind === 'control'; }).slice(0, 300);
+      list = list.filter(function (m) {
+        if (m.kind === 'control') return true;
+        const p = G.up(m.el);
+        if (!p) return true;
+        for (let i = 0; i < controls.length; i++) {
+          if (controls[i].el !== m.el && p.contains(controls[i].el)) {
+            return (p.textContent || '').length > 400 || G.text(p).length > 200;
           }
         }
-        node = node.parentNode || node.host || null;
+        return true;
+      });
+      for (let i = 0; i < list.length; i++) {
+        const m = list[i], el = m.el;
+        m.visible = G.visible(el);
+        m.inModal = !!M && G.inside(M, el);
+        m.covered = (!!M && !m.inModal) || !!el.closest('[aria-hidden="true"],[inert]');
+        m.role = m.kind === 'control' ? G.role(el) : m.kind;
+        let off = false;
+        try { off = el.matches(':disabled'); } catch (e) { off = false; }
+        m.disabled = off || el.getAttribute('aria-disabled') === 'true';
+        // Controls you can use first, then things that look clickable, then plain text; behind
+        // an open dialog after those, hidden last.
+        m.tier = !m.visible ? 4 : m.covered ? 3 : m.kind === 'control' ? 0 : m.kind === 'clickable' ? 1 : 2;
+        m.place = m.visible ? G.placement(el, clipOf) : { dir: 'hidden', inner: false, screens: 0, dist: 0 };
       }
-      return { moved: scrollWindow(window), scope: 'page' };
+      // Among equally good matches, the one nearest to view wins: what's on screen, then what a
+      // short scroll reaches (a product's own buy box before the "also bought" row far below).
+      const ranked = list.filter(function (m) { return fits(m.role); }).sort(function (p, q) {
+        return (p.tier - q.tier) || ((p.disabled ? 1 : 0) - (q.disabled ? 1 : 0)) || (p.q - q.q) ||
+          (p.place.dist - q.place.dist) || (p.len - q.len) || (p.idx - q.idx);
+      });
+      if (!ranked.length) {
+        const roles = [];
+        if (want) {
+          list.slice().sort(function (p, q) { return (p.tier - q.tier) || (p.idx - q.idx); })
+            .forEach(function (m) { if (roles.indexOf(m.role) < 0 && roles.length < 5) roles.push(m.role); });
+        }
+        return { found: false, total: 0, url: location.href, roles: roles, suggestions: list.length ? [] : G.suggest(names, needle) };
+      }
+      const nth = Math.max(1, a.nth | 0);
+      if (nth > ranked.length) return { found: false, total: ranked.length, url: location.href, roles: [], suggestions: [] };
+      const refOf = function (el) {
+        let ref = el.getAttribute('data-glide-ref');
+        if (ref && /^b\d{1,10}$/.test(ref) && (refs.get(ref) || 0) <= 1) {
+          const n = parseInt(ref.slice(1), 10);
+          if (n > seq) seq = n;
+          return ref;
+        }
+        seq += 1;
+        ref = 'b' + seq;
+        el.setAttribute('data-glide-ref', ref);
+        return ref;
+      };
+      const where = function (m) {
+        const el = m.el, parts = [];
+        if (el.ownerDocument !== document) {
+          let fe = null;
+          try { fe = el.ownerDocument.defaultView.frameElement; } catch (e) { fe = null; }
+          let label = fe ? (G.clean(fe.getAttribute('title')) || G.clean(fe.getAttribute('aria-label')) || G.clean(fe.getAttribute('name'))) : '';
+          if (!label) { try { label = G.clean(el.ownerDocument.title) || el.ownerDocument.location.pathname; } catch (e) { label = ''; } }
+          parts.push(label ? 'in frame “' + label.slice(0, 40) + '”' : 'in a frame');
+        }
+        const dlg = G.closestDialog(el);
+        if (dlg) { const n = G.dialogName(dlg); parts.push(n ? 'in dialog “' + n + '”' : 'in a dialog'); }
+        else if (M && !m.inModal) parts.push('behind the open ' + modal.kind);
+        if (!m.visible) { parts.push('hidden'); return parts.join(', '); }
+        const p = m.place;
+        let s;
+        if (p.dir === 'in') s = 'on screen';
+        else if (p.dir === 'below') s = p.inner ? 'further down' : 'further down the page';
+        else if (p.dir === 'above') s = p.inner ? 'further up' : 'further up the page';
+        else s = 'off-screen to the ' + p.dir;
+        if (p.inner && !dlg && el.ownerDocument === document && (p.dir === 'below' || p.dir === 'above')) s += ' in a scrolled panel';
+        if (!p.inner && p.screens >= 2) s = 'about ' + p.screens + ' screens ' + s;
+        parts.push(s);
+        return parts.join(', ');
+      };
+      const describe = function (m, rank) {
+        const raw = m.el.textContent || '';
+        let name = m.kind === 'control' ? G.name(m.el) : raw.length <= 2000 ? G.text(m.el) : G.clean(raw);
+        if (!name) name = G.clean(m.el.getAttribute('aria-label') || m.el.getAttribute('alt') || m.el.getAttribute('title') || '');
+        return { ref: refOf(m.el), role: m.role, name: name.slice(0, 120), where: where(m), nth: rank };
+      };
+      const chosen = ranked[nth - 1];
+      const match = describe(chosen, nth);
+      const others = [];
+      for (let i = 0; i < ranked.length && others.length < 8; i++) {
+        if (i !== nth - 1) others.push(describe(ranked[i], i + 1));
+      }
+      const scrolled = chosen.visible && chosen.place.dir !== 'in';
+      if (scrolled) G.reveal(chosen.el);
+      window.__glideSeq = seq;
+      return { found: true, url: location.href, seq: seq, total: ranked.length, match: match, scrolled: scrolled, others: others };
     }
     """#
 
