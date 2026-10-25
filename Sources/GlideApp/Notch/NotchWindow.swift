@@ -223,6 +223,38 @@ final class NotchModel {
         self.voice.onUtterance = { [weak self] text, source in self?.utterance(text, source: source) }
         self.voice.onTypingRequested = { [weak self] prefill in self?.showTyping(prefill) }
         self.voice.onChange = { [weak self] in self?.recompute() }
+        self.voice.isTaskRunning = { [weak controller] in controller?.isRunning ?? false }
+        self.voice.hasQuestion = { [weak self] in self?.shownQuestion != nil }
+        self.voice.onConversationTurn = { [weak self] in self?.conversationTurn() }
+        self.voice.onConversationEnded = { [weak self] reason in self?.conversationEnded(reason) }
+    }
+
+    /// The user said something in a realtime conversation: the model handles it (through
+    /// Glide's tools), so the text field and old cards make way.
+    private func conversationTurn() {
+        inputOpen = false
+        typingRequested = false
+        resultVisible = false
+        detailOpen = false
+        historyOpen = false
+        inputText = ""
+        recompute()
+    }
+
+    /// The realtime conversation closed. Closed by the user or for silence, the notch folds
+    /// away unless it still has something to show (a running task, a question, a result).
+    private func conversationEnded(_ reason: RealtimeConversation.EndReason) {
+        switch reason {
+        case .user, .idle:
+            if !controller.isRunning && shownQuestion == nil && !typingRequested {
+                inputOpen = false
+                detailOpen = false
+                historyOpen = false
+            }
+        case .failed:
+            break
+        }
+        recompute()
     }
 
     /// The question the notch shows: the controller's pending one (or, a moment before it is
@@ -247,6 +279,9 @@ final class NotchModel {
         recomputing = true
         defer { recomputing = false }
         let c = controller
+        // The realtime conversation follows the task and the question (listening, question
+        // card, or caption over the running task).
+        voice.syncRealtimePurpose()
         // A question answered or defaulted elsewhere takes the voice session's copy with it.
         if let seen = seenPendingQuestionID, c.pendingQuestion?.id != seen { voice.clearQuestion(id: seen) }
         seenPendingQuestionID = c.pendingQuestion?.id
@@ -442,7 +477,7 @@ final class NotchModel {
         dismissedQuestionID = nil
         // Voice-first: opening the notch starts listening, also while a task runs ("stop",
         // "make it the blue ones"); typing a key switches to the text field.
-        if settings.settings.voice.listenOnOpen {
+        if settings.settings.voice.listenOnOpen || voice.prefersRealtime() {
             if !controller.isRunning {
                 inputOpen = true
                 resultVisible = false

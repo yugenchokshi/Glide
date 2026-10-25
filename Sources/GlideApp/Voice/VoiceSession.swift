@@ -102,6 +102,9 @@ final class VoiceSession {
     private(set) var notice: String?
     /// The last utterance was spoken, so Glide keeps the conversation in voice.
     private(set) var conversationIsVoice = false
+    /// A realtime conversation (OpenAI Realtime) is open: the microphone streams to the model,
+    /// which speaks for Glide and runs it through tools. See `RealtimeConversation`.
+    private(set) var realtimeActive = false
 
     static let levelCount = 28
 
@@ -127,6 +130,24 @@ final class VoiceSession {
         /// "Thinking" gives up after this long without a cue.
         var replyTimeout: Double = 8
     }
+
+    // Realtime conversation hooks (set by the app; tests use fakes).
+    /// A realtime conversation to start, or nil with an optional notice (on-device is used).
+    @ObservationIgnored var makeRealtime: () -> (RealtimeConversation?, notice: String?) = { (nil, nil) }
+    /// The realtime connection failed: don't try it again for a while.
+    @ObservationIgnored var realtimeFailed: () -> Void = {}
+    /// The Realtime engine is chosen and usable: the hotkey opens a conversation even when
+    /// "Listen when the notch opens" is off.
+    @ObservationIgnored var prefersRealtime: () -> Bool = { false }
+    @ObservationIgnored var isTaskRunning: () -> Bool = { false }
+    /// A question is on show (the controller's pending one included).
+    @ObservationIgnored var hasQuestion: () -> Bool = { false }
+    /// The user finished a turn in a realtime conversation.
+    @ObservationIgnored var onConversationTurn: () -> Void = {}
+    @ObservationIgnored var onConversationEnded: (RealtimeConversation.EndReason) -> Void = { _ in }
+    @ObservationIgnored private(set) var realtime: RealtimeConversation?
+    @ObservationIgnored private var realtimeHadTurn = false
+    @ObservationIgnored private var realtimeCaptionKind: SpeechPolicy.Kind?
 
     @ObservationIgnored let recognizer: any VoiceRecognizer
     @ObservationIgnored let speaker: any VoiceSpeaker
@@ -169,9 +190,19 @@ final class VoiceSession {
 
     /// The user wants to talk: stops Glide speaking and opens the microphone.
     func listen(prefix: String = "") {
+        // ⌥Space again ends the conversation.
+        if realtime != nil {
+            endConversation()
+            onChange()
+            return
+        }
         stopSpeaking()
         answerTimer?.cancel()
         notice = nil
+        if prefix.isEmpty && startRealtime() {
+            onChange()
+            return
+        }
         startListening(.request, userInitiated: true, prefix: prefix,
                        request: ListenRequest(noSpeechTimeout: timing.userNoSpeechSeconds, echoCancellation: false, mayPrompt: true))
         onChange()
@@ -179,6 +210,7 @@ final class VoiceSession {
 
     /// Esc, or the notch closing.
     func cancelListening() {
+        if realtime != nil { endConversation() }
         stopListening()
         onChange()
     }
@@ -186,6 +218,12 @@ final class VoiceSession {
     /// The user started typing: closes the microphone and returns what was heard so far, for
     /// the text field.
     func takeTranscriptForTyping() -> String {
+        if realtime != nil {
+            let text = partial
+            endConversation()
+            onChange()
+            return text
+        }
         let text = transcript
         stopListening()
         onChange()
@@ -194,6 +232,8 @@ final class VoiceSession {
 
     /// Return while listening: send what was heard so far without waiting for the pause.
     func finishNow() {
+        // Server VAD ends the turn; there is nothing to send early.
+        guard realtime == nil else { return }
         let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         stopListening()
         if !text.isEmpty { deliver(text) }
@@ -303,6 +343,7 @@ final class VoiceSession {
     /// The user typed a request or an answer: the conversation moves to the keyboard, so Glide
     /// stops opening the microphone on its own (it still speaks per the speak mode).
     func noteTyped() {
+        if realtime != nil { endConversation() }
         conversationIsVoice = false
         activeQuestion = nil
         stopListening()
@@ -313,6 +354,11 @@ final class VoiceSession {
     /// An option chip answered the question.
     func noteAnswered(questionID: String) {
         if activeQuestion?.id == questionID { activeQuestion = nil }
+        if realtime != nil {
+            syncRealtimePurpose()
+            onChange()
+            return
+        }
         if purpose == .answer { stopListening() }
         setAwaitingReply()
         onChange()
@@ -322,6 +368,11 @@ final class VoiceSession {
     func clearQuestion(id: String) {
         guard activeQuestion?.id == id else { return }
         activeQuestion = nil
+        if realtime != nil {
+            syncRealtimePurpose()
+            onChange()
+            return
+        }
         if purpose == .answer && !heardSpeech { stopListening() }
         onChange()
     }
@@ -345,6 +396,24 @@ final class VoiceSession {
         awaitingReply = false
         replyTimer?.cancel()
         let kind = SpeechPolicy.kind(of: cue)
+        if let realtime {
+            // The realtime model says it, in its own words; the notch shows Glide's line until
+            // the model's caption replaces it.
+            switch cue {
+            case .question(let q):
+                activeQuestion = q
+            case .result, .needsYou, .error:
+                realtimeCaptionKind = kind
+                showCaption(SpeechPolicy.shownText(cue), kind)
+                lingerCaption(timing.silentCaption)
+            case .ack, .progress:
+                break
+            }
+            realtime.feed(cue)
+            syncRealtimePurpose()
+            onChange()
+            return
+        }
         let shown = SpeechPolicy.shownText(cue)
         if case .question(let q) = cue {
             activeQuestion = q
@@ -369,6 +438,7 @@ final class VoiceSession {
 
     /// Stops talking and forgets what was queued.
     func stopSpeaking() {
+        realtime?.silence()
         queue.removeAll()
         answerWindowPending = false
         guard speakTask != nil else { return }
@@ -379,6 +449,7 @@ final class VoiceSession {
 
     /// The notch was closed: quiet, microphone off, no caption.
     func reset() {
+        if realtime != nil { endConversation() }
         stopListening()
         stopSpeaking()
         clearCaption()
@@ -479,6 +550,140 @@ final class VoiceSession {
             self.stopListening()
             self.onChange()
         }
+    }
+
+    // MARK: Realtime
+
+    /// Opens a realtime conversation when that engine is chosen and can run. False: use the
+    /// on-device path (with `notice` saying why, when it matters).
+    private func startRealtime() -> Bool {
+        let (made, why) = makeRealtime()
+        guard let conversation = made else {
+            notice = why
+            return false
+        }
+        stopListening()
+        realtime = conversation
+        realtimeActive = true
+        realtimeHadTurn = false
+        realtimeCaptionKind = nil
+        purpose = .request
+        userInitiated = true
+        micLive = false
+        preparing = false
+        preparingFraction = nil
+        partial = ""
+        prefix = ""
+        heardSpeech = false
+        levels = [Float](repeating: 0, count: Self.levelCount)
+        conversation.onEvent = { [weak self, weak conversation] event in
+            guard let self, let conversation, self.realtime === conversation else { return }
+            self.handleRealtime(event)
+        }
+        conversation.start(mayPrompt: true)
+        return true
+    }
+
+    /// Ends the realtime conversation (the user closed it).
+    func endConversation() {
+        realtime?.end()
+    }
+
+    func handleRealtime(_ event: RealtimeConversation.Event) {
+        guard realtime != nil else { return }
+        switch event {
+        case .micLive:
+            micLive = true
+        case .ready:
+            break
+        case .level(let level):
+            levels.removeFirst()
+            levels.append(level)
+            return // Only the waveform redraws.
+        case .userSpeechStarted:
+            heardSpeech = true
+            partial = ""
+            isSpeaking = false
+            awaitingReply = false
+            replyTimer?.cancel()
+            realtimeCaptionKind = nil
+            clearCaption()
+        case .userTranscript(let text):
+            partial = text
+            heardSpeech = true
+        case .userSpeechStopped:
+            heardSpeech = false
+            conversationIsVoice = true
+            realtimeHadTurn = true
+            setAwaitingReply()
+            onConversationTurn()
+        case .userTurnEnded(let text):
+            if !text.isEmpty { partial = text }
+        case .assistantCaption(let text):
+            awaitingReply = false
+            replyTimer?.cancel()
+            partial = ""
+            showCaption(text, realtimeCaptionKind ?? .ack)
+        case .speaking(let speaking):
+            isSpeaking = speaking
+            if speaking {
+                awaitingReply = false
+                replyTimer?.cancel()
+            } else if caption != nil {
+                lingerCaption(timing.captionLinger)
+            }
+        case .ended(let reason):
+            let hadTurn = realtimeHadTurn
+            realtime = nil
+            realtimeActive = false
+            purpose = nil
+            micLive = false
+            userInitiated = false
+            partial = ""
+            heardSpeech = false
+            isSpeaking = false
+            levels = [Float](repeating: 0, count: Self.levelCount)
+            if case .failed(let message, let fallback) = reason {
+                if fallback {
+                    realtimeFailed()
+                    notice = RealtimeRouting.fallbackNotice
+                    // Nothing was said yet: carry on listening on this Mac.
+                    if !hadTurn {
+                        startListening(.request, userInitiated: true,
+                                       request: ListenRequest(noSpeechTimeout: timing.userNoSpeechSeconds, echoCancellation: false, mayPrompt: true))
+                    }
+                } else {
+                    notice = message
+                }
+            }
+            onConversationEnded(reason)
+            onChange()
+            return
+        }
+        syncRealtimePurpose()
+        onChange()
+    }
+
+    /// Maps the conversation onto the notch's states: listening when the user talks (or nothing
+    /// else is going on), the question card while Glide waits for an answer, and the caption,
+    /// "thinking" or the running task otherwise (the microphone stays open underneath).
+    func syncRealtimePurpose() {
+        guard realtime != nil else { return }
+        let question = activeQuestion != nil || hasQuestion()
+        let p: Purpose
+        if heardSpeech {
+            p = question ? .answer : .request
+        } else if question {
+            p = .answer
+        } else if isSpeaking || caption != nil || awaitingReply || isTaskRunning() {
+            p = .bargeIn
+        } else {
+            p = .request
+        }
+        if purpose != p { purpose = p }
+        // Keyboard focus only while nothing runs underneath: the agent may be typing.
+        let focus = p == .request && !isTaskRunning()
+        if userInitiated != focus { userInitiated = focus }
     }
 
     // MARK: Caption

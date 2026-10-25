@@ -58,6 +58,7 @@ struct VoiceSettingsView: View {
     var previewVoices: [AppleVoiceOption]?
     var previewHasOpenAIKey: Bool?
     var onOpenProviders: () -> Void = {}
+    @Bindable var realtime: RealtimePreferences = .shared
 
     @State private var statuses: [VoicePermissions.Kind: PermissionStatus] = [:]
     @State private var voices: [AppleVoiceOption] = []
@@ -70,6 +71,27 @@ struct VoiceSettingsView: View {
         let voice = $store.settings.voice
         BKSectionHeader(title: "Voice",
                         subtitle: "Press \(store.settings.hotkeys.open.display) and just talk. Glide answers out loud, asks when something's unclear, and keeps working while it waits for you.")
+
+        BKGroupHeader(title: "Conversation", subtitle: "Your voice is sent to OpenAI while you talk.")
+        BKGroup {
+            BKFormRow(title: "Conversation engine", detail: conversationDetail) {
+                BKSegmented(options: [(ConversationEngine.realtime, "Realtime"), (.onDevice, "On-device")], selection: engineBinding)
+            }
+            if realtime.effectiveEngine(hasKey: hasKey) == .realtime {
+                BKFormRow(title: "Realtime model", detail: "Mini answers fastest. Glide falls back to the on-device voice when OpenAI can't be reached.") {
+                    BKMenu(options: [("gpt-realtime-2.1-mini", "GPT Realtime 2.1 mini"), ("gpt-realtime-2.1", "GPT Realtime 2.1")],
+                           selection: $realtime.model, minWidth: 190)
+                }
+                .disabled(!hasKey)
+            }
+        }
+        if realtime.effectiveEngine(hasKey: hasKey) == .realtime && !hasKey {
+            BKCallout(tone: .info, icon: "key.fill", title: "Add an OpenAI key for Realtime",
+                      message: "Until then Glide uses the on-device voice.") {
+                Button("AI Providers", action: onOpenProviders)
+                    .buttonStyle(BKButtonStyle(kind: .secondary, compact: true))
+            }
+        }
 
         BKGroupHeader(title: "Listening")
         BKGroup {
@@ -119,7 +141,9 @@ struct VoiceSettingsView: View {
             }
         }
 
-        BKGroupHeader(title: "Privacy", subtitle: "Speech recognition runs on this Mac. The microphone is on only while Glide is listening, with a red dot in the notch. Audio is never stored — only the words you said become the task.")
+        BKGroupHeader(title: "Privacy", subtitle: realtime.effectiveEngine(hasKey: hasKey) == .realtime && hasKey
+            ? "With Realtime, your voice is streamed to OpenAI while a conversation is open, and only then. The microphone is on only while Glide is listening, with a red dot in the notch. Glide never stores audio."
+            : "Speech recognition runs on this Mac. The microphone is on only while Glide is listening, with a red dot in the notch. Audio is never stored — only the words you said become the task.")
         BKGroup {
             ForEach(VoicePermissions.Kind.allCases) { kind in
                 let status = (previewPermissions ?? statuses)[kind] ?? .unknown
@@ -142,6 +166,16 @@ struct VoiceSettingsView: View {
     }
 
     private var hasKey: Bool { previewHasOpenAIKey ?? hasOpenAIKey }
+
+    private var engineBinding: Binding<ConversationEngine> {
+        Binding(get: { realtime.effectiveEngine(hasKey: hasKey) }, set: { realtime.engine = $0 })
+    }
+
+    private var conversationDetail: String {
+        realtime.effectiveEngine(hasKey: hasKey) == .realtime
+            ? "Talk back and forth in real time and interrupt any time. \(store.settings.hotkeys.open.display) starts a conversation; it ends after 20 s of quiet, or press \(store.settings.hotkeys.open.display) or esc."
+            : "Speech recognition on this Mac, then Glide's planner and voice. Slower, and nothing leaves the Mac until you send a request."
+    }
 
     private var engineDetail: String {
         store.settings.voice.engine == .openAI

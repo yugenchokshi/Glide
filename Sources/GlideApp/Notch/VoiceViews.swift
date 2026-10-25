@@ -85,7 +85,7 @@ struct NotchListeningView: View {
             }
             HStack(spacing: 8) {
                 if v.micLive { MicIndicator() }
-                Text(v.userInitiated ? "Just talk — I'll send it when you pause. Type to switch, esc to cancel." : "Go ahead, I'm listening.")
+                Text(Self.hint(v))
                     .font(.system(size: 11)).foregroundStyle(BK.Notch.tertiary).lineLimit(1)
                 Spacer(minLength: 0)
             }
@@ -96,6 +96,13 @@ struct NotchListeningView: View {
         .focusEffectDisabled()
         .onKeyPress(phases: .down) { press in handle(press) }
         .onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { focused = true } }
+    }
+
+    /// The line under the transcript: a fallback notice first, then how this listen ends.
+    static func hint(_ v: VoiceSession) -> String {
+        if let notice = v.notice, !v.realtimeActive { return notice }
+        if v.realtimeActive { return "Just talk, I'm live. esc or the hotkey to end." }
+        return v.userInitiated ? "Just talk — I'll send it when you pause. Type to switch, esc to cancel." : "Go ahead, I'm listening."
     }
 
     private func handle(_ press: KeyPress) -> KeyPress.Result {
