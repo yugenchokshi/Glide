@@ -667,13 +667,33 @@ public final class TaskController {
         }
     }
 
-    /// The yes/no question for an approval: "Okay to click “Place order”?"
+    /// The yes/no question for an approval: "Should I click “Place order” on amazon.com?"
     static func approvalQuestion(_ req: ApprovalRequest) -> AgentQuestion {
-        let action = UtteranceInterpreter.lowerFirst(req.title.trimmingCharacters(in: CharacterSet(charactersIn: ". ")))
-        let text = "Okay to \(action)?"
+        let action = UtteranceInterpreter.lowerFirst(spokenAction(req.title))
+        let text = "Should I \(action)?"
         let spoken = text.replacingOccurrences(of: "`", with: "")
         return AgentQuestion(id: "approval-\(req.id.uuidString)", text: text, spoken: spoken == text ? nil : spoken, options: ["Yes", "No"],
                              lowRisk: false, isApproval: true)
+    }
+
+    /// An action title as people say it: tool titles carry element refs and roles
+    /// ("Clicking e3045 “Add to cart”", "Click b31 link “Buy” on www.apple.com"), which are
+    /// noise when spoken.
+    nonisolated static func spokenAction(_ title: String) -> String {
+        var t = title.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+        let gerunds = ["Clicking": "Click", "Typing": "Type", "Running": "Run", "Opening": "Open", "Pressing": "Press",
+                       "Choosing": "Choose", "Selecting": "Select", "Sending": "Send", "Deleting": "Delete"]
+        for (ing, base) in gerunds where t.hasPrefix(ing + " ") { t = base + t.dropFirst(ing.count); break }
+        let patterns = [
+            #"\b[a-z]\d+\s+(?=(link|button|radio|checkbox|option|menuitem|menu item|tab|textbox|combobox|switch)?\s*[“"])"#,
+            #"\b(link|button|radio|checkbox|option|menuitem|menu item|tab|textbox|combobox|switch)\s+(?=[“"])"#,
+            #"\bon www\."#,
+        ]
+        let replacements = ["", "", "on "]
+        for (pattern, replacement) in zip(patterns, replacements) {
+            t = t.replacingOccurrences(of: pattern, with: replacement, options: [.regularExpression, .caseInsensitive])
+        }
+        return t.replacingOccurrences(of: "  ", with: " ")
     }
 
     public func respondToApproval(_ decision: ApprovalDecision) {
