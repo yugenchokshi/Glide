@@ -20,6 +20,9 @@ import AgentKit
 //   glidectl job list | job show <id> | job resume <id> [--yes]
 
 setvbuf(stdout, nil, _IOLBF, 0)
+// Connect to the window server the way an app does (no Dock icon): screen capture and OCR
+// assert in SkyLight without it, which crashed `run` when a step looked at the screen.
+NSApplication.shared.setActivationPolicy(.prohibited)
 let args = Array(CommandLine.arguments.dropFirst())
 func flag(_ name: String) -> Bool { args.contains(name) }
 func option(_ name: String) -> String? {
