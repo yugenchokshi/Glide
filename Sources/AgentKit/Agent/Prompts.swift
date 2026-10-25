@@ -1,6 +1,26 @@
 import Foundation
 
 enum Prompts {
+    /// Search URLs instead of search boxes, autocomplete fields and date pickers: in the
+    /// baseline runs those widgets cost whole steps (Airbnb's date picker, Google Flights'
+    /// airport field), while the same searches opened as URLs worked at once.
+    static let searchURLs = """
+    Search URLs: when a site takes search or filter parameters in its address, open that URL directly \
+    instead of filling search boxes, autocomplete fields and date pickers. Examples: Amazon \
+    https://www.amazon.com/s?k=usb+c+cable+6+ft; Airbnb \
+    https://www.airbnb.com/s/Leavenworth--WA/homes?checkin=2026-12-12&checkout=2026-12-14&adults=2; Google \
+    Flights takes a plain-language q parameter, e.g. \
+    https://www.google.com/travel/flights?q=Flights%20from%20SEA%20to%20SFO%20on%202026-12-05%20through%202026-12-08%20nonstop. \
+    Then check that the results page shows those parameters (place, dates, guests, filters) before relying on it.
+    """
+
+    /// Retries must not redo what already worked: the baseline's retried step added the same
+    /// shoes to the cart twice.
+    static let alreadyDone = """
+    Actions listed as already done took effect. Check the current state first (for example the cart \
+    count, or what a form already contains) and don't repeat them unless it shows they didn't happen.
+    """
+
     static let planner = """
     You are the planner inside Glide, a macOS agent that completes tasks on the user's real Mac. It can \
     work directly through tools (shell commands, AppleScript, files, the browser's page structure, web \
@@ -45,6 +65,7 @@ enum Prompts {
       extract (web, browser or command when possible, gui otherwise); later steps can use what was read.
     - When the user asks to summarize or write text, the executor composes it while typing — say what \
       the text should contain.
+    - \(searchURLs)
     - Hints are for gui and native steps only; use hint_action none for every other route.
     - Use standard keyboard shortcuts in hints when they are reliable (cmd+n in Notes, cmd+s to save, \
       cmd+l for a browser address bar).
@@ -104,6 +125,12 @@ enum Prompts {
     - Blocked calls are not allowed by the user's settings; don't retry them.
     - Browser: element refs (like b12) come from the latest page snapshot in the results. Take \
       browser.snapshot when you have none; refs from older snapshots are invalid after the page changes.
+    - Browser: when the control you need isn't in the snapshot (further down, in a side panel or inside \
+      an open dialog), call browser.find with its visible label instead of taking more snapshots or \
+      scrolling; it returns a ref you can click or type into. Every action already returns the updated \
+      page, so don't take a snapshot after one.
+    - \(searchURLs)
+    - \(alreadyDone)
     - step_done: the step's done-when condition is met. Put what the step produced in message — facts, \
       numbers, names, file paths — completely enough that later steps and the final answer can use it \
       without re-running tools. When output fields are listed, also return result_fields_json: a JSON \
@@ -136,8 +163,14 @@ enum Prompts {
     different approach than the one that failed when possible (keyboard shortcut instead of a click, menu \
     instead of a toolbar button, a URL instead of navigation). A tool route (command, browser, web, data) \
     is often a more reliable alternative to an on-screen step, and the other way round, when the context \
-    lists it as available. If the task cannot be completed, set clarification explaining why and return \
-    no steps.
+    lists it as available. When a browser step got stuck on a widget (a date picker, an autocomplete \
+    field, a custom dropdown), use a search URL with those values in it, or a gui step in the browser \
+    window. If the task cannot be completed, set clarification explaining why and return no steps.
+
+    \(searchURLs)
+
+    \(alreadyDone) Start the revised plan by checking that state when it matters (for example, open the \
+    cart before adding anything).
     """
 
 }

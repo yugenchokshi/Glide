@@ -152,14 +152,28 @@ public struct PlanningContext: Sendable {
 public struct AgentPlanner: Sendable {
     let router: ModelRouter
     let metrics: TaskMetrics
+    /// One provider and model for every role instead of the router (tests, scripted runs).
+    let fixed: ToolStepRunner.ModelSource?
 
     public init(router: ModelRouter, metrics: TaskMetrics) {
         self.router = router
         self.metrics = metrics
+        self.fixed = nil
+    }
+
+    init(provider: any LLMProvider, model: String, metrics: TaskMetrics) {
+        self.router = ModelRouter(settings: AppSettings())
+        self.metrics = metrics
+        self.fixed = .fixed(provider: provider, model: model)
+    }
+
+    private func route(_ role: ModelRole) throws -> ModelRouter.Route {
+        if let fixed { return try fixed.route() }
+        return try router.route(role)
     }
 
     public func plan(_ instruction: String, context: PlanningContext) async throws -> Plan {
-        let route = try router.route(.planner)
+        let route = try route(.planner)
         let message = """
         \(context.rendered)
 
@@ -173,10 +187,27 @@ public struct AgentPlanner: Sendable {
         return try PlanSchema.decode(json)
     }
 
+    /// - Parameters:
+    ///   - alreadyDone: actions earlier steps took that changed something (`TaskSession.sideEffects`).
+    ///   - page: a fresh look at the task's browser tab, when it used one.
     public func replan(_ instruction: String, plan: Plan, completed: [PlanStep], failedStep: PlanStep, failure: String,
-                       notes: String, screen: String, context: PlanningContext) async throws -> Plan {
-        let route = try router.route(.recovery)
-        let message = """
+                       notes: String, screen: String, context: PlanningContext, alreadyDone: [String] = [], page: String? = nil) async throws -> Plan {
+        let route = try route(.recovery)
+        let message = Self.recoveryMessage(instruction, plan: plan, completed: completed, failedStep: failedStep, failure: failure, notes: notes,
+                                           screen: screen, context: context, alreadyDone: alreadyDone, page: page)
+        let req = LLMRequest(model: route.model, system: Prompts.recovery, messages: [.user(message)], schema: PlanSchema.schema,
+                             schemaName: "plan", maxTokens: 8000, effort: route.effort, timeout: 120)
+        let r = try await route.provider.complete(req)
+        await metrics.recordModel(r, vision: false)
+        guard let json = r.json else { throw LLMError.invalidJSON(r.text) }
+        return try PlanSchema.decode(json)
+    }
+
+    /// The recovery planner's message. What already took effect comes before the notes, so a
+    /// long notes section can't push it out of view.
+    static func recoveryMessage(_ instruction: String, plan: Plan, completed: [PlanStep], failedStep: PlanStep, failure: String, notes: String,
+                                screen: String, context: PlanningContext, alreadyDone: [String], page: String?) -> String {
+        var message = """
         \(context.rendered)
 
         Original request: \(instruction)
@@ -184,16 +215,16 @@ public struct AgentPlanner: Sendable {
         Completed steps: \(completed.isEmpty ? "none" : completed.map { "\($0.id). \($0.title)" }.joined(separator: "; "))
         Failed step: \(failedStep.title) — \(failedStep.instruction)
         Failure: \(failure)
+        """
+        if let done = RetryNotes.render(alreadyDone) { message += "\n" + done }
+        if let page, !page.isEmpty { message += "\nCurrent browser page:\n\(page.prefix(3000))" }
+        message += """
+
         Notes gathered so far: \(notes.isEmpty ? "none" : notes)
         Current screen:
         \(screen.prefix(4000))
         """
-        let req = LLMRequest(model: route.model, system: Prompts.recovery, messages: [.user(message)], schema: PlanSchema.schema,
-                             schemaName: "plan", maxTokens: 8000, effort: route.effort, timeout: 120)
-        let r = try await route.provider.complete(req)
-        await metrics.recordModel(r, vision: false)
-        guard let json = r.json else { throw LLMError.invalidJSON(r.text) }
-        return try PlanSchema.decode(json)
+        return message
     }
 }
 

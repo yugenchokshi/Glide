@@ -285,7 +285,28 @@ public struct BrowserSettings: Codable, Sendable, Hashable {
     public var useBackgroundTabs = true
     /// Fall back to Glide's own Chrome window when the extension isn't connected.
     public var fallbackToGlideChrome = true
+    /// When a browser step gets stuck in the page structure, try it once more on screen (the
+    /// mouse and keyboard in the Chrome window) before replanning.
+    public var onScreenFallback = true
     public init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case backend, bridgePort, chromePath, useBackgroundTabs, fallbackToGlideChrome, onScreenFallback
+    }
+
+    /// Tolerant decoding: settings saved before a field existed keep the rest and use the
+    /// default for it, instead of resetting the whole browser section.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func v<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T { ((try? c.decodeIfPresent(T.self, forKey: key)) ?? nil) ?? fallback }
+        let d = BrowserSettings()
+        backend = v(.backend, d.backend)
+        bridgePort = v(.bridgePort, d.bridgePort)
+        chromePath = (try? c.decodeIfPresent(String.self, forKey: .chromePath)) ?? nil
+        useBackgroundTabs = v(.useBackgroundTabs, d.useBackgroundTabs)
+        fallbackToGlideChrome = v(.fallbackToGlideChrome, d.fallbackToGlideChrome)
+        onScreenFallback = v(.onScreenFallback, d.onScreenFallback)
+    }
 }
 
 public enum ScreenUse: String, Codable, Sendable, CaseIterable {

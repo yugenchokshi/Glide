@@ -56,12 +56,30 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
     /// Include the frontmost app, window and browser page in the planning context. Tests turn
     /// it off so planning never reads the user's screen or sends Apple Events to a browser.
     var screenContext = true
+    /// Tests: one scripted model for planning, recovery and tool steps instead of the router.
+    var testModel: (provider: any LLMProvider, model: String)?
+    /// Tests: runs a stuck browser step's on-screen try instead of the GUI loop.
+    var onScreenRunner: (@Sendable (PlanStep) async throws -> StepResult)?
+    /// Brings the task's browser tab and its Chrome window to the front before the on-screen
+    /// try (tests make it a no-op).
+    var bringBrowserForward: @Sendable (_ sessionKey: String) async -> Void = { await OnScreenSwitch.bringForward(sessionKey: $0) }
+    /// Whether on-screen steps can run now (tests pretend they can).
+    var screenAvailable: @Sendable () -> Bool = { AccessibilityEngine.isTrusted }
 
     /// Notes, action count, deadline and screenshot consent shared by this task's steps.
     /// Replaced at the start of each run; only read and written by the run itself.
     private var session = TaskSession(limits: LimitSettings())
     private var start = Date()
     private var finalMessage: String?
+    /// Set once a step failed or moved on screen: from then on tool steps are told what
+    /// already took effect, so they check before repeating it.
+    private var retrying = false
+    /// Whether a browser step ran, so replanning takes a fresh look at the task's tab.
+    private var usedBrowser = false
+
+    private var activePlanner: AgentPlanner {
+        testModel.map { AgentPlanner(provider: $0.provider, model: $0.model, metrics: metrics) } ?? planner
+    }
 
     public init(instruction: String, settings: AppSettings, runtime: AutomationRuntime = .shared, callbacks: AgentCallbacks,
                 store: LocalStore? = .shared, credentials: CredentialStore = .shared, composio: (ComposioClient, String)? = nil,
@@ -101,6 +119,8 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
     public func run(plan presetPlan: Plan? = nil) async -> TaskResult {
         start = Date()
         session = TaskSession(limits: settings.limits, start: start)
+        retrying = false
+        usedBrowser = false
         // The caller resets the gate before starting (so a stop pressed early isn't undone here).
         runtime.executor.input.cursorMode = settings.cursorMode
         store?.startTask(id: taskID, instruction: instruction, at: start)
@@ -147,7 +167,7 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
             if let presetPlan {
                 plan = presetPlan
             } else {
-                plan = try await planner.plan(instruction, context: context)
+                plan = try await activePlanner.plan(instruction, context: context)
             }
         } catch is CancellationError {
             return await finish(.stopped, summary: "Stopped", plan: nil)
@@ -209,20 +229,27 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
                 index = plan.steps.count
             case .blocked(let message):
                 return await finish(.needsInput, summary: message, plan: plan)
-            case .failed(let reason):
+            case .failed(let reason), .stalled(let reason):
                 emit(ActivityEntry(kind: .error, title: "Step failed: \(step.title)", detail: reason, route: step.route, success: false, durationMs: ms, stepID: step.id))
                 if runtime.gate.isStopped { return await finish(.stopped, summary: "Stopped", plan: plan) }
                 guard replans < settings.limits.maxReplans, Date() < session.deadline else {
                     return await finish(.failed, summary: "Couldn't complete “\(step.title)”", error: reason, plan: plan)
                 }
                 replans += 1
+                retrying = true
                 await metrics.recordRecovery()
                 phase(.planning, "Finding another way…")
                 emit(ActivityEntry(kind: .recovery, title: "Replanning (attempt \(replans))", detail: reason))
                 do {
-                    let screen = (try? await gui.observeCurrent(session: session, metrics: metrics))?.compact(maxElements: 120, maxTextChars: 2000) ?? "(no window)"
-                    let revised = try await planner.replan(instruction, plan: plan, completed: completed, failedStep: step, failure: reason,
-                                                           notes: session.notesText, screen: screen, context: await planningContext())
+                    let screen = screenContext
+                        ? (try? await gui.observeCurrent(session: session, metrics: metrics))?.compact(maxElements: 120, maxTextChars: 2000) ?? "(no window)"
+                        : "(not read)"
+                    // What already took effect and where the page is now, so the new plan checks
+                    // the cart instead of adding the item again.
+                    let page = usedBrowser ? await browserPage() : nil
+                    let revised = try await activePlanner.replan(instruction, plan: plan, completed: completed, failedStep: step, failure: reason,
+                                                                 notes: session.notesText, screen: screen, context: await planningContext(),
+                                                                 alreadyDone: session.sideEffects, page: page)
                     if let q = revised.clarification, revised.steps.isEmpty {
                         return await finish(.failed, summary: "Couldn't complete “\(step.title)”", error: q, plan: plan)
                     }
@@ -301,30 +328,89 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
             let run = GUIStepRunner.Run(instruction: instruction, plan: plan, session: session, metrics: metrics, callbacks: stepCallbacks)
             return try await gui.run(step, run).status
         case .command, .browser, .web, .data, .composio, .mcp:
-            return try await runToolStep(step, plan: plan)
+            let result = try await runToolStep(step, plan: plan)
+            guard OnScreenSwitch.applies(route: step.route, status: result.status, settings: settings), screenAvailable() else { return result.status }
+            return try await runOnScreen(step, plan: plan, after: result)
         }
     }
 
     /// Runs a step with tools (no cursor). What it produced becomes a note, so later steps and
     /// the final answer can use it.
-    private func runToolStep(_ step: PlanStep, plan: Plan) async throws -> StepResult.Status {
+    private func runToolStep(_ step: PlanStep, plan: Plan) async throws -> StepResult {
+        if step.route == .browser { usedBrowser = true }
         let planLines = plan.steps.map { ($0.id == step.id ? "→ " : "  ") + "\($0.id). \($0.title) [\($0.route.rawValue)]" }.joined(separator: "\n")
         var context = "Task: \(instruction)\nPlan:\n\(planLines)"
+        // Before the notes, which can be long: the step's prompt keeps the start of the context.
+        if retrying {
+            let page = RetryNotes.page(BrowserSessions.shared.currentSnapshot(BrowserSessions.key(jobID: nil, itemID: nil)))
+            if let done = RetryNotes.render(session.sideEffects, page: page) { context += "\n\n" + done }
+        }
         let notes = session.notesText
         if !notes.isEmpty { context += "\n\nNotes so far:\n" + String(notes.suffix(5000)) }
         let request = StepRequest(goal: plan.goal.isEmpty ? instruction : plan.goal, step: RecipeStep(step), context: context,
                                   allowedCategories: step.route.toolCategories, maxTurns: settings.limits.maxActionsPerStep)
-        var runner = ToolStepRunner(settings: settings, runtime: runtime, tools: tools, models: .router(router), integrations: integrations)
+        let models: ToolStepRunner.ModelSource = testModel.map { .fixed(provider: $0.provider, model: $0.model) } ?? .router(router)
+        var runner = ToolStepRunner(settings: settings, runtime: runtime, tools: tools, models: models, integrations: integrations)
         runner.session = session
         runner.metrics = metrics
         let result = try await runner.execute(request, callbacks: stepCallbacks)
-        if !result.output.isEmpty {
-            session.appendNote("\(step.title): \(result.output.prefix(4000))")
+        // What a stuck step tried is for its on-screen try, not a note (the final summary
+        // may be the last note).
+        let facts = ToolStepRunner.facts(in: result.output)
+        if !facts.isEmpty {
+            session.appendNote("\(step.title): \(facts.prefix(4000))")
             if case .done = result.status {
-                emit(ActivityEntry(kind: .info, title: "Noted information", detail: String(result.output.prefix(400)), route: step.route, stepID: step.id))
+                emit(ActivityEntry(kind: .info, title: "Noted information", detail: String(facts.prefix(400)), route: step.route, stepID: step.id))
             }
         }
-        return result.status
+        return result
+    }
+
+    /// Runs a browser step that got stuck once more on screen, in the Chrome window showing its
+    /// tab (a quick task already holds the screen lease). It's told why the first try stalled,
+    /// what it tried and what already took effect. A failure here goes on to the usual
+    /// replanning, which hears about both tries.
+    private func runOnScreen(_ step: PlanStep, plan: Plan, after result: StepResult) async throws -> StepResult.Status {
+        let reason = OnScreenSwitch.reason(result.status)
+        retrying = true
+        emit(ActivityEntry(kind: .info, title: OnScreenSwitch.title, detail: OnScreenSwitch.detail, route: .gui, stepID: step.id))
+        phase(.executing, OnScreenSwitch.title + "…")
+        await bringBrowserForward(BrowserSessions.key(jobID: nil, itemID: nil))
+        let briefing = OnScreenSwitch.briefing(reason: reason, tried: result.output, alreadyDone: session.sideEffects)
+        let screenStep = OnScreenSwitch.screenStep(step, briefing: briefing)
+        let status: StepResult.Status
+        if let onScreenRunner {
+            let r = try await onScreenRunner(screenStep)
+            for effect in r.sideEffects { session.recordSideEffect(effect) }
+            status = r.status
+        } else {
+            let run = GUIStepRunner.Run(instruction: instruction, plan: plan, session: session, metrics: metrics, callbacks: stepCallbacks)
+            status = try await gui.run(screenStep, run).status
+        }
+        switch status {
+        case .failed(let why), .stalled(let why): return .failed("\(reason) On screen: \(why)")
+        case .done, .taskDone, .blocked: return status
+        }
+    }
+
+    /// A fresh look at the task's browser tab (title, address and the start of a snapshot) for
+    /// the recovery planner; nil when there's no snapshot tool or it doesn't answer in time.
+    private func browserPage() async -> String? {
+        guard let tool = tools.tool(named: "browser.snapshot") else { return nil }
+        let context = ToolContext(settings: settings, gate: runtime.gate, workspace: nil, jobID: nil, itemID: nil,
+                                  workingDirectory: FileManager.default.homeDirectoryForCurrentUser, log: { _ in })
+        let output: ToolOutput? = await withTaskGroup(of: ToolOutput?.self) { group in
+            group.addTask { try? await tool.run(.object([:]), context: context) }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(20))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+        guard let output, output.ok, !output.text.isEmpty else { return nil }
+        return ToolStepRunner.clip(output.text, 3000)
     }
 
     // MARK: - Control
