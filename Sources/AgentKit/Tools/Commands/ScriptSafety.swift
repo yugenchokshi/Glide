@@ -71,6 +71,57 @@ public enum ScriptSafety {
         return Assessment(risk: .low, reasons: [])
     }
 
+    /// Whether a script could read the clipboard, so the concealed-item guard must run first.
+    ///
+    /// It can when it names it (`the clipboard`, `clipboard info`, `theClipboard()`,
+    /// `NSPasteboard`, `pbpaste`), pastes it somewhere it can be read back (keystrokes, a
+    /// Paste menu item), or reaches a name built at run time: a shell command, `run script`,
+    /// another app's `do script`/`do JavaScript`, raw event codes (`«event JonsgClp»`), the
+    /// Objective-C bridge, or (JXA) computed member access, `eval` and `Function`. A script
+    /// with none of these (`return 1 + 1`, reading Finder windows) can't, so it runs even while
+    /// a password manager's item is on the clipboard.
+    public static func mayReadClipboard(_ source: String, language: Language) -> Bool {
+        let lower = source.lowercased()
+        let names = ["clipboard", "pasteboard", "pbpaste", "paste", "«", "<<event", "<<class", "nsclassfromstring"]
+        if names.contains(where: { lower.contains($0) }) { return true }
+        let words = normalize(source)
+        let phrases = ["keystroke", "key code", "do shell script", "do script", "do javascript", "run script", "load script",
+                       "use framework", "current application", "call method", "perform selector"]
+        if phrases.contains(where: { contains(words, $0) }) { return true }
+        guard language == .javaScript else { return false }
+        if source.contains("ObjC") || source.contains("$.") || source.contains("$(") || source.contains("Library(") { return true }
+        if source.range(of: #"\b(eval|Function|Reflect|globalThis|require|import)\b"#, options: .regularExpression) != nil { return true }
+        return hasComputedMemberAccess(source)
+    }
+
+    /// JXA `obj[expr]` where `expr` isn't a number or a single quoted string: a property name
+    /// that could be built at run time (`app['the' + 'Clipboard']()`). Array literals
+    /// (`[1, 2]`) and plain indexes (`windows[0]`) don't count.
+    static func hasComputedMemberAccess(_ source: String) -> Bool {
+        let c = Array(source)
+        var i = 0
+        while i < c.count {
+            guard c[i] == "[", i > 0 else { i += 1; continue }
+            // Member access follows a name, `)` or `]`; otherwise it's an array literal.
+            var p = i - 1
+            while p >= 0, c[p] == " " || c[p] == "\t" { p -= 1 }
+            guard p >= 0, c[p].isLetter || c[p].isNumber || c[p] == "_" || c[p] == "$" || c[p] == ")" || c[p] == "]" else { i += 1; continue }
+            var j = i + 1
+            var depth = 1
+            while j < c.count, depth > 0 {
+                if c[j] == "[" { depth += 1 } else if c[j] == "]" { depth -= 1 }
+                if depth > 0 { j += 1 }
+            }
+            let inner = String(c[(i + 1)..<min(j, c.count)]).trimmingCharacters(in: .whitespaces)
+            let literalIndex = inner.allSatisfy(\.isNumber) && !inner.isEmpty
+            let quoted = inner.count >= 2 && (inner.first == "'" || inner.first == "\"") && inner.last == inner.first
+                && !inner.dropFirst().dropLast().contains(inner.first ?? "'")
+            if !literalIndex && !quoted { return true }
+            i = j + 1
+        }
+        return false
+    }
+
     /// Literal shell commands passed to `do shell script "…"` (AppleScript) or
     /// `doShellScript('…')` (JXA), so they can be checked with `CommandSafety` like any other
     /// command line. Commands built at run time aren't visible here; the keyword scan already

