@@ -12,6 +12,8 @@ import AgentKit
 //   glidectl workflow                  Finder + Notes deterministic workflow (Phase 2 acceptance)
 //   glidectl bench [--only 1,2] [--json out.json]   run the 12-scenario benchmark
 //   glidectl run "<task>" [--mock-url URL] [--yes]  run the full agent with configured providers
+//   glidectl say "<text>" [--answer "<reply>"]… [--dry-run] [--mock-url URL] [--yes]
+//                                      the full conversation path: speech cues, questions, answers
 //   glidectl permissions               show permission status
 //   glidectl tool list [--category browser]       list the agent's tools
 //   glidectl tool run <name> '<json args>' [--yes] [--headless]   run one tool (safety-checked)
@@ -29,12 +31,16 @@ func option(_ name: String) -> String? {
     guard let i = args.firstIndex(of: name), i + 1 < args.count else { return nil }
     return args[i + 1]
 }
+/// Every value of a repeatable option, in order (`--answer a --answer b`).
+func options(_ name: String) -> [String] {
+    args.indices.filter { args[$0] == name && $0 + 1 < args.count }.map { args[$0 + 1] }
+}
 var positional: [String] {
     var out: [String] = []
     var skip = false
     for a in args.dropFirst() {
         if skip { skip = false; continue }
-        if ["--app", "--only", "--json", "--mock-url", "--model", "--provider", "--category"].contains(a) { skip = true; continue }
+        if ["--app", "--only", "--json", "--mock-url", "--model", "--provider", "--category", "--answer"].contains(a) { skip = true; continue }
         if a.hasPrefix("--") { continue }
         out.append(a)
     }
@@ -59,6 +65,10 @@ Tools, browser and jobs (no Accessibility needed):
 
 Driving apps (needs Accessibility for this terminal):
   run "<task>" [--yes] [--mock-url <url>] [--model <id>]   full agent as a quick task
+  say "<text>" [--answer "<reply>"]… [--dry-run] [--yes] [--mock-url <url>]
+                                             talk to Glide as the notch does: prints every speech cue
+                                             and question; replies come from --answer in order (or
+                                             stdin when interactive); --dry-run only shows the plan
   inspect [app] [--ocr] | click "<label>" [--app <app>] | type "<text>" | key cmd+n | menu "File > New"
   workflow | bench [--only 1,2] [--json <file>]
   permissions
@@ -71,7 +81,7 @@ func main() async -> Int32 {
         return args.first == nil ? 2 : 0
     }
     // Tools, jobs and the browser don't need Accessibility; driving the UI does.
-    let needsAccessibility = !["permissions", "tool", "job", "browser"].contains(command)
+    let needsAccessibility = !["permissions", "tool", "job", "browser", "say"].contains(command)
     if needsAccessibility && !AccessibilityEngine.isTrusted {
         print("✗ Accessibility permission is not granted to this process.")
         return 1
@@ -188,6 +198,9 @@ func main() async -> Int32 {
             print("duration \(Int(result.durationMs))ms · actions \(m.actions) (\(m.deterministicActions) deterministic) · model calls \(m.modelCalls) · vision \(m.visionCalls) · tokens \(m.inputTokens)/\(m.outputTokens) · recoveries \(m.recoveries)" + (m.estimatedCost.map { String(format: " · ~$%.4f", $0) } ?? ""))
             return result.status == .completed ? 0 : 1
 
+        case "say":
+            return await sayCommand()
+
         case "tool":
             return try await toolCommand(settings: cliSettings)
 
@@ -225,6 +238,127 @@ func askApproval(_ title: String, risk: RiskLevel, reasons: [String]) async -> A
     print("  approve? [y/N/s(top)] ", terminator: "")
     let answer = await Task.detached { readLine() ?? "" }.value.lowercased()
     return answer == "y" ? .approve : (answer == "s" ? .stop : .reject)
+}
+
+/// One line for a speech cue.
+func describe(_ cue: SpeechCue) -> String {
+    switch cue {
+    case .ack(let s): return "» ack: \(s)"
+    case .progress(let s): return "» progress: \(s)"
+    case .question(let q): return "» question: \(q.spokenText)"
+    case .result(let s): return "» result: \(s)"
+    case .needsYou(let s): return "» needs you: \(s)"
+    case .error(let s): return "» error: \(s)"
+    }
+}
+
+/// `say`: the whole conversation path, headless. The utterance goes through
+/// `TaskController.handleUtterance` exactly as the notch sends it; every cue and question is
+/// printed, and each question is answered with the next `--answer` (or a line from stdin when
+/// interactive). Without an answer left, approvals are declined (or approved with `--yes`),
+/// low-risk questions take their default, and any other question stops the task.
+@MainActor
+func sayCommand() async -> Int32 {
+    guard let text = positional.first else { print("glidectl say \"<text>\" [--answer \"<reply>\"]… [--dry-run]"); return 2 }
+    var settings = SettingsStore.loadSnapshot()
+    applyMock(&settings)
+    settings.safety.pauseOnUserInput = false
+    // Conversations tried out here stay out of the app's task history.
+    settings.keepHistory = false
+    if flag("--dry-run") { return await sayDryRun(text, settings: settings) }
+
+    // A private settings domain, so nothing here changes the app's settings.
+    let suite = "dev.glide.glidectl.say.\(ProcessInfo.processInfo.processIdentifier)"
+    guard let defaults = UserDefaults(suiteName: suite) else { print("✗ Couldn't create a settings domain."); return 1 }
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let store = SettingsStore(defaults: defaults)
+    store.settings = settings
+    let controller = TaskController(runtime: runtime, settingsStore: store)
+    controller.backgroundJobsEnabled = false
+    controller.onSpeech = { print(describe($0)) }
+
+    signal(SIGINT, SIG_IGN)
+    let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    sig.setEventHandler { print("\n■ stop requested"); controller.handleUtterance("stop", source: .typed) }
+    sig.resume()
+
+    var replies = options("--answer")
+    let interactive = isatty(STDIN_FILENO) != 0
+    var handled = Set<String>()
+    var lastStatus = ""
+    print("you: \(text)")
+    controller.handleUtterance(text, source: .typed)
+    while true {
+        try? await Task.sleep(for: .milliseconds(100))
+        let line = "[\(controller.phase.rawValue)] \(controller.status)"
+        if controller.status != lastStatus, !controller.status.isEmpty {
+            lastStatus = controller.status
+            print("◆ \(line)")
+        }
+        if let q = controller.pendingQuestion, !handled.contains(q.id) {
+            handled.insert(q.id)
+            print("? \(q.text)" + (q.options.isEmpty ? "" : "  [\(q.options.joined(separator: " / "))]")
+                  + (q.defaultOption.map { "  (default: \($0))" } ?? ""))
+            var reply: String?
+            if q.isApproval && flag("--yes") {
+                reply = "yes"
+            } else if !replies.isEmpty {
+                reply = replies.removeFirst()
+            } else if interactive {
+                print("you: ", terminator: "")
+                reply = await Task.detached { readLine() }.value
+            }
+            if let reply, !reply.trimmingCharacters(in: .whitespaces).isEmpty {
+                if !interactive { print("you: \(reply)") }
+                controller.handleUtterance(reply, source: .typed)
+            } else if q.isApproval {
+                print("  (no answer — declining)")
+                controller.handleUtterance("no", source: .typed)
+            } else if controller.isRunning && !(q.lowRisk && q.defaultOption != nil) {
+                print("  (no answer to give — stopping)")
+                controller.handleUtterance("stop", source: .typed)
+            }
+        }
+        // Settled: nothing running or being routed, and no question left to answer.
+        if !controller.isBusy, controller.pendingQuestion.map({ handled.contains($0.id) }) ?? true { break }
+    }
+    // Let the last cues print.
+    try? await Task.sleep(for: .milliseconds(200))
+    guard let result = controller.lastResult else { print("\nDONE"); return 0 }
+    print("\n\(result.status.rawValue.uppercased()): \(result.summary)\(result.error.map { " — " + $0 } ?? "")")
+    return result.status == .completed ? 0 : 1
+}
+
+/// `say --dry-run`: what would happen, without doing it — the instant router's description
+/// when it has one, else the plan with its ack, questions and what each step waits for.
+@MainActor
+func sayDryRun(_ text: String, settings: AppSettings) async -> Int32 {
+    if let preview = InstantPreview.describe, let description = await preview(text) {
+        print("instant: \(description)")
+        return 0
+    }
+    let router = ModelRouter(settings: settings, credentials: .shared)
+    guard router.isConfigured else { print("✗ No AI provider is configured (or pass --mock-url)."); return 1 }
+    var context = PlanningContext()
+    context.routes = await RouteAvailability.current(settings: settings, tools: ToolRegistry.standard(settings: settings), backgroundJobs: false)
+    do {
+        let plan = try await AgentPlanner(router: router, metrics: TaskMetrics()).plan(text, context: context)
+        print("Plan (\(plan.mode.rawValue)): \(plan.goal)")
+        if let ack = plan.ack { print("» ack: \(ack)") }
+        if let c = plan.clarification { print("? clarification: \(c)") }
+        for q in plan.questions {
+            print("? [\(q.id)] \(q.text)" + (q.options.isEmpty ? "" : "  [\(q.options.joined(separator: " / "))]")
+                  + (q.lowRisk ? "  (low risk\(q.defaultOption.map { ", default: \($0)" } ?? ""))" : ""))
+        }
+        for s in plan.steps {
+            print("  \(s.id). \(s.title) [\(s.route.rawValue)\(s.risk == .low ? "" : ", \(s.risk.rawValue) risk")]"
+                  + (s.needs.isEmpty ? "" : "  waits for \(s.needs.joined(separator: ", "))"))
+        }
+        return 0
+    } catch {
+        print("✗ \(error.localizedDescription)")
+        return 1
+    }
 }
 
 @MainActor

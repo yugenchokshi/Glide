@@ -4,6 +4,11 @@ import AutomationKit
 
 /// UI-facing state machine for the current task. The notch and menu bar observe this; the
 /// automation itself runs off the main actor in `ExecutionOrchestrator`.
+///
+/// It is also the conversation layer (see Conversation.swift): everything the user says or
+/// types arrives at `handleUtterance`, which decides whether it stops, pauses or resumes the
+/// task, answers the open question, steers the running task, or starts something new (instant
+/// actions first, then the planner). Everything Glide wants said leaves through `onSpeech`.
 @MainActor
 @Observable
 public final class TaskController {
@@ -59,6 +64,13 @@ public final class TaskController {
         self.jobCenterOverride = jobCenter
         self.screenLease = screenLease
         self.credentials = credentials
+        let (stream, continuation) = AsyncStream.makeStream(of: Outgoing.self)
+        self.outgoing = continuation
+        // One consumer, so cues and question changes reach the UI in the order they happened,
+        // whichever task produced them.
+        Task { @MainActor [weak self] in
+            for await event in stream { self?.deliver(event) }
+        }
     }
 
     /// True while this run holds the screen lease, so the shared input gate is its own.
@@ -80,19 +92,356 @@ public final class TaskController {
     /// The question Glide is waiting on, answered by voice, typing or an option chip.
     public private(set) var pendingQuestion: AgentQuestion?
 
+    /// True while anything is going on: a task running or unwinding, or an utterance still being
+    /// routed (an instant action at work). glidectl `say` waits for this to settle.
+    public var isBusy: Bool { isRunning || task != nil || routing > 0 }
+
+    /// Long or repetitive requests become background jobs (the app). Off where nothing hosts
+    /// jobs (glidectl), so every plan runs as a quick task.
+    public var backgroundJobsEnabled = true
+
+    /// What goes to the voice layer, in order.
+    private enum Outgoing: Sendable {
+        case speech(SpeechCue)
+        /// The conversation identified by the token changed its shown question.
+        case questionChanged(UUID)
+    }
+
+    private let outgoing: AsyncStream<Outgoing>.Continuation
+    /// The running task's conversation and the token its events carry.
+    private var conversation: TaskConversation?
+    private var conversationToken = UUID()
+    /// The open approval's question, while the task waits on it.
+    private var approvalQuestionID: String?
+
+    /// A question asked when no task runs: an instant action's "anything else there?", or a
+    /// planner's clarification. Whatever the user says next answers it.
+    private struct IdleQuestion {
+        enum Kind {
+            /// After an instant action; an answer becomes a new request with what it opened.
+            case instant(context: String?)
+            /// The planner couldn't start without this; the answer re-runs the request with it.
+            case clarify(instruction: String)
+        }
+        var question: AgentQuestion
+        var kind: Kind
+    }
+    private var idleQuestion: IdleQuestion?
+
+    /// The last finished request, for follow-ups within `followUpWindowMinutes`.
+    private struct Exchange {
+        var instruction: String
+        var result: String
+        var front: String?
+        var at: Date
+    }
+    private var lastExchange: Exchange?
+    /// The part of a request an instant action left over while another task was running; it
+    /// starts when that task finishes.
+    private var queuedRequest: (text: String, context: String?)?
+    /// Utterances still being routed (waiting on the instant handler).
+    private var routing = 0
+
+    // Test seams.
+    /// The instant-actions hook (tests install a fake without touching the global one).
+    var instantHandler: () -> (@Sendable (String) async -> InstantResult?)? = { InstantActions.handler }
+    /// Adjusts each orchestrator before it runs (tests: scripted model, no screen reading).
+    var configureOrchestrator: ((ExecutionOrchestrator) -> Void)?
+    /// Tools for the orchestrator instead of the standard registry (tests).
+    var toolsOverride: ToolRegistry?
+    /// Where tasks and instant actions are recorded (tests use a throwaway store).
+    var historyStore: () -> LocalStore = { .shared }
+
     /// Everything the user says or types: answers a pending question, steers or stops the
     /// running task, or starts a new request (instant actions first).
     public func handleUtterance(_ text: String, source: UtteranceSource) {
-        start(text)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        // (a) Control words act at once.
+        if source != .option, let control = UtteranceInterpreter.control(trimmed) {
+            if isRunning || task != nil {
+                switch control {
+                case .stop:
+                    stop()
+                    speak(.ack("Okay, stopped."))
+                case .pause:
+                    if phase == .executing || phase == .planning {
+                        pause()
+                        speak(.ack("Paused — say continue when you're ready."))
+                    }
+                case .resume:
+                    if phase == .paused {
+                        resume()
+                        speak(.ack("Continuing."))
+                    }
+                }
+                return
+            }
+            if control == .stop {
+                if idleQuestion != nil { clearIdleQuestion() }
+                queuedRequest = nil
+                speak(.ack("Okay."))
+                return
+            }
+            // "continue" with nothing paused: nothing to do.
+            if control == .resume || control == .pause { return }
+        }
+
+        // (b) The open question.
+        if let idle = idleQuestion, !isRunning {
+            answerIdle(trimmed, question: idle)
+            return
+        }
+        if let q = conversation?.current, let answer = UtteranceInterpreter.answer(trimmed, to: q, source: source) {
+            self.answer(questionID: q.id, with: answer)
+            return
+        }
+
+        // (c) While a task runs: an instant request runs alongside it; anything else steers it.
+        if isRunning {
+            routeWhileRunning(trimmed)
+            return
+        }
+        if task != nil {
+            status = "Still stopping the previous task — try again in a moment."
+            return
+        }
+
+        // (d) Something new.
+        routeNewRequest(trimmed, context: recentContext())
     }
 
     /// Answers a specific question (an option chip, or a typed reply to it).
     public func answer(questionID: String, with text: String) {
-        guard pendingQuestion?.id == questionID else { return }
-        pendingQuestion = nil
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if let idle = idleQuestion, idle.question.id == questionID {
+            answerIdle(trimmed, question: idle)
+            return
+        }
+        guard let conversation else { return }
+        if questionID == approvalQuestionID {
+            // Approvals take only a yes or a no; anything else asks again.
+            guard let yes = UtteranceInterpreter.yesNo(trimmed) else {
+                if let q = conversation.question(questionID) { speak(.question(q)) }
+                return
+            }
+            conversation.answer(questionID, with: yes ? "Yes" : "No")
+            append(ActivityEntry(kind: .approval, title: yes ? "You said yes" : "You said no", success: yes))
+            respondToApproval(yes ? .approve : .reject)
+            // "No, use the other card": the rest of it is for the task.
+            if !yes, UtteranceInterpreter.normalize(trimmed).split(separator: " ").count > 2 { conversation.addNote(trimmed) }
+            return
+        }
+        if conversation.answer(questionID, with: trimmed) {
+            append(ActivityEntry(kind: .info, title: "You answered: \(trimmed)", detail: conversation.question(questionID)?.text))
+            refreshQuestion()
+        }
     }
 
+    // MARK: Routing
+
+    /// While a task runs: instant requests ("open Spotify") are done right away; anything else
+    /// is a note for the running task ("make it size 10").
+    private func routeWhileRunning(_ text: String) {
+        let handler = instantHandler()
+        let conversation = self.conversation
+        routing += 1
+        Task { @MainActor in
+            defer { self.routing -= 1 }
+            if let handler, let result = await handler(text) {
+                self.speak(.ack(result.ack))
+                self.append(ActivityEntry(kind: .result, title: result.summary, success: true))
+                if let rest = result.remainder, !rest.isEmpty {
+                    self.queuedRequest = (rest, result.context)
+                    self.append(ActivityEntry(kind: .info, title: "Next up: \(rest)"))
+                }
+                return
+            }
+            guard let conversation, conversation === self.conversation, self.isRunning else {
+                // The task ended meanwhile: it's a new request after all.
+                if !self.isRunning, self.task == nil { self.routeNewRequest(text, context: self.recentContext()) }
+                return
+            }
+            conversation.addNote(text)
+            self.append(ActivityEntry(kind: .info, title: "You said: \(text)"))
+            self.speak(.ack("Got it."))
+        }
+    }
+
+    /// A new request: the instant handler first (milliseconds, no model); what it leaves over,
+    /// or anything it doesn't handle, goes to the planner with `context`.
+    private func routeNewRequest(_ text: String, context: String?) {
+        clearIdleQuestion()
+        let handler = instantHandler()
+        guard let handler else {
+            start(text, context: context)
+            return
+        }
+        routing += 1
+        Task { @MainActor in
+            defer { self.routing -= 1 }
+            let result = await handler(text)
+            guard !self.isRunning, self.task == nil else { return }
+            if let result {
+                await self.finishInstant(text, result, context: context)
+            } else {
+                self.start(text, context: context)
+            }
+        }
+    }
+
+    /// Shows and says what an instant action did, then plans what it left over or asks its
+    /// follow-up question.
+    private func finishInstant(_ text: String, _ result: InstantResult, context: String?) async {
+        speak(.ack(result.ack))
+        let entry = ActivityEntry(kind: .result, title: result.summary, success: true)
+        if let rest = result.remainder?.trimmingCharacters(in: .whitespacesAndNewlines), !rest.isEmpty {
+            start(rest, context: Self.join(context, result.context ?? result.summary))
+            activity.insert(entry, at: 0)
+            return
+        }
+        let metrics = await TaskMetrics().snapshot()
+        guard !isRunning, task == nil else { return }
+        runID &+= 1
+        instruction = text
+        plan = nil
+        currentStepIndex = 0
+        activity = [entry]
+        pendingApproval = nil
+        startedAt = Date()
+        phase = .completed
+        status = result.summary
+        var done = TaskResult(status: .completed, summary: result.summary, error: nil, plan: nil, metrics: metrics, durationMs: 0)
+        done.front = result.context
+        lastResult = done
+        lastTaskID = nil
+        recordInstant(text, entry: entry, result: done)
+        lastExchange = Exchange(instruction: text, result: result.summary, front: result.context, at: Date())
+        onFinished?(done)
+        if let followUp = result.followUp, settingsStore.settings.conversation.offerNextStep {
+            askIdle(followUp, kind: .instant(context: result.context ?? result.summary))
+        }
+        onAttentionNeeded?()
+    }
+
+    private func recordInstant(_ text: String, entry: ActivityEntry, result: TaskResult) {
+        guard settingsStore.settings.keepHistory else { return }
+        let id = UUID().uuidString
+        let store = historyStore()
+        store.startTask(id: id, instruction: text)
+        store.appendEvent(taskID: id, entry)
+        store.finishTask(id: id, result: result)
+        lastTaskID = id
+    }
+
+    private func askIdle(_ question: AgentQuestion, kind: IdleQuestion.Kind) {
+        idleQuestion = IdleQuestion(question: question, kind: kind)
+        pendingQuestion = question
+        speak(.question(question))
+    }
+
+    private func clearIdleQuestion() {
+        guard idleQuestion != nil else { return }
+        idleQuestion = nil
+        pendingQuestion = conversation?.current
+    }
+
+    /// The answer to a question asked while idle. "No" closes it; anything else continues
+    /// from it (an instant follow-up becomes a request with what it opened; a clarification
+    /// re-runs the request with the answer).
+    private func answerIdle(_ text: String, question idle: IdleQuestion) {
+        clearIdleQuestion()
+        let yesNo = UtteranceInterpreter.yesNo(text)
+        if yesNo == false || UtteranceInterpreter.control(text) == .stop {
+            speak(.ack("Okay."))
+            return
+        }
+        switch idle.kind {
+        case .instant(let context):
+            // A bare "yes": what should it be?
+            if yesNo == true, UtteranceInterpreter.normalize(text).split(separator: " ").count <= 3 {
+                askIdle(AgentQuestion(text: "What should I do there?"), kind: .instant(context: context))
+                return
+            }
+            routeNewRequest(text, context: Self.join(recentContext(), context))
+        case .clarify(let instruction):
+            start(instruction + "\n\nThe user's answer to “\(idle.question.text)”: \(text)", context: recentContext())
+        }
+    }
+
+    /// The last request and its result, while within the follow-up window.
+    private func recentContext() -> String? {
+        let window = settingsStore.settings.conversation.followUpWindowMinutes
+        guard window > 0, let last = lastExchange, Date().timeIntervalSince(last.at) <= window * 60 else { return nil }
+        var lines = ["Previous request: \(last.instruction)", "Its result: \(last.result)"]
+        if let front = last.front, !front.isEmpty { lines.append("In front afterwards: \(front)") }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func join(_ a: String?, _ b: String?) -> String? {
+        let parts = [a, b].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n")
+    }
+
+    // MARK: Speech
+
+    private func speak(_ cue: SpeechCue) { outgoing.yield(.speech(cue)) }
+
+    private func deliver(_ event: Outgoing) {
+        switch event {
+        case .speech(let cue):
+            onSpeech?(cue)
+        case .questionChanged(let token):
+            guard token == conversationToken else { return }
+            refreshQuestion()
+        }
+    }
+
+    /// The notch shows the conversation's current question (always read fresh, so events that
+    /// arrive late never bring back an answered one).
+    private func refreshQuestion() {
+        guard idleQuestion == nil else { return }
+        let current = conversation?.current
+        guard current != pendingQuestion else { return }
+        pendingQuestion = current
+        if current != nil { onAttentionNeeded?() }
+    }
+
+    /// A new conversation for a run; its events reach the UI through `outgoing`.
+    private func makeConversation(defaultAfter: TimeInterval) -> TaskConversation {
+        let token = UUID()
+        conversationToken = token
+        let out = outgoing
+        let conversation = TaskConversation(defaultAfter: defaultAfter) { event in
+            switch event {
+            case .speech(let cue): out.yield(.speech(cue))
+            case .question: out.yield(.questionChanged(token))
+            }
+        }
+        let gate = runtime.gate
+        conversation.isPaused = { gate.isPaused }
+        return conversation
+    }
+
+    private func endConversation() {
+        conversation?.close()
+        conversation = nil
+        approvalQuestionID = nil
+        conversationToken = UUID()
+        if idleQuestion == nil { pendingQuestion = nil }
+    }
+
+    // MARK: Running
+
     public func start(_ text: String) {
+        start(text, context: nil)
+    }
+
+    /// Starts a task with the planner. `context` is what the conversation established (the
+    /// previous task, what an instant action opened), for follow-ups like "now add two of them".
+    public func start(_ text: String, context: String?) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         // Refuse while a stopped run is still unwinding: it shares the input gate.
         guard !trimmed.isEmpty, !isRunning else { return }
@@ -111,13 +460,18 @@ public final class TaskController {
         startedAt = Date()
         phase = .planning
         status = "Understanding your task…"
+        idleQuestion = nil
+        endConversation()
         let settings = settingsStore.settings
         guard ModelRouter(settings: settings, credentials: credentials).isConfigured else {
             phase = .failed
             status = "Add an AI provider key in Settings to get started."
+            speak(.error("I need an AI provider key first — add one in Settings."))
             onAttentionNeeded?()
             return
         }
+        let conversation = makeConversation(defaultAfter: settings.conversation.defaultAfterSeconds)
+        self.conversation = conversation
         // The gate is reset once this run holds the screen lease (`takeInputGate`), not here: a
         // background job's on-screen step may be using it until then.
         holdsLease = false
@@ -133,10 +487,16 @@ public final class TaskController {
             })
         // Long or repetitive requests (plan mode `job`) become background jobs; this quick task
         // then finishes with a short "Started a background job" summary and the job's id.
-        let handoff: ExecutionOrchestrator.JobHandoff = { [weak self] instruction, _ in
-            guard let self else { return nil }
-            return await self.startBackgroundJob(instruction, run: id)
+        var handoff: ExecutionOrchestrator.JobHandoff?
+        if backgroundJobsEnabled {
+            handoff = { [weak self] instruction, _ in
+                guard let self else { return nil }
+                return await self.startBackgroundJob(instruction, run: id)
+            }
         }
+        let jobHandoff = handoff
+        let tools = toolsOverride
+        let configure = configureOrchestrator
         task = Task { [weak self] in
             var composio: (ComposioClient, String)?
             if settings.composio.enabled {
@@ -166,8 +526,13 @@ public final class TaskController {
                 return
             }
             self.takeInputGate()
-            let orchestrator = ExecutionOrchestrator(instruction: trimmed, settings: SettingsStore.shared.settings, runtime: self.runtime,
-                                                     callbacks: callbacks, credentials: self.credentials, composio: composio, jobHandoff: handoff)
+            let orchestrator = ExecutionOrchestrator(instruction: trimmed, settings: self.settingsStore.settings, runtime: self.runtime,
+                                                     callbacks: callbacks, store: self.historyStore(), credentials: self.credentials,
+                                                     composio: composio, tools: tools,
+                                                     jobHandoff: jobHandoff)
+            orchestrator.conversation = conversation
+            orchestrator.conversationContext = context
+            configure?(orchestrator)
             self.orchestrator = orchestrator
             self.lastTaskID = orchestrator.taskID
             let run = Task.detached(priority: .userInitiated) { await orchestrator.run() }
@@ -241,6 +606,7 @@ public final class TaskController {
         approvalContinuation?.resume(returning: .stop)
         approvalContinuation = nil
         guard run == runID else { return }
+        endConversation()
         lastResult = result
         switch result.status {
         case .completed: phase = .completed; status = result.summary
@@ -249,8 +615,36 @@ public final class TaskController {
         case .needsInput: phase = .needsInput; status = result.summary
         }
         pendingApproval = nil
+        speakOutcome(result)
+        if result.status != .stopped {
+            lastExchange = Exchange(instruction: instruction, result: result.summary, front: result.front, at: Date())
+        }
         onFinished?(result)
         onAttentionNeeded?()
+        // What an instant action left over while this task ran starts now (unless it was stopped).
+        if let next = queuedRequest {
+            queuedRequest = nil
+            if result.status != .stopped { start(next.text, context: Self.join(recentContext(), next.context)) }
+        }
+    }
+
+    /// What Glide says when a task ends. A planner's clarification becomes a question whose
+    /// answer re-runs the request; a stop was already acknowledged.
+    private func speakOutcome(_ result: TaskResult) {
+        switch result.status {
+        case .completed:
+            speak(.result(result.spoken ?? UtteranceInterpreter.spokenSummary(result.summary)))
+        case .failed:
+            speak(.error(UtteranceInterpreter.spokenSummary(result.summary)))
+        case .needsInput:
+            if let plan = result.plan, plan.steps.isEmpty, let question = plan.clarification, question == result.summary, result.jobID == nil {
+                askIdle(AgentQuestion(text: question), kind: .clarify(instruction: instruction))
+            } else {
+                speak(.needsYou(UtteranceInterpreter.spokenSummary(result.summary, maxWords: 30)))
+            }
+        case .stopped:
+            break
+        }
     }
 
     private func requestApproval(_ req: ApprovalRequest, run: Int) async -> ApprovalDecision {
@@ -260,14 +654,38 @@ public final class TaskController {
             approvalContinuation = c
             pendingApproval = req
             phase = .awaitingApproval
+            // Also a yes/no question, so it can be answered by voice. It's shown ahead of any
+            // other question (the task is stopped on it) and never answered by silence.
+            if let conversation {
+                if let old = approvalQuestionID { conversation.withdraw(old) }
+                let question = Self.approvalQuestion(req)
+                approvalQuestionID = question.id
+                conversation.post(question, first: true)
+                refreshQuestion()
+            }
             onAttentionNeeded?()
         }
+    }
+
+    /// The yes/no question for an approval: "Okay to click “Place order”?"
+    static func approvalQuestion(_ req: ApprovalRequest) -> AgentQuestion {
+        let action = UtteranceInterpreter.lowerFirst(req.title.trimmingCharacters(in: CharacterSet(charactersIn: ". ")))
+        let text = "Okay to \(action)?"
+        let spoken = text.replacingOccurrences(of: "`", with: "")
+        return AgentQuestion(id: "approval-\(req.id.uuidString)", text: text, spoken: spoken == text ? nil : spoken, options: ["Yes", "No"],
+                             lowRisk: false, isApproval: true)
     }
 
     public func respondToApproval(_ decision: ApprovalDecision) {
         pendingApproval = nil
         approvalContinuation?.resume(returning: decision)
         approvalContinuation = nil
+        if let id = approvalQuestionID {
+            // Answered with the notch's buttons: the spoken question goes too.
+            approvalQuestionID = nil
+            conversation?.withdraw(id)
+            refreshQuestion()
+        }
         if decision == .stop { stop() } else if isPaused { phase = .paused } else { phase = .executing }
     }
 
@@ -312,6 +730,9 @@ public final class TaskController {
             orchestrator?.stop()
         }
         pendingPause = false
+        queuedRequest = nil
+        // Steps waiting for an answer end now.
+        conversation?.close()
         runTask?.cancel()
         task?.cancel()
         approvalContinuation?.resume(returning: .stop)
@@ -321,6 +742,7 @@ public final class TaskController {
             phase = .stopped
             status = "Stopped"
         }
+        pendingQuestion = idleQuestion?.question
     }
 
     public func retry() {
@@ -338,7 +760,8 @@ public final class TaskController {
 
     /// Sets display state directly. Used only by the UI snapshot renderer (`--snapshot`).
     public func previewState(phase: AgentPhase, status: String, instruction: String = "", plan: Plan? = nil, stepIndex: Int = 0,
-                             activity: [ActivityEntry] = [], approval: ApprovalRequest? = nil, holdsScreen: Bool = false) {
+                             activity: [ActivityEntry] = [], approval: ApprovalRequest? = nil, holdsScreen: Bool = false,
+                             question: AgentQuestion? = nil) {
         self.holdsLease = holdsScreen
         self.phase = phase
         self.status = status
@@ -347,6 +770,7 @@ public final class TaskController {
         self.currentStepIndex = stepIndex
         self.activity = activity
         self.pendingApproval = approval
+        self.pendingQuestion = question
     }
 
     public func reset() {

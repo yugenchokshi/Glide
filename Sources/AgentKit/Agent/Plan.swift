@@ -33,8 +33,12 @@ public struct PlanStep: Codable, Sendable, Hashable, Identifiable {
     public var doneWhen: String
     /// Optional deterministic hint (e.g. click "New Note") tried before asking a model.
     public var hint: ActionHint?
+    /// Ids of the plan's questions this step can't start without. Only these steps wait for
+    /// the user; the steps before them (searching, looking) run while the question is open.
+    public var needs: [String]
 
-    public init(id: Int, title: String, instruction: String, route: ExecutionRoute, app: String?, risk: RiskLevel, doneWhen: String, hint: ActionHint?) {
+    public init(id: Int, title: String, instruction: String, route: ExecutionRoute, app: String?, risk: RiskLevel, doneWhen: String, hint: ActionHint?,
+                needs: [String] = []) {
         self.id = id
         self.title = title
         self.instruction = instruction
@@ -43,6 +47,23 @@ public struct PlanStep: Codable, Sendable, Hashable, Identifiable {
         self.risk = risk
         self.doneWhen = doneWhen
         self.hint = hint
+        self.needs = needs
+    }
+
+    enum CodingKeys: String, CodingKey { case id, title, instruction, route, app, risk, doneWhen, hint, needs }
+
+    /// Tolerant decoding so steps stored in task history before `needs` existed still load.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(Int.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        instruction = try c.decode(String.self, forKey: .instruction)
+        route = try c.decode(ExecutionRoute.self, forKey: .route)
+        app = try c.decodeIfPresent(String.self, forKey: .app)
+        risk = try c.decode(RiskLevel.self, forKey: .risk)
+        doneWhen = try c.decode(String.self, forKey: .doneWhen)
+        hint = try c.decodeIfPresent(ActionHint.self, forKey: .hint)
+        needs = ((try? c.decodeIfPresent([String].self, forKey: .needs)) ?? nil) ?? []
     }
 }
 
@@ -74,34 +95,56 @@ public struct Plan: Codable, Sendable, Hashable {
     public var clarification: String?
     /// How the request should run. Plans saved before this existed decode as `.quick`.
     public var mode: PlanMode
+    /// Said the moment work starts ("On it — opening Amazon."), at most about 8 words.
+    public var ack: String?
+    /// Questions asked while the task works ("Which socks?"). They're posted at once; only the
+    /// steps that list a question in `needs` wait for its answer.
+    public var questions: [AgentQuestion]
 
-    public init(goal: String, steps: [PlanStep], clarification: String?, mode: PlanMode = .quick) {
+    public init(goal: String, steps: [PlanStep], clarification: String?, mode: PlanMode = .quick, ack: String? = nil, questions: [AgentQuestion] = []) {
         self.goal = goal
         self.steps = steps
         self.clarification = clarification
         self.mode = mode
+        self.ack = ack
+        self.questions = questions
     }
 
-    enum CodingKeys: String, CodingKey { case goal, steps, clarification, mode }
+    enum CodingKeys: String, CodingKey { case goal, steps, clarification, mode, ack, questions }
 
-    /// Tolerant decoding so plans stored in task history by older builds (no `mode`) still load.
+    /// Tolerant decoding so plans stored in task history by older builds (no `mode`, `ack` or
+    /// `questions`) still load.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         goal = try c.decode(String.self, forKey: .goal)
         steps = try c.decode([PlanStep].self, forKey: .steps)
         clarification = try c.decodeIfPresent(String.self, forKey: .clarification)
         mode = ((try? c.decodeIfPresent(PlanMode.self, forKey: .mode)) ?? nil) ?? .quick
+        ack = (try? c.decodeIfPresent(String.self, forKey: .ack)) ?? nil
+        questions = ((try? c.decodeIfPresent([AgentQuestion].self, forKey: .questions)) ?? nil) ?? []
     }
 }
 
 enum PlanSchema {
     static let actionNames = ["click", "double_click", "right_click", "type", "key", "scroll", "launch_app", "activate_app", "open_url", "menu", "none"]
 
+    /// Most options one question offers (they're shown as chips and read out).
+    static let maxOptions = 4
+
     static let schema: JSONValue = Schema.object([
         ("goal", Schema.string("One sentence restating the user's goal.")),
+        ("ack", Schema.string("What Glide says the moment it starts, at most 8 words, warm and plain, e.g. 'On it — opening Amazon.'")),
         ("mode", Schema.string("quick = do it now step by step; job = long or repetitive work that runs in the background (many items, more than ~15 steps, waits or schedules, or more than ~10 minutes).",
                                enum: PlanMode.allCases.map(\.rawValue))),
-        ("clarification", Schema.nullableString("A question for the user if the task is impossible or ambiguous, else null.")),
+        ("clarification", Schema.nullableString("Only when NOTHING can be started without an answer, or the task is impossible: one question, with no steps. Else null.")),
+        ("questions", Schema.array(Schema.object([
+            ("id", Schema.string("Short id steps refer to in needs, e.g. q1.")),
+            ("text", Schema.string("The question as shown, short and friendly, e.g. 'Which socks — athletic crew, no-show or wool?'")),
+            ("spoken", Schema.nullableString("Shorter version to say out loud, or null to say text.")),
+            ("options", Schema.array(Schema.string(), description: "Up to \(maxOptions) short concrete options, or empty for a free answer.")),
+            ("default", Schema.nullableString("The option to use if the user doesn't answer (only for low_risk questions), else null.")),
+            ("low_risk", Schema.boolean("True only for preferences (size, color, which result). False for anything that buys, sends, deletes or can't be undone.")),
+        ]), description: "Questions to ask while working; empty when the request is clear.")),
         ("steps", Schema.array(Schema.object([
             ("title", Schema.string("2-5 word present-progressive label shown to the user, e.g. 'Opening Notes'.")),
             ("instruction", Schema.string("What to accomplish in this step, specific enough to act on.")),
@@ -112,6 +155,7 @@ enum PlanSchema {
             ("hint_action", Schema.string("Single obvious first action if known, else none.", enum: actionNames)),
             ("hint_target", Schema.nullableString("Visible label of the control for the hint action, app name, URL, or menu path like 'File > Save'.")),
             ("hint_text", Schema.nullableString("Text to type / key combo for the hint action.")),
+            ("needs", Schema.array(Schema.string(), description: "Ids of questions this step can't start without; empty for steps that can run before the answer.")),
         ]))),
     ])
 
@@ -129,12 +173,41 @@ enum PlanSchema {
                 app: s["app"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 },
                 risk: RiskLevel(rawValue: s["risk"]?.stringValue ?? "low") ?? .low,
                 doneWhen: s["done_when"]?.stringValue ?? "",
-                hint: hint))
+                hint: hint,
+                needs: (s["needs"]?.arrayValue ?? []).compactMap { $0.stringValue?.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }))
         }
         let clarification = json["clarification"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
         // Unknown or missing modes run as quick tasks: the safe default that needs no job host.
         let mode = json["mode"]?.stringValue.flatMap { PlanMode(rawValue: $0.lowercased()) } ?? .quick
-        return Plan(goal: json["goal"]?.stringValue ?? "", steps: steps, clarification: clarification, mode: mode)
+        let questions = decodeQuestions(json["questions"])
+        // A step can only wait for a question that exists; anything else would wait forever.
+        let known = Set(questions.map(\.id))
+        for i in steps.indices { steps[i].needs = steps[i].needs.filter(known.contains) }
+        let ack = json["ack"]?.stringValue.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty || $0 == "null" ? nil : $0 }
+        return Plan(goal: json["goal"]?.stringValue ?? "", steps: steps, clarification: clarification, mode: mode, ack: ack, questions: questions)
+    }
+
+    /// The plan's questions. Duplicates and empty questions are dropped, options are capped,
+    /// and a default is kept only on a low-risk question, so nothing risky is ever decided by
+    /// silence.
+    static func decodeQuestions(_ value: JSONValue?) -> [AgentQuestion] {
+        func text(_ v: JSONValue?) -> String? {
+            guard let s = v?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty, s != "null" else { return nil }
+            return s
+        }
+        var out: [AgentQuestion] = []
+        var seen = Set<String>()
+        for (i, q) in (value?.arrayValue ?? []).enumerated() {
+            guard let question = text(q["text"]) else { continue }
+            var id = text(q["id"]) ?? "q\(i + 1)"
+            if seen.contains(id) { id = "q\(i + 1)-\(UUID().uuidString.prefix(4))" }
+            seen.insert(id)
+            let options = (q["options"]?.arrayValue ?? []).compactMap { text($0) }.prefix(maxOptions)
+            let lowRisk = q["low_risk"]?.boolValue ?? false
+            out.append(AgentQuestion(id: id, text: question, spoken: text(q["spoken"]), options: Array(options),
+                                     defaultOption: lowRisk ? text(q["default"]) : nil, lowRisk: lowRisk))
+        }
+        return out
     }
 }
 
@@ -169,6 +242,8 @@ public struct ActorDecision: Sendable, Hashable {
     public var followUps: [ActorDecision] = []
     /// The step's output fields (jobs), returned with `step_done`.
     public var resultFields: [String: JSONValue]? = nil
+    /// With `task_done`: the result to say out loud (at most about 25 words).
+    public var spoken: String? = nil
 }
 
 enum ActorSchema {
@@ -207,7 +282,8 @@ enum ActorSchema {
     ] + actionFields + [
         ("actions", Schema.array(followUpSchema, description: "Optional follow-up actions (up to \(maxFollowUps)) performed in order AFTER the main action, on this same screen (e.g. fill the next field, then click Save). Only targets from the current list. Null when none.", nullable: true)),
         ("remember", Schema.nullableString("Facts read from the screen worth keeping for later steps (e.g. extracted text), else null.")),
-        ("message", Schema.nullableString("For task_done: the result summary for the user. For blocked: why.")),
+        ("message", Schema.nullableString("For task_done: the result summary for the user. For blocked: why, or the one question to ask the user.")),
+        ("spoken", Schema.nullableString("For task_done: the result said out loud, at most 25 words, plain and warm. Else null.")),
         ("tool_name", Schema.nullableString("For call_tool: exact tool name.")),
         ("tool_arguments_json", Schema.nullableString("For call_tool: arguments as a JSON object string.")),
         ("result_fields_json", Schema.nullableString("With step_done, when the step lists output fields: a JSON object string with exactly those fields, else null.")),
@@ -219,6 +295,7 @@ enum ActorSchema {
         d.thought = str("thought") ?? ""
         d.remember = str("remember")
         d.message = str("message")
+        d.spoken = str("spoken")
         d.toolName = str("tool_name")
         // Both JSON-string fields also accept the object itself, which models send when the
         // schema isn't enforced (prompt-only fallbacks).

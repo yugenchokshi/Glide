@@ -66,6 +66,18 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
     /// Whether on-screen steps can run now (tests pretend they can).
     var screenAvailable: @Sendable () -> Bool = { AccessibilityEngine.isTrusted }
 
+    /// The task's conversation with the user (the controller's): the plan's ack and questions
+    /// go out through it, steps that need an answer wait on it, and the step runners hear the
+    /// user's notes from it. Nil runs the task without talking (glidectl `run`, tests).
+    var conversation: TaskConversation?
+    /// What the conversation so far established, for the planner (the previous task within the
+    /// follow-up window, what an instant action just opened).
+    var conversationContext: String?
+    /// A step running longer than this gets a spoken progress line, then one every
+    /// `progressEvery` seconds at most.
+    var progressAfter: TimeInterval = 20
+    var progressEvery: TimeInterval = 30
+
     /// Notes, action count, deadline and screenshot consent shared by this task's steps.
     /// Replaced at the start of each run; only read and written by the run itself.
     private var session = TaskSession(limits: LimitSettings())
@@ -76,6 +88,8 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
     private var retrying = false
     /// Whether a browser step ran, so replanning takes a fresh look at the task's tab.
     private var usedBrowser = false
+    /// The final result as the step that finished the task wants it said.
+    private var finalSpoken: String?
 
     private var activePlanner: AgentPlanner {
         testModel.map { AgentPlanner(provider: $0.provider, model: $0.model, metrics: metrics) } ?? planner
@@ -121,6 +135,8 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
         session = TaskSession(limits: settings.limits, start: start)
         retrying = false
         usedBrowser = false
+        finalSpoken = nil
+        finalMessage = nil
         // The caller resets the gate before starting (so a stop pressed early isn't undone here).
         runtime.executor.input.cursorMode = settings.cursorMode
         store?.startTask(id: taskID, instruction: instruction, at: start)
@@ -147,6 +163,8 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
     private func finish(_ status: TaskResult.Status, summary: String, error: String? = nil, plan: Plan?, jobID: String? = nil) async -> TaskResult {
         let snapshot = await metrics.snapshot()
         let duration = Date().timeIntervalSince(start) * 1000
+        // Nothing is left to answer once the task has ended.
+        conversation?.close()
         switch status {
         case .completed: phase(.completed, summary)
         case .failed: phase(.failed, error ?? summary)
@@ -154,7 +172,24 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
         case .needsInput: phase(.needsInput, summary)
         }
         emit(ActivityEntry(kind: status == .completed ? .result : .error, title: status == .completed ? summary : (error ?? summary), success: status == .completed, durationMs: duration))
-        return TaskResult(status: status, summary: summary, error: error, plan: plan, metrics: snapshot, durationMs: duration, jobID: jobID)
+        var result = TaskResult(status: status, summary: summary, error: error, plan: plan, metrics: snapshot, durationMs: duration, jobID: jobID)
+        if status == .completed { result.spoken = finalSpoken ?? UtteranceInterpreter.spokenSummary(summary) }
+        if status != .stopped { result.front = frontDescription() }
+        return result
+    }
+
+    /// The app, window and page in front, for a follow-up request; nil when the screen isn't
+    /// read (tests).
+    private func frontDescription() -> String? {
+        guard screenContext else { return nil }
+        let ax = runtime.accessibility
+        guard let front = ax.frontmostApp() else { return nil }
+        var text = front.name
+        if let title = ax.focusedWindow(pid: front.pid).flatMap({ AX_title($0) }), !title.isEmpty { text += " — “\(title)”" }
+        if let browser = BrowserAdapter.browser(forBundleID: front.bundleID), let page = runtime.perception.browser.currentPage(browser) {
+            text += " showing \(page.title) (\(page.url))"
+        }
+        return text
     }
 
     private func execute(presetPlan: Plan?) async -> TaskResult {
@@ -177,6 +212,16 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
         if runtime.gate.isStopped { return await finish(.stopped, summary: "Stopped", plan: plan) }
         if let question = plan.clarification, plan.steps.isEmpty {
             return await finish(.needsInput, summary: question, plan: plan)
+        }
+        // Say it's on it, then ask what the plan needs to know; the steps that don't depend on
+        // the answers start right away.
+        if let conversation {
+            if let ack = plan.ack { conversation.speak(.ack(ack)) }
+            for q in plan.questions { conversation.post(q) }
+            if !plan.questions.isEmpty {
+                emit(ActivityEntry(kind: .info, title: plan.questions.count == 1 ? "Asked a question" : "Asked \(plan.questions.count) questions",
+                                   detail: plan.questions.map(\.text).joined(separator: "\n")))
+            }
         }
         if plan.mode == .job, let jobHandoff {
             phase(.planning, "Setting up a background job…")
@@ -203,12 +248,18 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
                 return await finish(.failed, summary: "Accessibility permission needed", error: AutomationError.accessibilityNotTrusted.localizedDescription, plan: plan)
             }
             callbacks.plan(plan, index)
+            // Only a step that needs an answer waits for it; everything before it already ran.
+            guard await waitForNeeds(of: step, plan: plan) else { return await finish(.stopped, summary: "Stopped", plan: plan) }
+            deliverNotes()
             phase(.executing, step.title + "…")
             emit(ActivityEntry(kind: .step, title: step.title, detail: step.instruction, route: step.route, stepID: step.id))
             let stepStart = Date()
             let outcome: StepResult.Status
+            let ticker = progressTicker(for: step)
+            defer { ticker?.cancel() }
             do {
                 outcome = try await runStep(step, plan: plan)
+                ticker?.cancel()
             } catch is CancellationError {
                 return await finish(.stopped, summary: "Stopped", plan: plan)
             } catch AutomationError.stopped {
@@ -257,6 +308,12 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
                     var steps = completed
                     for (i, var s) in revised.steps.enumerated() { s.id = completed.count + i + 1; steps.append(s) }
                     plan.steps = steps
+                    // New questions the revised plan asks (the ones already asked keep their answers).
+                    let known = Set(plan.questions.map(\.id))
+                    for q in revised.questions where !known.contains(q.id) {
+                        plan.questions.append(q)
+                        conversation?.post(q)
+                    }
                     emit(ActivityEntry(kind: .plan, title: "Revised plan", detail: revised.steps.map { "\($0.title) [\($0.route.rawValue)]" }.joined(separator: "\n")))
                 } catch is CancellationError {
                     return await finish(.stopped, summary: "Stopped", plan: plan)
@@ -291,10 +348,64 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
         }
     }
 
+    // MARK: - Conversation
+
+    /// Waits until every question `step` needs is answered. Shows "Waiting for your answer…"
+    /// meanwhile, and the wait doesn't count toward the task's time limit. False when the task
+    /// was stopped while waiting.
+    private func waitForNeeds(of step: PlanStep, plan: Plan) async -> Bool {
+        guard let conversation else { return true }
+        let open = step.needs.filter { conversation.isOpen($0) }
+        guard !open.isEmpty else { return true }
+        phase(.executing, Self.waitingStatus)
+        emit(ActivityEntry(kind: .info, title: Self.waitingStatus, detail: open.compactMap { conversation.question($0)?.text }.joined(separator: "\n"),
+                           stepID: step.id))
+        let started = Date()
+        for id in open {
+            let answer = await conversation.waitForAnswer(id)
+            if Task.isCancelled || runtime.gate.isStopped || (answer == nil && conversation.isClosed) { return false }
+            if let answer, let q = conversation.question(id) {
+                if conversation.wasDefaulted(id) {
+                    session.appendNote("No answer to “\(q.text)”, so going with the default: \(answer)")
+                    emit(ActivityEntry(kind: .info, title: "Going with \(answer)", detail: q.text, stepID: step.id))
+                } else {
+                    session.appendNote("The user answered “\(q.text)”: \(answer)")
+                    emit(ActivityEntry(kind: .info, title: "You answered: \(answer)", detail: q.text, stepID: step.id))
+                }
+            }
+        }
+        session.extendDeadline(by: Date().timeIntervalSince(started))
+        return true
+    }
+
+    static let waitingStatus = "Waiting for your answer…"
+
+    /// What the user said since the last step, into the notes every later step reads.
+    private func deliverNotes() {
+        guard let conversation else { return }
+        for note in conversation.takeNotes() { session.appendNote("From the user: \(note)") }
+    }
+
+    /// Says how a long step is going: once it has run `progressAfter` seconds, then at most
+    /// every `progressEvery`. Quiet while paused or while a question is open.
+    private func progressTicker(for step: PlanStep) -> Task<Void, Never>? {
+        guard let conversation, progressAfter > 0 else { return nil }
+        let after = progressAfter, every = max(progressEvery, 1), gate = runtime.gate
+        let line = "Still \(UtteranceInterpreter.lowerFirst(step.title))…"
+        return Task {
+            try? await Task.sleep(for: .seconds(after))
+            while !Task.isCancelled {
+                if !gate.isPaused, conversation.current == nil { conversation.speak(.progress(line)) }
+                try? await Task.sleep(for: .seconds(every))
+            }
+        }
+    }
+
     // MARK: - Context
 
     private func planningContext() async -> PlanningContext {
         var ctx = PlanningContext()
+        ctx.conversation = conversationContext
         if screenContext {
             let ax = runtime.accessibility
             let front = ax.frontmostApp()
@@ -322,11 +433,25 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
         switch step.route {
         case .answer:
             phase(.executing, "Writing the answer…")
-            let message = try await selector.answer(instruction: instruction, step: step, notes: session.notesText)
-            return .taskDone(message)
+            if let testModel {
+                // Scripted runs write the answer with the tool loop's answer writer on the test model.
+                let runner = ToolStepRunner(settings: settings, runtime: runtime, tools: tools, models: .fixed(provider: testModel.provider, model: testModel.model),
+                                            integrations: integrations)
+                let request = StepRequest(goal: plan.goal.isEmpty ? instruction : plan.goal, step: RecipeStep(step),
+                                          context: "Task: \(instruction)\n\nNotes so far:\n" + session.notesText, allowedCategories: [.workspace])
+                let result = try await runner.execute(request, callbacks: stepCallbacks)
+                if let spoken = result.fields[ToolStepRunner.spokenField]?.stringValue { finalSpoken = spoken }
+                return result.status
+            }
+            let answer = try await selector.answer(instruction: instruction, step: step, notes: session.notesText)
+            finalSpoken = answer.spoken
+            return .taskDone(answer.message)
         case .gui, .native:
-            let run = GUIStepRunner.Run(instruction: instruction, plan: plan, session: session, metrics: metrics, callbacks: stepCallbacks)
-            return try await gui.run(step, run).status
+            var run = GUIStepRunner.Run(instruction: instruction, plan: plan, session: session, metrics: metrics, callbacks: stepCallbacks)
+            run.conversation = conversation
+            let outcome = try await gui.run(step, run)
+            if let spoken = outcome.spoken { finalSpoken = spoken }
+            return outcome.status
         case .command, .browser, .web, .data, .composio, .mcp:
             let result = try await runToolStep(step, plan: plan)
             guard OnScreenSwitch.applies(route: step.route, status: result.status, settings: settings), screenAvailable() else { return result.status }
@@ -353,7 +478,9 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
         var runner = ToolStepRunner(settings: settings, runtime: runtime, tools: tools, models: models, integrations: integrations)
         runner.session = session
         runner.metrics = metrics
+        runner.conversation = conversation
         let result = try await runner.execute(request, callbacks: stepCallbacks)
+        if let spoken = result.fields[ToolStepRunner.spokenField]?.stringValue { finalSpoken = spoken }
         // What a stuck step tried is for its on-screen try, not a note (the final summary
         // may be the last note).
         let facts = ToolStepRunner.facts(in: result.output)
@@ -384,8 +511,11 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
             for effect in r.sideEffects { session.recordSideEffect(effect) }
             status = r.status
         } else {
-            let run = GUIStepRunner.Run(instruction: instruction, plan: plan, session: session, metrics: metrics, callbacks: stepCallbacks)
-            status = try await gui.run(screenStep, run).status
+            var run = GUIStepRunner.Run(instruction: instruction, plan: plan, session: session, metrics: metrics, callbacks: stepCallbacks)
+            run.conversation = conversation
+            let outcome = try await gui.run(screenStep, run)
+            if let spoken = outcome.spoken { finalSpoken = spoken }
+            status = outcome.status
         }
         switch status {
         case .failed(let why), .stalled(let why): return .failed("\(reason) On screen: \(why)")

@@ -112,6 +112,9 @@ public struct PlanningContext: Sendable {
     public var date = Date()
     /// Which routes can run right now. Nil leaves the route section out of the prompt.
     public var routes: RouteAvailability?
+    /// What the conversation so far established (the last task and its result, what an
+    /// instant action just opened), so "now add two of them" can be planned.
+    public var conversation: String?
 
     public init(frontmostApp: String? = nil, windowTitle: String? = nil, runningApps: [String] = [], browserPage: String? = nil,
                 composioToolkits: [String] = [], mcpTools: [MCPTool] = [], skills: [Skill] = [], routes: RouteAvailability? = nil) {
@@ -143,6 +146,9 @@ public struct PlanningContext: Sendable {
         if !skills.isEmpty {
             lines.append("Saved skills that may apply:")
             for s in skills.prefix(3) { lines.append(s.promptText) }
+        }
+        if let conversation, !conversation.isEmpty {
+            lines.append("Context from the conversation (use it to resolve “it”, “them”, “there”):\n\(conversation.prefix(3000))")
         }
         return lines.joined(separator: "\n")
     }
@@ -286,16 +292,21 @@ public struct ActionSelector: Sendable {
         return ActorSchema.decode(json)
     }
 
-    static let answerSchema: JSONValue = Schema.object([("message", Schema.string("The answer for the user, concise and complete."))])
+    static let answerSchema: JSONValue = Schema.object([
+        ("message", Schema.string("The answer for the user, concise and complete.")),
+        ("spoken", Schema.nullableString("The answer said out loud: at most 25 words, plain and warm.")),
+    ])
 
-    /// Writes the final answer for `answer` steps from gathered notes.
-    public func answer(instruction: String, step: PlanStep, notes: String) async throws -> String {
+    /// Writes the final answer for `answer` steps from gathered notes, with a short version to
+    /// say out loud.
+    public func answer(instruction: String, step: PlanStep, notes: String) async throws -> (message: String, spoken: String?) {
         let route = try router.route(.planner)
-        let req = LLMRequest(model: route.model, system: "You write the final answer for a macOS agent's task using only the notes gathered while operating the computer. Be concise.",
+        let req = LLMRequest(model: route.model, system: "You write the final answer for a macOS agent's task using only the notes gathered while operating the computer. Be concise. In spoken, say it as you would out loud, in at most 25 words.",
                              messages: [.user("Task: \(instruction)\nStep: \(step.instruction)\nNotes:\n\(notes.isEmpty ? "(none)" : notes)")],
                              schema: Self.answerSchema, schemaName: "answer", maxTokens: 3000, effort: "low", timeout: 60)
         let r = try await route.provider.complete(req)
         await metrics.recordModel(r, vision: false)
-        return r.json?["message"]?.stringValue ?? r.text
+        let spoken = r.json?["spoken"]?.stringValue.flatMap { $0.isEmpty || $0 == "null" ? nil : $0 }
+        return (r.json?["message"]?.stringValue ?? r.text, spoken)
     }
 }

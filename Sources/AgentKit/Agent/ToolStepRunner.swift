@@ -105,6 +105,20 @@ public struct ToolStepRunner: StepExecuting {
     /// Hard ceiling for one tool call. Each tool has its own, shorter timeout (shell commands
     /// may run up to 10 minutes); this only catches tools that hang.
     var callTimeout: TimeInterval = 660
+    /// Quick tasks: the task's conversation with the user. Gives the step the `ask_user` tool,
+    /// delivers what the user says meanwhile as notes at each turn, and turns a step that would
+    /// end blocked on a decision into a question it waits for. Nil for job steps.
+    var conversation: TaskConversation?
+
+    /// The tool the model calls to ask the user something; handled by the runner itself.
+    static let askUserName = "ask_user"
+    /// Questions one step may ask in place of ending blocked.
+    static let maxBlockedQuestions = 2
+
+    /// The conversation, when this step may talk to the user (quick tasks only).
+    private func conversation(for request: StepRequest) -> TaskConversation? {
+        request.jobID == nil ? conversation : nil
+    }
 
     public init(settings: AppSettings, runtime: AutomationRuntime = .shared, tools: ToolRegistry, credentials: CredentialStore = .shared,
                 integrations: Integrations? = nil) {
@@ -191,7 +205,8 @@ public struct ToolStepRunner: StepExecuting {
         if !primary.isEmpty, !stepTools.specs().contains(where: { primary.contains($0.category) }) {
             return state.result(.failed("The \(request.step.route.rawValue) tools aren't available here, so this step can't run with tools."))
         }
-        let listing = stepTools.promptListing(categories: request.allowedCategories)
+        var listing = stepTools.promptListing(categories: request.allowedCategories)
+        if conversation(for: request) != nil { listing += Prompts.askUserTool + "\n" }
         let maxBatch = settings.tools.batchActions ? min(max(settings.tools.maxBatch, 1), 10) : 1
         let schema = ToolDecisionSchema.schema(maxBatch: maxBatch)
         let canFind = stepTools.tool(named: "browser.find") != nil
@@ -199,6 +214,7 @@ public struct ToolStepRunner: StepExecuting {
         for _ in 0..<max(1, request.maxTurns) {
             try await checkStop(gates)
             callbacks.phase(.executing, request.step.title + "…")
+            deliverNotes(request, state: &state)
 
             // 1. Decide.
             let decision: ToolDecision
@@ -221,7 +237,12 @@ public struct ToolStepRunner: StepExecuting {
                 }
             }
             if decision.status == .blocked {
-                return state.result(.blocked(decision.message ?? "I can't continue this step without your help."))
+                let message = decision.message ?? "I can't continue this step without your help."
+                if let reply = try await askInstead(message, request: request, callbacks: callbacks, gates: gates, state: &state) {
+                    state.history.append(HistoryEntry(header: "you asked the user “\(Self.clip(message, 300))” → they answered: \(reply)"))
+                    continue
+                }
+                return state.result(.blocked(message))
             }
             let finishing = decision.status == .stepDone || decision.status == .taskDone
             if decision.status == .act && decision.calls.isEmpty {
@@ -297,8 +318,9 @@ public struct ToolStepRunner: StepExecuting {
                 state.note("result_fields_json is missing \(missing.joined(separator: ", ")); include every output field (null when unknown)")
                 continue
             }
-            let fields = StepResult.completeFields(decision.resultFields ?? [:], required: request.step.outputFields)
+            var fields = StepResult.completeFields(decision.resultFields ?? [:], required: request.step.outputFields)
             if decision.status == .taskDone && request.jobID == nil {
+                if let spoken = decision.spoken { fields[Self.spokenField] = .string(spoken) }
                 return state.result(.taskDone(decision.message ?? "Done"), message: decision.message, fields: fields)
             }
             return state.result(.done, message: decision.message, fields: fields)
@@ -325,6 +347,9 @@ public struct ToolStepRunner: StepExecuting {
             state.lastError = message
             state.progress.recordNotRun()
             return .failed(message)
+        }
+        if call.tool == Self.askUserName, let conversation = conversation(for: request) {
+            return try await askUser(call, conversation: conversation, request: request, callbacks: callbacks, gates: gates, state: &state)
         }
 
         // Resolve and check the tool.
@@ -500,12 +525,88 @@ public struct ToolStepRunner: StepExecuting {
                     : "Your previous reply was missing result_fields_json keys: \(missing.joined(separator: ", ")). Include every listed key (null when unknown)."
                 continue
             }
-            let complete = StepResult.completeFields(fields ?? [:], required: request.step.outputFields)
+            var complete = StepResult.completeFields(fields ?? [:], required: request.step.outputFields)
             let answer = text.isEmpty ? "Done" : text
-            if request.jobID == nil { return state.result(.taskDone(answer), message: answer, fields: complete) }
+            if request.jobID == nil {
+                if let spoken = response.json?["spoken"]?.stringValue, !spoken.isEmpty, spoken != "null" { complete[Self.spokenField] = .string(spoken) }
+                return state.result(.taskDone(answer), message: answer, fields: complete)
+            }
             return state.result(.done, message: answer, fields: complete)
         }
         return state.result(.failed("Couldn't write the answer."))
+    }
+
+    // MARK: - Talking with the user
+
+    /// A quick task's `task_done` carries the spoken result in this field (quick tasks have no
+    /// output fields of their own); the orchestrator takes it out.
+    static let spokenField = "_spoken"
+
+    /// What the user said since the last turn, as notes: the newest results the model reads,
+    /// and the task's notes for later steps.
+    private func deliverNotes(_ request: StepRequest, state: inout LoopState) {
+        guard let conversation = conversation(for: request) else { return }
+        for note in conversation.takeNotes() {
+            state.history.append(HistoryEntry(header: "note from the user: \(note)"))
+            session?.appendNote("From the user: \(note)")
+        }
+    }
+
+    /// `ask_user`: posts the question; with wait, suspends this step (only this one) until the
+    /// user answers. The answer of a question asked without waiting arrives later as a note.
+    private func askUser(_ call: ToolDecision.Call, conversation: TaskConversation, request: StepRequest, callbacks: AgentCallbacks,
+                         gates: CallGates, state: inout LoopState) async throws -> CallOutcome {
+        state.progress.recordNotRun()
+        guard case .object(let a)? = call.arguments,
+              let text = a["question"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+            state.history.append(HistoryEntry(header: "ask_user \(call.argumentsText) → NOT RUN: give the question in “question”"))
+            return .failed("ask_user needs a question")
+        }
+        let options = (a["options"]?.arrayValue ?? []).compactMap { $0.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        // A risky step never lets silence decide.
+        let lowRisk = (a["low_risk"]?.boolValue ?? false) && request.step.risk < .high
+        let fallback = lowRisk ? a["default"]?.stringValue.flatMap { $0.isEmpty || $0 == "null" ? nil : $0 } : nil
+        let wait = a["wait"]?.boolValue ?? false
+        let question = AgentQuestion(text: text, options: Array(options.prefix(4)), defaultOption: fallback, lowRisk: lowRisk)
+        callbacks.log(ActivityEntry(kind: .info, title: "Asked: \(text)", detail: options.isEmpty ? nil : options.joined(separator: " · "),
+                                    route: request.step.route, stepID: request.step.id))
+        guard wait else {
+            conversation.post(question)
+            state.history.append(HistoryEntry(header: "ask_user “\(Self.clip(text, 200))” → asked; keep working on what doesn't depend on it, the answer will arrive as a note"))
+            return .ok
+        }
+        guard let answer = try await waitForAnswer(question, conversation: conversation, request: request, callbacks: callbacks, gates: gates) else {
+            state.history.append(HistoryEntry(header: "ask_user “\(Self.clip(text, 200))” → no answer came; carry on without it or return blocked"))
+            return .ok
+        }
+        state.history.append(HistoryEntry(header: "ask_user “\(Self.clip(text, 200))” → the user answered: \(answer)"))
+        return .ok
+    }
+
+    /// Asks a step's blocking decision as a question instead of ending the step, and returns
+    /// the answer; nil when the step must end blocked after all (it needs the person — a login,
+    /// a CAPTCHA — or it already asked too often, or this is a job step).
+    private func askInstead(_ message: String, request: StepRequest, callbacks: AgentCallbacks, gates: CallGates,
+                            state: inout LoopState) async throws -> String? {
+        guard let conversation = conversation(for: request), state.questionsAsked < Self.maxBlockedQuestions,
+              !UtteranceInterpreter.needsPerson(message) else { return nil }
+        state.questionsAsked += 1
+        callbacks.log(ActivityEntry(kind: .info, title: "Asked: \(message)", route: request.step.route, stepID: request.step.id))
+        return try await waitForAnswer(AgentQuestion(text: message), conversation: conversation, request: request, callbacks: callbacks, gates: gates)
+    }
+
+    /// Posts `question` and waits for its answer. The wait doesn't count toward the task's time
+    /// limit; a Stop while waiting ends the step.
+    private func waitForAnswer(_ question: AgentQuestion, conversation: TaskConversation, request: StepRequest, callbacks: AgentCallbacks,
+                               gates: CallGates) async throws -> String? {
+        callbacks.phase(.executing, "Waiting for your answer…")
+        let start = Date()
+        let answer = await conversation.ask(question, wait: true)
+        session?.extendDeadline(by: Date().timeIntervalSince(start))
+        if Task.isCancelled || gates.isStopped || (answer == nil && conversation.isClosed) { throw AutomationError.stopped }
+        callbacks.phase(.executing, request.step.title + "…")
+        return answer
     }
 
     // MARK: - Helpers
@@ -616,6 +717,8 @@ struct LoopState {
     var usage = LLMUsage()
     var learned: [String] = []
     var fieldsReminded = false
+    /// Blocking decisions this step asked the user about instead of ending blocked.
+    var questionsAsked = 0
     var browser = BrowserRefs()
     /// Whether turns change anything (the loop breaker).
     var progress = ProgressWatch()
@@ -867,6 +970,8 @@ struct ToolDecision: Sendable {
     var resultFieldsUnreadable: Bool
     var message: String?
     var remember: String?
+    /// With task_done: the result said out loud.
+    var spoken: String? = nil
 }
 
 enum ToolDecisionSchema {
@@ -882,12 +987,14 @@ enum ToolDecisionSchema {
             ("result_fields_json", Schema.nullableString("With step_done: a JSON object string with the step's output fields, else null.")),
             ("message", Schema.nullableString("With step_done: what the step produced (facts, numbers, paths). With task_done: the final answer. With blocked: why. Else null.")),
             ("remember", Schema.nullableString("Short facts worth keeping for later steps, else null.")),
+            ("spoken", Schema.nullableString("With task_done: the result said out loud, at most 25 words, plain and warm. Else null.")),
         ])
     }
 
     static let answerSchema: JSONValue = Schema.object([
         ("message", Schema.string("The answer or result, concise and complete.")),
         ("result_fields_json", Schema.nullableString("A JSON object string with the step's output fields when any are listed, else null.")),
+        ("spoken", Schema.nullableString("The result said out loud, at most 25 words, plain and warm.")),
     ])
 
     /// Tolerant decoding: models sometimes send arguments as an object instead of a string, or
@@ -929,7 +1036,7 @@ enum ToolDecisionSchema {
         // error and the model is told what's expected.
         let status = str("status").flatMap { ToolDecision.Status(rawValue: $0.lowercased()) } ?? .act
         return ToolDecision(status: status, thought: str("thought") ?? "", calls: calls, resultFields: fields,
-                            resultFieldsUnreadable: fieldsUnreadable, message: str("message"), remember: str("remember"))
+                            resultFieldsUnreadable: fieldsUnreadable, message: str("message"), remember: str("remember"), spoken: str("spoken"))
     }
 }
 
