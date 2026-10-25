@@ -163,6 +163,12 @@ struct UtteranceInterpreterTests {
         #expect(UtteranceInterpreter.answer("yeah do it", to: approval, source: .voice) == "Yes")
         #expect(UtteranceInterpreter.answer("nope", to: approval, source: .voice) == "No")
         #expect(UtteranceInterpreter.answer("the blue ones", to: approval, source: .voice) == nil, "an approval takes only yes or no")
+        // Replies to an open question count however they're phrased.
+        let who = AgentQuestion(text: "Who should the email go to, and what should it say?")
+        #expect(UtteranceInterpreter.answer("send it to Sneh and say hi, how is the job search going", to: who, source: .voice)
+                == "send it to Sneh and say hi, how is the job search going")
+        #expect(UtteranceInterpreter.answer("write to sneh shah saying hello from glide", to: who, source: .voice) != nil)
+        #expect(UtteranceInterpreter.answer("open Spotify", to: who, source: .voice) == nil)
     }
 
     @Test func spokenSummariesAreShort() {

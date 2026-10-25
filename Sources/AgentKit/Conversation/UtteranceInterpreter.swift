@@ -149,10 +149,20 @@ public enum UtteranceInterpreter {
                 || significantWords(n).isSubset(of: significantWords(normalize(option)))
             return saysOnlyTheOption ? option : trimmed
         }
-        if yesNo(trimmed) != nil { return trimmed }
-        let words = normalize(trimmed).split(separator: " ").count
-        if words <= 6 && !looksLikeRequest(trimmed) { return trimmed }
-        return nil
+        // Glide just asked this, so a reply is the answer however it's phrased ("send it to Sneh
+        // and say hi" starts like a request but answers "who should it go to?"). Only switching
+        // to something else entirely ("open Spotify and play jazz") isn't.
+        if switchesAway(trimmed) { return nil }
+        return trimmed
+    }
+
+    static let switchVerbs: Set<String> = ["open", "launch", "start", "quit", "close"]
+
+    /// "Open Spotify", "launch Xcode": a new instant request rather than a reply.
+    static func switchesAway(_ text: String) -> Bool {
+        let words = normalize(text).split(separator: " ").map(String.init)
+        guard let first = words.first, switchVerbs.contains(first), words.count >= 2 else { return false }
+        return true
     }
 
 
