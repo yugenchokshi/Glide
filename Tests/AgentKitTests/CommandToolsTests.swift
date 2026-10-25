@@ -772,6 +772,7 @@ private let adversarialCases: [AdversarialCase] = [
     .init("long pipeline", Array(repeating: "cat", count: 40_000).joined(separator: " | "), .low),
     .init("embedded shell scripts", "osascript -e '" + rep("do shell script \"", 8000) + "'", .high),
     .init("glob qualifier code", "ls *(" + rep("e:", 30_000) + ")", .high),
+    .init("over the length limit", "echo " + rep("a", 70_000), .blocked),
 ]
 
 @Suite("CommandSafety limits")

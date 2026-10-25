@@ -65,7 +65,9 @@ public enum CommandSafety {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         func done(_ v: ToolVerdict) -> Analysis { Analysis(verdict: v, programs: [], readsClipboard: false, runsScript: false) }
         if trimmed.isEmpty { return done(ToolVerdict(risk: .low, summary: summary)) }
-        if trimmed.unicodeScalars.count > 200_000 {
+        // Real command lines are a few KB at most (files are written with the file tools); a cap
+        // well above that bounds the checker's worst case on adversarial input.
+        if trimmed.unicodeScalars.count > 64_000 {
             return done(ToolVerdict(risk: .high, reasons: ["command too long to check"],
                                     blocked: "This command is too long for Glide to check safely. Put it in a script file instead.", summary: summary))
         }

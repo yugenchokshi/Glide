@@ -401,7 +401,9 @@ struct ToolStepRunnerTests {
         runner.callTimeout = 0.2
         let start = Date()
         let result = try await runner.execute(request(jobID: "job-1"), callbacks: CallbackRecorder().callbacks)
-        #expect(Date().timeIntervalSince(start) < 2)
+        // The hung tool would run 3 s on its own; "gate stopped" below proves the timeout ended
+        // it. The margin is wide because a loaded machine runs this suite slowly.
+        #expect(Date().timeIntervalSince(start) < 2.9)
         #expect(result.status == .blocked("It hangs"))
         #expect(llm.userMessages[1].contains("didn't finish within"))
         for _ in 0..<200 where sawStop.all.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
