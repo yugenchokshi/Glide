@@ -22,6 +22,7 @@ public enum AgentSetup {
             WorkspaceTools.install()
             BrowserTools.install()
             StepRouter.install()
+            InstantActionsSetup.install()
         }
         if startBrowserBridge { ExtensionBridge.shared.start(settings: settings.browser) }
     }

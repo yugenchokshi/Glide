@@ -73,6 +73,25 @@ public final class TaskController {
     /// True while a previous run is still unwinding after Stop.
     public var isWindingDown: Bool { task != nil && !isRunning }
 
+    // MARK: Conversation (see Conversation.swift)
+
+    /// What Glide wants said out loud; the voice layer subscribes.
+    public var onSpeech: ((SpeechCue) -> Void)?
+    /// The question Glide is waiting on, answered by voice, typing or an option chip.
+    public private(set) var pendingQuestion: AgentQuestion?
+
+    /// Everything the user says or types: answers a pending question, steers or stops the
+    /// running task, or starts a new request (instant actions first).
+    public func handleUtterance(_ text: String, source: UtteranceSource) {
+        start(text)
+    }
+
+    /// Answers a specific question (an option chip, or a typed reply to it).
+    public func answer(questionID: String, with text: String) {
+        guard pendingQuestion?.id == questionID else { return }
+        pendingQuestion = nil
+    }
+
     public func start(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         // Refuse while a stopped run is still unwinding: it shares the input gate.

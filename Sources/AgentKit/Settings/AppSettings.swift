@@ -342,6 +342,83 @@ public struct JobSettings: Codable, Sendable, Hashable {
     public init() {}
 }
 
+/// What Glide says out loud. Everything is always shown in the notch either way.
+public enum SpeakMode: String, Codable, Sendable, CaseIterable {
+    case everything
+    case questionsAndResults
+    case questionsOnly
+    case never
+}
+
+public enum VoiceEngine: String, Codable, Sendable, CaseIterable {
+    /// OpenAI text-to-speech with the user's key; Apple's voice when offline or unavailable.
+    case openAI
+    /// Apple's on-device voices only.
+    case apple
+}
+
+/// Voice-first: the open-notch hotkey starts listening, Glide speaks back, and after a question
+/// it listens for the answer without another tap.
+public struct VoiceSettings: Codable, Sendable, Hashable {
+    /// Opening the notch starts listening; typing switches to text.
+    public var listenOnOpen = true
+    public var speakMode: SpeakMode = .questionsAndResults
+    public var engine: VoiceEngine = .openAI
+    /// OpenAI speech model id; empty picks the best available one.
+    public var openAIModel = ""
+    /// OpenAI voice name; empty uses the model's default.
+    public var openAIVoice = ""
+    /// Apple voice identifier for the fallback (and the `.apple` engine); nil picks the best
+    /// installed voice for the user's language.
+    public var appleVoiceID: String?
+    /// After Glide asks something, how long it listens for the answer without a tap (0 = off).
+    public var listenForAnswerSeconds: Double = 8
+    public var speakingRate: Double = 1.0
+
+    public init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case listenOnOpen, speakMode, engine, openAIModel, openAIVoice, appleVoiceID, listenForAnswerSeconds, speakingRate
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func v<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T { ((try? c.decodeIfPresent(T.self, forKey: key)) ?? nil) ?? fallback }
+        let d = VoiceSettings()
+        listenOnOpen = v(.listenOnOpen, d.listenOnOpen)
+        speakMode = v(.speakMode, d.speakMode)
+        engine = v(.engine, d.engine)
+        openAIModel = v(.openAIModel, d.openAIModel)
+        openAIVoice = v(.openAIVoice, d.openAIVoice)
+        appleVoiceID = (try? c.decodeIfPresent(String.self, forKey: .appleVoiceID)) ?? nil
+        listenForAnswerSeconds = v(.listenForAnswerSeconds, d.listenForAnswerSeconds)
+        speakingRate = v(.speakingRate, d.speakingRate)
+    }
+}
+
+/// How Glide asks while it works.
+public struct ConversationSettings: Codable, Sendable, Hashable {
+    /// Seconds before a low-risk question's default is used (0 = always wait for the user).
+    public var defaultAfterSeconds: Double = 15
+    /// Requests within this many minutes of the last task continue its context ("now add two").
+    public var followUpWindowMinutes: Double = 5
+    /// After an instant "open X", ask whether to do anything there.
+    public var offerNextStep = true
+
+    public init() {}
+
+    enum CodingKeys: String, CodingKey { case defaultAfterSeconds, followUpWindowMinutes, offerNextStep }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func v<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T { ((try? c.decodeIfPresent(T.self, forKey: key)) ?? nil) ?? fallback }
+        let d = ConversationSettings()
+        defaultAfterSeconds = v(.defaultAfterSeconds, d.defaultAfterSeconds)
+        followUpWindowMinutes = v(.followUpWindowMinutes, d.followUpWindowMinutes)
+        offerNextStep = v(.offerNextStep, d.offerNextStep)
+    }
+}
+
 public struct AppSettings: Codable, Sendable, Hashable {
     public var providers: [ProviderConfig] = [.anthropicDefault, .openAIDefault]
     public var routing = RoutingSettings()
@@ -359,12 +436,14 @@ public struct AppSettings: Codable, Sendable, Hashable {
     public var tools = ToolSettings()
     public var browser = BrowserSettings()
     public var jobs = JobSettings()
+    public var voice = VoiceSettings()
+    public var conversation = ConversationSettings()
 
     public init() {}
 
     enum CodingKeys: String, CodingKey {
         case providers, routing, safety, limits, hotkeys, composio, mcpServers, cursorMode, completedDismissSeconds
-        case keepHistory, debugScreenshots, onboardingComplete, enableVoiceInput, tools, browser, jobs
+        case keepHistory, debugScreenshots, onboardingComplete, enableVoiceInput, tools, browser, jobs, voice, conversation
     }
 
     /// Tolerant decoding: any missing or unreadable field keeps its default, so settings saved
@@ -389,6 +468,8 @@ public struct AppSettings: Codable, Sendable, Hashable {
         tools = v(.tools, d.tools)
         browser = v(.browser, d.browser)
         jobs = v(.jobs, d.jobs)
+        voice = v(.voice, d.voice)
+        conversation = v(.conversation, d.conversation)
     }
 
     public func provider(_ id: String) -> ProviderConfig? { providers.first { $0.id == id } }
