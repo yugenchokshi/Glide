@@ -119,12 +119,38 @@ final class RealtimeAudioEngine: RealtimeAudioIO {
     func start(onAudio: @escaping @Sendable (Data) -> Void, onLevel: @escaping @Sendable (Float) -> Void,
                onPlaying: @escaping @Sendable (Bool) -> Void) throws {
         stop()
+        do {
+            try start(voiceProcessing: true, onAudio: onAudio, onLevel: onLevel, onPlaying: onPlaying)
+            echoCancelled = true
+        } catch {
+            // Echo cancellation can't run on some setups (Bluetooth headsets, mismatched input and
+            // output rates). Without it the mic would hear Glide, so it's muted while Glide speaks.
+            stop()
+            let muted = HalfDuplexGate()
+            do {
+                try start(voiceProcessing: false, onAudio: { pcm in if !muted.isMuted { onAudio(pcm) } }, onLevel: onLevel,
+                          onPlaying: { playing in muted.set(playing); onPlaying(playing) })
+                echoCancelled = false
+            } catch {
+                let ns = error as NSError
+                throw RealtimeError.closed("\(ns.localizedDescription) (\(ns.domain) \(ns.code))")
+            }
+        }
+    }
+
+    /// False when the mic runs without echo cancellation (and so is muted while Glide speaks).
+    private(set) var echoCancelled = true
+
+    private func start(voiceProcessing: Bool, onAudio: @escaping @Sendable (Data) -> Void, onLevel: @escaping @Sendable (Float) -> Void,
+                       onPlaying: @escaping @Sendable (Bool) -> Void) throws {
         guard let playFormat else { throw RealtimeError.badURL }
         let engine = AVAudioEngine()
         let input = engine.inputNode
-        try input.setVoiceProcessingEnabled(true)
-        // Keep the user's other audio at its volume while the conversation is open.
-        input.voiceProcessingOtherAudioDuckingConfiguration = .init(enableAdvancedDucking: false, duckingLevel: .min)
+        if voiceProcessing {
+            try input.setVoiceProcessingEnabled(true)
+            // Keep the user's other audio at its volume while the conversation is open.
+            input.voiceProcessingOtherAudioDuckingConfiguration = .init(enableAdvancedDucking: false, duckingLevel: .min)
+        }
         let player = AVAudioPlayerNode()
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: playFormat)
@@ -192,4 +218,22 @@ final class RealtimeAudioEngine: RealtimeAudioIO {
         player = nil
         tap = nil
     }
+}
+
+
+/// Mutes mic upload while Glide's voice plays (plus a short tail for the room's echo), for
+/// setups without echo cancellation.
+final class HalfDuplexGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var playing = false
+    private var quietSince = Date.distantPast
+
+    func set(_ isPlaying: Bool) {
+        lock.withLock {
+            if playing && !isPlaying { quietSince = Date() }
+            playing = isPlaying
+        }
+    }
+
+    var isMuted: Bool { lock.withLock { playing || Date().timeIntervalSince(quietSince) < 0.3 } }
 }
