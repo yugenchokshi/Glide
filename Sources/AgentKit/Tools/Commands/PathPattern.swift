@@ -71,7 +71,13 @@ struct PathPattern: Sendable, Hashable {
     /// alternatives to check.
     static func make(base: [Component], text: String, glob: Bool, extendedGlob: Bool, dots: Bool = false) -> [PathPattern]? {
         guard let alternatives = glob ? expandBraces(text) : [text] else { return nil }
-        return alternatives.map { alt in
+        return make(base: base, alternatives: alternatives, glob: glob, extendedGlob: extendedGlob, dots: dots)
+    }
+
+    /// `make` for alternatives already brace-expanded (`braceAlternatives`), so a caller that
+    /// matches under several folders expands the text once.
+    static func make(base: [Component], alternatives: [String], glob: Bool, extendedGlob: Bool, dots: Bool = false) -> [PathPattern] {
+        alternatives.map { alt in
             var dynamic = base.contains(.anywhere)
             let tokens = tokenize(alt, glob: glob, extendedGlob: extendedGlob, dynamic: &dynamic)
             var comps = base
@@ -132,25 +138,48 @@ struct PathPattern: Sendable, Hashable {
     /// nesting deeper than `maxBraceDepth` or more than `limit` alternatives returns nil, so a
     /// long run of `{1..2}` or `{a,{a,…}}` can neither recurse without bound nor take long.
     static func expandBraces(_ text: String, limit: Int = PathPattern.braceLimit) -> [String]? {
+        if case .alternatives(let a) = braceAlternatives(text, limit: limit) { return a }
+        return nil
+    }
+
+    /// What brace expansion of a word comes to.
+    enum BraceExpansion: Equatable {
+        case alternatives([String])
+        /// More than `limit` alternatives, or nested deeper than `maxBraceDepth`.
+        case tooMany
+        /// The alternatives together would be longer than `maxLength` characters (a long word
+        /// times a few dozen alternatives is megabytes).
+        case tooLong
+    }
+
+    /// `expandBraces`, also bounded by the total length of what it builds, and saying which
+    /// limit stopped it. The length is checked before each step builds anything.
+    static func braceAlternatives(_ text: String, limit: Int = PathPattern.braceLimit, maxLength: Int = .max) -> BraceExpansion {
         let chars = Array(text)
-        guard chars.contains("{") else { return [text] }
+        guard chars.contains("{") else { return .alternatives([text]) }
         // The `}` matching each `{` (an unmatched `{` is literal text).
         var close = [Int](repeating: -1, count: chars.count)
         var open: [Int] = []
         for (k, ch) in chars.enumerated() {
             if ch == "{" { open.append(k) } else if ch == "}", let o = open.popLast() { close[o] = k }
         }
+        var tooLong = false
 
-        /// Alternatives for chars[lo..<hi]; nil once over the limit or too deep.
+        /// Alternatives for chars[lo..<hi]; nil once over a limit or too deep.
         func expand(_ lo: Int, _ hi: Int, depth: Int) -> [String]? {
             if depth > maxBraceDepth { return nil }
             var results = [""]
+            // Characters across all of `results`.
+            var length = 0
             var literal = ""
             var i = lo
-            func flush() {
-                guard !literal.isEmpty else { return }
+            func flush() -> Bool {
+                guard !literal.isEmpty else { return true }
+                length += results.count * literal.utf8.count
+                guard length <= maxLength else { tooLong = true; return false }
                 for k in results.indices { results[k] += literal }
                 literal = ""
+                return true
             }
             while i < hi {
                 let ch = chars[i]
@@ -181,20 +210,28 @@ struct PathPattern: Sendable, Hashable {
                     continue
                 }
                 var alternatives: [String] = []
+                var alternativesLength = 0
                 for (a, b) in parts {
                     guard let more = expand(a, b, depth: depth + 1) else { return nil }
                     alternatives += more
+                    alternativesLength += more.reduce(0) { $0 + $1.utf8.count }
                     if alternatives.count > limit { return nil }
+                    guard alternativesLength <= maxLength else { tooLong = true; return nil }
                 }
-                flush()
+                guard flush() else { return nil }
                 guard results.count * alternatives.count <= limit else { return nil }
+                // Every result gets every alternative appended.
+                let product = length * alternatives.count + alternativesLength * results.count
+                guard product <= maxLength else { tooLong = true; return nil }
                 results = results.flatMap { r in alternatives.map { r + $0 } }
+                length = product
                 i = end + 1
             }
-            flush()
+            guard flush() else { return nil }
             return results
         }
-        return expand(0, chars.count, depth: 0)
+        if let results = expand(0, chars.count, depth: 0) { return .alternatives(results) }
+        return tooLong ? .tooLong : .tooMany
     }
 
     /// Index of the bracket closing the one at `from` (or `chars.count` when unbalanced).
@@ -405,8 +442,21 @@ struct PathPattern: Sendable, Hashable {
             default: return false
             }
         }
+        // Each character, `?` or set takes one character of the name, so more of them than the
+        // name has can't match. Counted first, stopping as soon as that's clear, so a pattern
+        // name thousands of characters long is turned down at once.
+        var consuming = 0
+        var allLiteral = true
+        for tok in tokens {
+            switch tok {
+            case .star, .any: allLiteral = false
+            case .char: consuming += 1
+            case .one, .set: consuming += 1; allLiteral = false
+            }
+            if consuming > n.count { return false }
+        }
         // All literal (the usual case): a plain comparison.
-        if tokens.allSatisfy({ if case .char = $0 { return true }; return false }) {
+        if allLiteral {
             guard tokens.count == n.count else { return false }
             for (t, ch) in zip(tokens, n) { if case .char(let c) = t, c != ch { return false } }
             return true

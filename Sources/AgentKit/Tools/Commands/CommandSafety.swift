@@ -79,6 +79,7 @@ public enum CommandSafety {
         let options = trimmed.lowercased().replacingOccurrences(of: "_", with: "")
         checker.dotGlob = options.contains("globdots") || options.contains("dotglob")
         checker.extendedGlob = options.contains("extendedglob") || options.contains("extglob")
+        checker.grepOptionsMayBeSet = options.contains("grepoptions")
         if parse.tooComplex { checker.acc.raise(.high, "nested too deeply to check") }
         checker.check(parse.list, depth: 0)
         checker.finish()
@@ -174,20 +175,20 @@ struct RiskAccumulator {
 struct ShellRiskChecker {
     let home: String
     /// Current directory for relative paths; nil once a `cd` went somewhere unknowable.
-    var cwd: String?
+    var cwd: String? { didSet { pathStateVersion &+= 1 } }
     var acc = RiskAccumulator()
     /// Files a download wrote earlier in the same line (`curl -o x.sh … && sh x.sh`).
     var downloadedFiles: Set<String> = []
     /// Every program the line runs, by lowercased base name.
     var programs: Set<String> = []
     /// Folder before the last `cd`, for `cd -` and zsh's `~-`.
-    var oldCwd: String?
+    var oldCwd: String? { didSet { pathStateVersion &+= 1 } }
     /// Set when `cd` went to a glob or a partly run-time path: the folders it may be in.
-    var cwdPatterns: [PathPattern]?
+    var cwdPatterns: [PathPattern]? { didSet { pathStateVersion &+= 1 } }
     /// Extra folders a relative path may be under because a `cd` might not have taken effect (a
     /// missing folder, a file, a `cd` in a pipeline) and nothing stopped the next command from
     /// running anyway: the folders the shell was in before the cd.
-    var cwdAlternates: [PathPattern] = []
+    var cwdAlternates: [PathPattern] = [] { didSet { pathStateVersion &+= 1 } }
     /// Folders a `cd` joined by `&&` left behind: if it failed, the rest of the `&&` chain never
     /// runs, so they come back (into `cwdAlternates`) only once the chain ends (`;`, `||`, `&`…).
     var cwdIfChainFailed: [PathPattern] = []
@@ -195,14 +196,22 @@ struct ShellRiskChecker {
     /// could be anywhere from here on.
     var cwdLost = false
     /// Texts of words with unquoted glob characters (see `ShellWord.globbed`).
-    var globbedTexts: Set<String> = []
+    var globbedTexts: Set<String> = [] { didSet { pathStateVersion &+= 1 } }
     /// Texts of words with a zsh `(D)` qualifier, whose wildcards also match hidden names.
-    var dotQualifiedTexts: Set<String> = []
+    var dotQualifiedTexts: Set<String> = [] { didSet { pathStateVersion &+= 1 } }
     /// Variables the line set to fixed text (`d=~/.ssh`), so `$d/x` can be judged as a path.
-    var vars: [String: String] = [:]
+    var vars: [String: String] = [:] { didSet { pathStateVersion &+= 1 } }
     /// The line turns on `GLOB_DOTS`/`dotglob` or extended globbing somewhere.
     var dotGlob = false
-    var extendedGlob = false
+    var extendedGlob = false { didSet { pathStateVersion &+= 1 } }
+    /// Changes whenever something `pathForm` reads changes (the folders, variables, which words
+    /// are globs), so a result kept in `pathFormCache` is never used after it went stale.
+    var pathStateVersion = 0
+    var pathFormCache: [String: PathForm] = [:]
+    var pathFormCacheVersion = -1
+    /// The line mentions `GREP_OPTIONS`, which macOS grep reads for extra options (`-H` makes
+    /// `grep -c` print file names), so grep's output isn't trusted to be only numbers.
+    var grepOptionsMayBeSet = false
     /// Command text written as quoted data (`'$(cmd)'`), and whether the line evaluates
     /// arithmetic, which runs such text through array subscripts (see `finish`).
     var literalCode: [String] = []
@@ -240,6 +249,10 @@ struct ShellRiskChecker {
     /// A compound command (`if`, a loop, a function…) appeared: code after it may have skipped
     /// code before it, so `cd x || exit` no longer proves where later commands run.
     var sawStructure = false
+    /// `set -e` (errexit) is on for the rest of the line: it ran at the top level, and nothing
+    /// since could have turned it off (`set +e`, `eval`, `source`, `emulate`…). A failed `cd`
+    /// on its own then ends the script, so what follows runs only in the new folder.
+    var errexit = false
     /// Work done so far, in units of about four characters read or one path comparison. Past
     /// `workLimit` the rest of the line isn't checked and the verdict is high ("too complex to
     /// check"), so even a line built to be slow (nesting that re-reads text, thousands of
@@ -328,17 +341,24 @@ struct ShellRiskChecker {
         for (pi, pipeline) in pipelines.enumerated() {
             if outOfWork { return }
             // A lone `cd` followed by `&&` gates what comes next: if it failed, nothing later in
-            // the chain runs. `cd x || exit` does so for the rest of the list. Neither holds when
-            // an `||` before it may have skipped the `cd` (`a || cd x && …`).
+            // the chain runs. `cd x || exit` (or `|| { …; exit 1; }`) does so for the rest of the
+            // list, and so does a plain `cd x` under `set -e`. None holds when an `||` before it
+            // may have skipped the `cd` (`a || cd x && …`).
             if pipeline.commands.contains(where: Self.startsStructure) { sawStructure = true }
+            // Only on the command line itself, before any branch, loop or function: a `cd x ||
+            // exit` (or a `set -e`) in code that may never run (`if false; then …`, a function
+            // body, a trap) says nothing about where later commands run.
+            let topLevel = depth == 0 && !sawStructure && loopDepth == 0
+            // Runs whenever the line gets here: not after `&&`/`||`, not in the background or a
+            // pipeline (where `set -e` and `cd` change only a subshell).
+            let standalone = pipeline.commands.count == 1 && !["&&", "||"].contains(previousConnector)
+                && ["", ";", "\n"].contains(pipeline.connector)
             var gate = CDGate.none
             if pipeline.commands.count == 1, previousConnector != "||" {
                 if pipeline.connector == "&&" { gate = .chain }
-                // Only on the command line itself, before any branch, loop or function: a `cd x ||
-                // exit` in code that may never run (`if false; then …`, a function body, a trap)
-                // says nothing about where later commands run.
-                if pipeline.connector == "||", depth == 0, !sawStructure, loopDepth == 0,
-                   pi + 1 < pipelines.count, Self.exitsShell(pipelines[pi + 1]) { gate = .exits }
+                if pipeline.connector == "||", topLevel, pi + 1 < pipelines.count, Self.exitsAfterFailure(pipelines, at: pi + 1) { gate = .exits }
+                // Under `set -e` a failed `cd` on its own ends the script.
+                if errexit, topLevel, standalone { gate = .exits }
             }
             var sawDownload = false
             var pipedText: String?
@@ -347,6 +367,7 @@ struct ShellRiskChecker {
                 if isDownloadish(cmd) { sawDownload = true }
                 if let t = literalOutput(cmd) { pipedText = t }
             }
+            if topLevel, standalone, let cmd = pipeline.commands.first, turnsOnErrexit(cmd) { errexit = true }
             forkBombCheck(pipeline)
             // The `&&` chain ends here: a `cd` in it that failed leaves the shell where it was.
             if pipeline.connector != "&&" { endChain() }
@@ -370,7 +391,8 @@ struct ShellRiskChecker {
         case none
         /// `cd x && …`: the rest of the `&&` chain runs only if it worked.
         case chain
-        /// `cd x || exit`: nothing after it runs unless it worked.
+        /// `cd x || exit`, `cd x || { …; exit 1; }`, or `cd x` under `set -e`: nothing after it
+        /// runs unless it worked.
         case exits
     }
 
@@ -393,6 +415,91 @@ struct ShellRiskChecker {
         let words = cmd.words.filter { !$0.text.isEmpty }
         guard let first = words.first, !first.quoted, first.text == "exit" || first.text == "return", words.count <= 2 else { return false }
         return words.count == 1 || words[1].text.allSatisfy(\.isNumber)
+    }
+
+    /// What runs when the command before an `||` fails ends the shell: `exit [n]`, or a brace
+    /// group whose last command is (`cd x || { echo 'no x' >&2; exit 1; }`). The group isn't a
+    /// subshell, so its `exit` ends the script; one in `( … )` would only end the subshell.
+    /// The `exit` must run whatever came before it in the group (not after `&&`/`||`), and the
+    /// group must run in this shell (not backgrounded or piped).
+    static func exitsAfterFailure(_ pipelines: [ShellPipeline], at start: Int) -> Bool {
+        let first = pipelines[start]
+        if exitsShell(first) { return true }
+        guard first.commands.count >= 1, let head = first.commands.first?.words.first, !head.quoted, head.text == "{" else { return false }
+        func isBrace(_ p: ShellPipeline, _ text: String) -> Bool {
+            p.commands.first?.words.first.map { !$0.quoted && $0.text == text } ?? false
+        }
+        // The group as written: its first pipeline without the `{`, up to a `}` of its own.
+        var inner = first
+        inner.commands[0].words.removeFirst()
+        var k = start + 1
+        var previous: ShellPipeline?
+        while k < pipelines.count {
+            let p = pipelines[k]
+            if p.commands.count == 1, p.commands[0].words.count == 1, isBrace(p, "}") {
+                // The `}` ends the group, which runs in this shell; its last command exits, and
+                // nothing before it could skip that.
+                guard p.connector != "&", !["&&", "||"].contains(previous?.connector ?? ";") else { return false }
+                return exitsShell(inner)
+            }
+            // Nested groups aren't followed: the `}` found might be theirs.
+            if isBrace(p, "{") { return false }
+            previous = inner
+            inner = p
+            k += 1
+        }
+        return false
+    }
+
+    /// `set -e`, `set -o errexit`, a cluster with `e` (`set -euo pipefail`) or zsh's `setopt
+    /// errexit`, as the shell's own builtin: from then on a failed command ends the script.
+    func turnsOnErrexit(_ cmd: ShellCommand) -> Bool {
+        let words = cmd.words.filter { !$0.text.isEmpty }
+        guard cmd.groups.isEmpty, let first = words.first, !first.quoted, ["set", "setopt"].contains(first.text),
+              !functionNames.contains(first.text) else { return false }
+        return Self.errexitChange(first.text, words.dropFirst().map(\.text)) == true
+    }
+
+    /// How `set`/`setopt`/`unsetopt`/`shopt` arguments leave errexit: true (on), false (off or
+    /// unknown, as with an option name only known at run time), nil (not touched).
+    static func errexitChange(_ prog: String, _ a: [String]) -> Bool? {
+        func isErrexit(_ s: String) -> Bool { s.lowercased().replacingOccurrences(of: "_", with: "") == "errexit" }
+        var result: Bool?
+        if a.contains(where: hasRunTimeParts) { return false }
+        switch prog {
+        case "set":
+            var idx = 0
+            while idx < a.count {
+                let x = a[idx]
+                idx += 1
+                if x == "--" || x == "-" { break }
+                // zsh's `set -A name values…` assigns an array: what follows isn't options.
+                guard let sign = x.first, sign == "-" || sign == "+", x.count > 1, !x.contains("A") else { break }
+                let on = sign == "-"
+                if x.dropFirst() == "o" {
+                    if idx < a.count, isErrexit(a[idx]) { result = on }
+                    idx += 1
+                    continue
+                }
+                if x.dropFirst().contains("e") { result = on }
+                // `-o` inside a cluster (`-euo pipefail`) takes the next word as its option.
+                if x.dropFirst().contains("o"), idx < a.count {
+                    if isErrexit(a[idx]) { result = on }
+                    idx += 1
+                }
+            }
+        case "setopt", "unsetopt":
+            for x in a {
+                let name = x.lowercased().replacingOccurrences(of: "_", with: "")
+                if name == "errexit" { result = prog == "setopt" }
+                if name == "noerrexit" { result = prog != "setopt" }
+            }
+        case "shopt":
+            if a.contains(where: isErrexit) { result = false }
+        default:
+            break
+        }
+        return result
     }
 
     /// `:(){ :|:& };:` and named variants: a function defined on the line whose name is piped
@@ -455,11 +562,12 @@ struct ShellRiskChecker {
         var anySubstitution = false
         for w in allWords {
             var wordDownloads = false
+            var wordNumeric = !w.substitutions.isEmpty
             for s in w.substitutions {
                 checkSubshell(s, depth: depth + 1)
                 if listDownloads(s) { subsDownload = true; wordDownloads = true }
                 anySubstitution = true
-                if !numericOutput(s) { subsNumeric = false }
+                if !numericOutput(s) { subsNumeric = false; wordNumeric = false }
             }
             if w.globbed { globbedTexts.insert(w.text) }
             for q in w.qualifiers {
@@ -470,18 +578,19 @@ struct ShellRiskChecker {
                 literalCode += Self.literalCode(in: w.text).prefix(Self.maxLiteralCode - literalCode.count)
             }
             // `$(( … ))`, `$[ … ]` and subscripts evaluate arithmetic: note what they read, and
-            // a substitution inside them (zsh runs it, then evaluates its output).
+            // a substitution inside them (zsh runs it, then evaluates its output) unless every
+            // substitution in the word prints only numbers (`$(( $(date +%s) - start ))`).
             let segments = Self.arithmeticSegments(w.text)
             if !segments.isEmpty {
                 arithmetic = true
-                for seg in segments { noteArithmetic(seg, downloads: wordDownloads) }
+                for seg in segments { noteArithmetic(seg, downloads: wordDownloads, numeric: wordNumeric) }
             }
             if Self.mentionsClipboard(w.text) { mentionsClipboard = true }
             expansionRules(w.text, depth: depth)
         }
         if cmd.arithmetic {
             arithmetic = true
-            noteArithmetic(cmd.arithmeticText ?? "", downloads: subsDownload)
+            noteArithmetic(cmd.arithmeticText ?? "", downloads: subsDownload, numeric: anySubstitution && subsNumeric)
         }
         if let h = cmd.heredoc, Self.mentionsClipboard(h) { mentionsClipboard = true }
         for g in cmd.groups { checkSubshell(g, depth: depth + 1) }
@@ -508,7 +617,7 @@ struct ShellRiskChecker {
             let first = words[start]
             // Assignment values that are command substitutions were already checked above.
             if Self.isAssignment(first.text) {
-                assignment(first.text, persists: onlyAssignments, depth: depth,
+                assignment(assignmentText(first), persists: onlyAssignments, depth: depth,
                            valueIsCommandOutput: !first.substitutions.isEmpty && !numericAssignment(first),
                            valueSubDownloads: first.substitutions.contains(where: listDownloads))
                 start += 1
@@ -526,7 +635,27 @@ struct ShellRiskChecker {
             case "[[", "[":
                 // A condition; anything after its closing bracket (zsh short forms) still runs.
                 let close = first.text == "[[" ? "]]" : "]"
-                guard let end = words[start...].firstIndex(where: { $0.text == close && !$0.quoted }) else { return }
+                guard let end = words[start...].firstIndex(where: { $0.text == close && !$0.quoted }) else {
+                    // A `[[` that never closes swallowed the line's `&&`, `||` and `(` as its own
+                    // words. The shell rejects it, but what follows them is judged as commands
+                    // anyway rather than waved through.
+                    if first.text == "[[" {
+                        acc.raise(.high, "too complex to check (a [[ condition that never closes)")
+                        let ctx = Context(piped: piped, pipedFromDownload: pipedFromDownload, heredoc: nil, hereString: nil,
+                                          substitutionDownloads: subsDownload, depth: depth)
+                        var segment: [String] = []
+                        for w in words[(start + 1)...] {
+                            if !w.quoted, ["&&", "||", "|", "(", ")", "!"].contains(w.text) {
+                                if !segment.isEmpty { checkWords(segment, ctx: ctx) }
+                                segment = []
+                            } else {
+                                segment.append(w.text)
+                            }
+                        }
+                        if !segment.isEmpty { checkWords(segment, ctx: ctx) }
+                    }
+                    return
+                }
                 conditionRules(words[(start + 1)..<end], doubleBracket: first.text == "[[")
                 start = end + 1
             case "function", "repeat":
@@ -565,7 +694,26 @@ struct ShellRiskChecker {
                           hereString: cmd.hereString?.text, substitutionDownloads: subsDownload, depth: depth)
         ctx.cdGate = negated ? .none : cdGate
         ctx.substitutionsNumeric = anySubstitution && subsNumeric
-        checkWords(words[start...].map(\.text), ctx: ctx)
+        checkWords(words[start...].map { Self.isAssignment($0.text) ? assignmentText($0) : $0.text }, ctx: ctx)
+    }
+
+    /// An assignment word's text with `$(pwd)` written as `$PWD`, which it equals, so
+    /// `PYTHONPATH="$(pwd)/src"` is judged by the folder it names. Only when every substitution
+    /// in the word is a plain `pwd` (and `pwd` wasn't redefined on the line).
+    func assignmentText(_ word: ShellWord) -> String {
+        guard !word.substitutions.isEmpty, !functionNames.contains("pwd"), word.substitutions.allSatisfy(Self.isPlainPwd) else { return word.text }
+        let marks = word.text.components(separatedBy: "$(…)").count - 1 + (word.text.components(separatedBy: "`…`").count - 1)
+        // A placeholder for each substitution and no more: a quoted `'$(…)'` is only text.
+        guard marks == word.substitutions.count else { return word.text }
+        return word.text.replacingOccurrences(of: "$(…)", with: "$PWD").replacingOccurrences(of: "`…`", with: "$PWD")
+    }
+
+    /// `pwd` or `pwd -L` on its own: prints the folder the shell is in, like `$PWD`.
+    static func isPlainPwd(_ list: ShellList) -> Bool {
+        guard list.pipelines.count == 1, let p = list.pipelines.first, p.commands.count == 1, let c = p.commands.first,
+              c.redirects.isEmpty, c.groups.isEmpty, c.heredoc == nil, c.hereString == nil, !c.arithmetic else { return false }
+        let texts = c.words.map(\.text)
+        return texts == ["pwd"] || texts == ["pwd", "-L"]
     }
 
     /// The words between `[[`/`[` and the closing bracket. zsh's `[[ … ]]` evaluates the
@@ -580,16 +728,20 @@ struct ShellRiskChecker {
             arithmetic = true
             let sides = op.text == "-v" ? [k + 1] : [k - 1, k + 1]
             for j in sides where j >= 0 && j < operands.count {
-                noteArithmetic(operands[j].text, downloads: operands[j].substitutions.contains(where: listDownloads))
+                let subs = operands[j].substitutions
+                noteArithmetic(operands[j].text, downloads: subs.contains(where: listDownloads), numeric: !subs.isEmpty && subs.allSatisfy(numericOutput))
             }
         }
     }
 
     /// Records an arithmetic expression: the names it reads (checked against run-time
-    /// variables in `finish`) and whether a substitution feeds it.
-    mutating func noteArithmetic<S: StringProtocol>(_ expr: S, downloads: Bool) {
+    /// variables in `finish`) and whether a substitution feeds it. With `numeric`, every
+    /// substitution feeding it prints only numbers (`(( $(wc -l < f) > 100 ))`), which can't
+    /// name a variable or subscript, so evaluating that output runs nothing — the same trust
+    /// `x=$(wc -l < f); (( x > 100 ))` gets.
+    mutating func noteArithmetic<S: StringProtocol>(_ expr: S, downloads: Bool, numeric: Bool = false) {
         arithmeticReads.formUnion(Self.arithmeticNames(expr))
-        if Self.hasSubstitutionMarker(expr) {
+        if !numeric, Self.hasSubstitutionMarker(expr) {
             arithmeticHasSubstitution = true
             if downloads { arithmeticSubDownloads = true }
         }
@@ -616,7 +768,7 @@ struct ShellRiskChecker {
             || globbedTexts.contains(rawProgram) {
             acc.raise(.high, "runs a program chosen at run time")
             // A variable set earlier on the line is known, so judge what it names as well.
-            let known = substituteVariables(rawProgram)
+            guard let known = substituteVariables(rawProgram) else { acc.raise(.high, "too complex to check"); return }
             if known != rawProgram, !Self.hasRunTimeParts(known) {
                 checkText(([known] + rest).joined(separator: " "), depth: ctx.depth + 1)
             }
@@ -640,15 +792,22 @@ struct ShellRiskChecker {
         }
         // Any operand naming private keys or credentials. Listing programs print names, sizes
         // and dates, never contents, so a glob that merely could reach a key folder is fine for
-        // them (`du -sh ~/Library/*` reads no more than `du -sh ~/Library`).
-        let contents = !Self.metadataPrograms.contains(prog)
-        for a in rest where !a.hasPrefix("-") { readCheck(a, contents: contents) }
+        // them (`du -sh ~/Library/*` reads no more than `du -sh ~/Library`), and those that
+        // never open a file are fine on the key folder itself (`ls -la ~/.ssh`, GitHub's check
+        // for existing keys, or `test -f ~/.ssh/id_ed25519`, like `[ -f … ]`).
+        if !Self.namesOnlyPrograms.contains(prog) {
+            let contents = !Self.metadataPrograms.contains(prog)
+            for a in rest where !a.hasPrefix("-") { readCheck(a, contents: contents) }
+        }
 
         rules(prog, rest, ctx)
     }
 
     /// Programs that only report names and metadata (`wc` reads files but prints counts).
     static let metadataPrograms: Set<String> = ["ls", "du", "stat", "mdls", "wc"]
+    /// Of those, the ones that never read a file's contents at all (and `test`, which only asks
+    /// whether a file exists or what kind it is). `wc` reads them, so it isn't one.
+    static let namesOnlyPrograms: Set<String> = ["ls", "du", "stat", "mdls", "test"]
 
     // MARK: Wrappers
 
@@ -824,7 +983,7 @@ struct ShellRiskChecker {
         if ctx.substitutionDownloads { acc.block(Self.downloadIntoShell, reason: "evaluates downloaded content") }
         if Self.hasRunTimeParts(text) { acc.raise(.high, "evaluates text built at run time (\(what))") }
         checkText(text, depth: ctx.depth + 1)
-        let known = substituteVariables(text)
+        guard let known = substituteVariables(text) else { acc.raise(.high, "too complex to check"); return }
         if known != text { checkText(known, depth: ctx.depth + 1) }
     }
 
@@ -1271,10 +1430,14 @@ struct ShellRiskChecker {
         case "python", "python2", "python3", "perl", "ruby", "node", "php", "lua", "rscript", "tclsh", "pwsh", "deno", "bun", "swift", "nodejs":
             interpreterRules(prog, a, ctx)
         case "eval":
+            // Text run here could turn `set -e` off, whether or not it can be read.
+            errexit = false
             evaluate(a.joined(separator: " "), what: "eval", ctx)
         case "emulate":
             // `emulate zsh -c 'cmd'` runs cmd with that shell's options; without -c it only
-            // switches options. ksh emulation may make `[` evaluate arithmetic.
+            // switches options (resetting errexit among them). ksh emulation may make `[`
+            // evaluate arithmetic.
+            errexit = false
             if a.contains(where: { Self.arithmeticTestShells.contains($0) || Self.hasRunTimeParts($0) }) { testIsArithmetic = true }
             var idx = 0
             while idx < a.count {
@@ -1287,6 +1450,8 @@ struct ShellRiskChecker {
                 }
             }
         case "source", ".":
+            // A sourced script runs in this shell and may turn `set -e` off.
+            errexit = false
             if ctx.substitutionDownloads { acc.block(Self.downloadIntoShell, reason: "sources downloaded content") }
             if let f = a.first {
                 if f == "/dev/stdin" || f == "-" {
@@ -1396,6 +1561,9 @@ struct ShellRiskChecker {
         case "printf":
             if let i = a.firstIndex(of: "-v"), i + 1 < a.count { assignsUnknown(a[i + 1], ctx) }
         case "set":
+            // Turning errexit on only counts at the top of the line (see `check(_:depth:)`);
+            // turning it off counts anywhere, even where it may not run.
+            if Self.errexitChange("set", a) == false { errexit = false }
             if a.contains(where: { $0 == "-o" || $0 == "+o" }), a.contains(where: Self.hasRunTimeParts) { dotGlob = true; extendedGlob = true }
             // zsh `set -A name values…` assigns an array (`set -A path /tmp/x` changes PATH).
             if let i = a.firstIndex(where: { $0 == "-A" || $0 == "+A" }), i + 1 < a.count {
@@ -1410,16 +1578,17 @@ struct ShellRiskChecker {
         case "let":
             // Every argument is an arithmetic expression, substitutions in it included.
             arithmetic = true
-            for x in a { noteArithmetic(x, downloads: ctx.substitutionDownloads) }
+            for x in a { noteArithmetic(x, downloads: ctx.substitutionDownloads, numeric: ctx.substitutionsNumeric) }
         case "test":
             // Like `[`: only `-v` evaluates (a subscript), unless a ksh-like shell runs it.
             for (k, op) in a.enumerated() where Self.arithmeticTests.contains(op) && (op == "-v" || testIsArithmetic) {
                 arithmetic = true
                 for j in (op == "-v" ? [k + 1] : [k - 1, k + 1]) where j >= 0 && j < a.count {
-                    noteArithmetic(a[j], downloads: ctx.substitutionDownloads)
+                    noteArithmetic(a[j], downloads: ctx.substitutionDownloads, numeric: ctx.substitutionsNumeric)
                 }
             }
         case "setopt", "unsetopt", "shopt":
+            if Self.errexitChange(prog, a) == false { errexit = false }
             // An option name built at run time could be GLOB_DOTS or extended globbing.
             if a.contains(where: Self.hasRunTimeParts) { dotGlob = true; extendedGlob = true }
         case "unset":
@@ -1640,7 +1809,8 @@ struct ShellRiskChecker {
             if f == "-host", !rest.isEmpty { rest.removeFirst() }
         }
         let sub = rest.first?.lowercased() ?? ""
-        let domain = rest.count > 1 ? substituteVariables(rest[1]) : ""
+        // Too long to fill in: judged as a domain only known at run time.
+        let domain = rest.count > 1 ? substituteVariables(rest[1]) ?? "$(…)" : ""
         switch sub {
         case "", "read", "read-type", "domains", "find", "help":
             return
@@ -2029,7 +2199,7 @@ struct ShellRiskChecker {
                 let saved = folderState
                 checkText(s, depth: ctx.depth + 1)
                 folderState = saved
-                let known = substituteVariables(s)
+                guard let known = substituteVariables(s) else { acc.raise(.high, "too complex to check"); return }
                 if known != s {
                     checkText(known, depth: ctx.depth + 1)
                     folderState = saved
@@ -2406,7 +2576,7 @@ struct ShellRiskChecker {
         case .patterns(let ps):
             guard spend(ps.count * criticalTargets.count) else { return false }
             return ps.contains { !$0.dynamic && mayBeCriticalTree($0) }
-        case .unknown:
+        case .unknown, .tooComplex:
             return false
         }
     }
@@ -2417,6 +2587,8 @@ struct ShellRiskChecker {
         switch pathForm(raw) {
         case .unknown:
             acc.raise(.medium, "\(what) a path set at run time")
+            return
+        case .tooComplex:
             return
         case .literal(let s):
             guard let p = resolve(s) else {
@@ -2456,7 +2628,7 @@ struct ShellRiskChecker {
         guard spend(1) else { return }
         let stripped = PathRules.stripTrailingGlob(raw)
         switch pathForm(stripped, globbed: globbedTexts.contains(raw)) {
-        case .unknown:
+        case .unknown, .tooComplex:
             return
         case .literal(let s):
             guard let p = resolve(s) else { return }
@@ -2494,7 +2666,7 @@ struct ShellRiskChecker {
     mutating func readCheck(_ raw: String, contents: Bool = true) {
         guard spend(1) else { return }
         switch pathForm(raw) {
-        case .unknown:
+        case .unknown, .tooComplex:
             return
         case .literal(let s):
             guard s.contains("/") || s.hasPrefix("~") || s.hasPrefix(".") || cwd.map({ PathRules.isSecret($0, home: home) }) == true,
@@ -2520,13 +2692,52 @@ struct ShellRiskChecker {
         case patterns([PathPattern])
         /// Starts with something only known at run time (`$dir/x`); nothing reliable to say.
         case unknown
+        /// Too long to work out within the limits (variables filled in thousands of times, a
+        /// long word times many brace alternatives or folders). Already raised as high, "too
+        /// complex to check"; the caller adds nothing.
+        case tooComplex
     }
+
+    /// Most characters of patterns one word may be matched as: its text, times its brace
+    /// alternatives, times the folders it may be under. Real paths are under 1 KB.
+    static let maxPatternText = 1_000_000
+    /// Most `pathForm` results kept for reuse before the cache is emptied.
+    static let maxCachedPathForms = 256
 
     /// How the shell will see `raw`: the text itself, or the patterns it could expand to.
     /// `globbed` overrides the word's own flag (for a word already cut down, like `~/L*/*`).
-    func pathForm(_ raw: String, globbed: Bool? = nil) -> PathForm {
+    /// The same word is usually asked about more than once (a read check, then the delete or
+    /// write rules), so results are kept until something they depend on changes.
+    mutating func pathForm(_ raw: String, globbed: Bool? = nil) -> PathForm {
+        if pathFormCacheVersion != pathStateVersion || pathFormCache.count >= Self.maxCachedPathForms {
+            pathFormCache.removeAll(keepingCapacity: true)
+            pathFormCacheVersion = pathStateVersion
+        }
+        let key = (globbed.map { $0 ? "g" : "t" } ?? "-") + raw
+        let form: PathForm
+        if let cached = pathFormCache[key] {
+            form = cached
+        } else {
+            form = computePathForm(raw, globbed: globbed)
+            // Computing it may have spent the budget or raised; neither changes what it depends on.
+            pathFormCache[key] = form
+        }
+        // Callers compare a literal's text with protected folders each time they use it, so
+        // a long one (a variable filled in) costs work on every use, cached or not.
+        if case .literal(let s) = form, !spend(s.utf8.count / 16) { return .tooComplex }
+        return form
+    }
+
+    mutating func computePathForm(_ raw: String, globbed: Bool?) -> PathForm {
+        func tooComplex() -> PathForm {
+            acc.raise(.high, "too complex to check")
+            return .tooComplex
+        }
         // `$HOME`, `$PWD` and variables set on the line are filled in first.
-        let (s, valueGlob) = substituteVariablesForPath(raw)
+        guard let substituted = substituteVariablesForPath(raw) else { return tooComplex() }
+        let (s, valueGlob) = substituted
+        // Filling them in is work in proportion to what it built.
+        if raw.contains("$"), !spend(s.utf8.count / 4) { return .tooComplex }
         let glob = globbed ?? globbedTexts.contains(raw) || valueGlob
         let special = PathRules.isDirectoryStackTilde(s)
         // A relative name after `cd` into a glob, or after a `cd` that might not have taken
@@ -2570,15 +2781,28 @@ struct ShellRiskChecker {
             text = "/" + s
         }
         let dots = dotQualifiedTexts.contains(raw)
+        let alternatives: [String]
+        if glob {
+            switch PathPattern.braceAlternatives(text, maxLength: Self.maxPatternText / max(1, base.count)) {
+            case .alternatives(let found): alternatives = found
+            // Too many brace alternatives to enumerate: fail closed to a pattern that could be
+            // anywhere, so secret and persistence roots match.
+            case .tooMany: return .patterns([PathPattern.anywhere])
+            case .tooLong: return tooComplex()
+            }
+        } else {
+            alternatives = [text]
+        }
+        // Building and matching the patterns is work in proportion to their length, charged
+        // before any of it is done (counting patterns alone let one long word through cheaply).
+        let length = base.count * alternatives.reduce(0) { $0 + $1.utf8.count }
+        guard length <= Self.maxPatternText else { return tooComplex() }
+        guard spend(length / 4) else { return .tooComplex }
+        // Folders times alternatives past the limit: anywhere, as above.
+        guard base.count * alternatives.count <= Self.maxPatterns else { return .patterns([PathPattern.anywhere]) }
         var out: [PathPattern] = []
         for b in base {
-            // Too many brace alternatives (or folders times alternatives) to enumerate: fail
-            // closed to a pattern that could be anywhere, so secret and persistence roots match.
-            guard let ps = PathPattern.make(base: b, text: text, glob: glob, extendedGlob: extendedGlob, dots: dots),
-                  out.count + ps.count <= Self.maxPatterns else {
-                return .patterns([PathPattern.anywhere])
-            }
-            out += ps
+            out += PathPattern.make(base: b, alternatives: alternatives, glob: glob, extendedGlob: extendedGlob, dots: dots)
         }
         return .patterns(out)
     }
@@ -2645,7 +2869,13 @@ struct ShellRiskChecker {
                 cwdPatterns = nil
             }
         } else if let t = ops.first {
-            let (s, valueGlob) = substituteVariablesForPath(t)
+            guard let substituted = substituteVariablesForPath(t) else {
+                // Too long to follow: from here a relative path could be anywhere.
+                acc.raise(.high, "too complex to check")
+                loseFolders()
+                return
+            }
+            let (s, valueGlob) = substituted
             literalTarget = !globbedTexts.contains(t) && !valueGlob && !PathRules.isDirectoryStackTilde(s) && !Self.hasRunTimeParts(s)
             switch pathForm(t) {
             case .literal(let s):
@@ -2655,6 +2885,9 @@ struct ShellRiskChecker {
             case .patterns(let ps):
                 cwd = nil
                 cwdPatterns = ps
+            case .tooComplex:
+                loseFolders()
+                return
             case .unknown:
                 literalTarget = false
                 cwd = nil
@@ -2707,10 +2940,25 @@ struct ShellRiskChecker {
     /// `x=$(cmd)` where cmd only ever prints numbers: arithmetic over `x` can't run anything,
     /// since running code needs a name and a subscript (`a[$(cmd)]`), and digits aren't one.
     func numericAssignment(_ word: ShellWord) -> Bool {
-        guard word.substitutions.count == 1, let eq = word.text.firstIndex(of: "=") else { return false }
+        guard !word.substitutions.isEmpty, let eq = word.text.firstIndex(of: "=") else { return false }
         let value = word.text[word.text.index(after: eq)...]
-        guard value == "$(…)" || value == "`…`" else { return false }
+        // `x=$(( … ))`: whatever feeds it (judged where it's evaluated), the result is a number.
+        if Self.isWholeArithmetic(value) { return true }
+        guard word.substitutions.count == 1, value == "$(…)" || value == "`…`" else { return false }
         return numericOutput(word.substitutions[0])
+    }
+
+    /// `s` is one `$(( … ))` expansion from start to end, nothing before or after it.
+    static func isWholeArithmetic(_ s: Substring) -> Bool {
+        guard s.hasPrefix("$(("), s.hasSuffix("))") else { return false }
+        var depth = 0
+        var k = 0
+        let last = s.count - 1
+        for ch in s {
+            if ch == "(" { depth += 1 } else if ch == ")" { depth -= 1; if depth == 0 { return k == last } }
+            k += 1
+        }
+        return false
     }
 
     /// Whether a substitution's output is only digits, spaces and punctuation: one pipeline
@@ -2724,9 +2972,31 @@ struct ShellRiskChecker {
             if cmd.redirects.contains(where: { $0.op == ">&" || $0.op == "&>" || $0.op == "&>>" }) { return false }
             if !cmd.groups.isEmpty || cmd.words.contains(where: { !$0.substitutions.isEmpty }) { return false }
         }
-        var k = pipeline.commands.count - 1
-        while k > 0, Self.keepsNumbers(pipeline.commands[k].words.map(\.text)) { k -= 1 }
-        return Self.printsOnlyNumbers(pipeline.commands[k].words.map(\.text))
+        let commands = pipeline.commands
+        var k = commands.count - 1
+        while true {
+            let texts = commands[k].words.map(\.text)
+            // `wc -l file | awk '{print $1}'`: wc's first column is the count, and the filter
+            // keeps only that column (the names after it are dropped) — when it reads wc's
+            // lines directly, not cut or reordered by something in between.
+            if k > 0, Self.printsFirstColumn(texts) {
+                let producer = commands[k - 1].words
+                if Self.countsWithNames(producer) || producesOnlyNumbers(producer) { return true }
+            }
+            guard k > 0, Self.keepsNumbers(texts) else { break }
+            k -= 1
+        }
+        return producesOnlyNumbers(commands[k].words)
+    }
+
+    /// `printsOnlyNumbers` for parsed words, which also says which operands are quoted, globbed
+    /// or only known at run time (what grep's output depends on).
+    func producesOnlyNumbers(_ words: [ShellWord]) -> Bool {
+        if let first = words.first, ["grep", "egrep", "fgrep"].contains(Self.programName(first.text)) {
+            // The line may set GREP_OPTIONS (`-H` adds file names); then grep isn't trusted.
+            return !grepOptionsMayBeSet && Self.grepPrintsOnlyCounts(Array(words.dropFirst()))
+        }
+        return Self.printsOnlyNumbers(words.map(\.text))
     }
 
     /// Programs (as written: no wrappers, no assignments) whose standard output is numbers.
@@ -2738,6 +3008,11 @@ struct ShellRiskChecker {
         case "wc":
             // Counts only: with no file operands it prints no names.
             return !a.isEmpty && all(#"^-[lcmw]+$"#)
+        case "sysctl":
+            // `sysctl -n hw.ncpu`: the value alone, for settings that are counts or sizes.
+            return a.first == "-n" && a.count >= 2 && a.dropFirst().allSatisfy { $0.range(of: numericSysctl, options: .regularExpression) != nil }
+        case "getconf":
+            return a.count == 1 && a[0].range(of: #"^_?(NPROCESSORS_ONLN|NPROCESSORS_CONF|PAGESIZE|PAGE_SIZE|ARG_MAX|OPEN_MAX|CHILD_MAX|LINE_MAX|CLK_TCK|LONG_BIT)$"#, options: .regularExpression) != nil
         case "date":
             return a.contains { $0.hasPrefix("+") } && a.allSatisfy { $0 == "-u" || (Self.numericFormat($0.dropFirst(), letters: "sYmdHMSjuwyeNCGgVUWklIz") && $0.hasPrefix("+")) }
         case "git":
@@ -2806,6 +3081,105 @@ struct ShellRiskChecker {
         default:
             return false
         }
+    }
+
+    /// `sysctl` settings whose value is a count, a size, a frequency or a 0/1 flag
+    /// (`hw.model`, a name, isn't one).
+    static let numericSysctl = #"^(hw\.(ncpu|activecpu|physicalcpu|physicalcpu_max|logicalcpu|logicalcpu_max|memsize|memsize_usable|pagesize|cachelinesize|l1icachesize|l1dcachesize|l2cachesize|l3cachesize|cpufrequency|cpufrequency_max|busfrequency|tbfrequency|packages|byteorder|nperflevels|perflevel[0-9]+\.(physicalcpu|logicalcpu|physicalcpu_max|logicalcpu_max|l1icachesize|l1dcachesize|l2cachesize|cpusperl2)|optional\.[a-z0-9_.]+)|kern\.(maxfiles|maxfilesperproc|maxproc|maxprocperuid|argmax|osrevision))$"#
+
+    /// `grep -c PATTERN [FILE]`: prints only a count when it prints no file name, which is with
+    /// at most one file or with `-h`. Only options that change what's counted are allowed. A
+    /// glob, or an unquoted variable bash may split, could add files (or options), so any such
+    /// word rules it out; so does a run-time operand outside `-e`/`--`, which could be `-H`.
+    static func grepPrintsOnlyCounts(_ a: [ShellWord]) -> Bool {
+        guard a.allSatisfy({ !$0.globbed && ($0.quoted || !hasRunTimeParts($0.text)) }) else { return false }
+        let plainFlags = Set("ivwxEFGsaIU")
+        var counts = false
+        var noNames = false
+        var patternGiven = false
+        var operands = 0
+        var idx = 0
+        while idx < a.count {
+            let x = a[idx].text
+            idx += 1
+            if x == "--" { operands += a.count - idx; break }
+            if hasRunTimeParts(x) { return false }
+            if x.hasPrefix("--") {
+                switch x {
+                case "--count": counts = true
+                case "--no-filename": noNames = true
+                case "--ignore-case", "--invert-match", "--word-regexp", "--line-regexp", "--extended-regexp", "--fixed-strings",
+                     "--basic-regexp", "--no-messages", "--text": break
+                case _ where x.hasPrefix("--regexp=") || x.hasPrefix("--file="): patternGiven = true
+                case _ where x.hasPrefix("--max-count="): break
+                default: return false
+                }
+                continue
+            }
+            if let cluster = shortCluster(x) {
+                let flags = Array(cluster)
+                for (k, f) in flags.enumerated() {
+                    if f == "c" { counts = true; continue }
+                    if f == "h" { noNames = true; continue }
+                    if plainFlags.contains(f) { continue }
+                    // `-e PATTERN`, `-f FILE`, `-m NUM`: the value is the rest of the word or the next one.
+                    guard f == "e" || f == "f" || f == "m" else { return false }
+                    if f != "m" { patternGiven = true }
+                    if k + 1 == flags.count { guard idx < a.count else { return false }; idx += 1 }
+                    break
+                }
+                continue
+            }
+            operands += 1
+        }
+        let files = patternGiven ? operands : max(0, operands - 1)
+        return counts && (noNames || files <= 1)
+    }
+
+    /// `awk '{print $1}'` or `cut -d ' ' -f 1`: only the first column of each line.
+    static func printsFirstColumn(_ words: [String]) -> Bool {
+        guard let first = words.first else { return false }
+        let a = Array(words.dropFirst())
+        switch programName(first) {
+        case "awk", "gawk", "nawk", "mawk":
+            return a.count == 1 && a[0].range(of: #"^\s*\{\s*print\s+\$1\s*;?\s*\}\s*$"#, options: .regularExpression) != nil
+        case "cut":
+            var delimiter: String?
+            var field: String?
+            var idx = 0
+            while idx < a.count {
+                let x = a[idx]
+                idx += 1
+                if x == "-d" || x == "-f" {
+                    guard idx < a.count else { return false }
+                    if x == "-d" { delimiter = a[idx] } else { field = a[idx] }
+                    idx += 1
+                } else if x.hasPrefix("-d") { delimiter = String(x.dropFirst(2)) }
+                else if x.hasPrefix("-f") { field = String(x.dropFirst(2)) }
+                else { return false }
+            }
+            return delimiter == " " && field == "1"
+        default:
+            return false
+        }
+    }
+
+    /// `wc -l a.txt b.txt`: counts followed by the names written on the line. Each output line
+    /// starts with a count as long as no name holds a newline, so a glob or a name only known at
+    /// run time (which could) rules it out.
+    static func countsWithNames(_ words: [ShellWord]) -> Bool {
+        guard let first = words.first, programName(first.text) == "wc" else { return false }
+        var names = 0
+        for w in words.dropFirst() {
+            if w.globbed || hasRunTimeParts(w.text) || w.text.contains("\n") || w.text.contains("\r") { return false }
+            // Quoting doesn't stop a leading `-` from being read as an option.
+            if w.text.hasPrefix("-") {
+                guard w.text.range(of: #"^-[lcmw]+$"#, options: .regularExpression) != nil else { return false }
+                continue
+            }
+            names += 1
+        }
+        return names > 0
     }
 
     /// A `date +…`/`stat -f …` format that prints only numbers: `%` conversions from `letters`
@@ -3006,7 +3380,7 @@ struct ShellRiskChecker {
             if let value { pagerRules(value.split(whereSeparator: \.isWhitespace).map(String.init), depth: depth) }
             else { acc.raise(.high, "sets LESS to a value only known at run time") }
         } else if Self.codeVariables.contains(name) || Self.codeVariablePrefixes.contains(where: { name.hasPrefix($0) }) {
-            if (name == "PYTHONPATH" || name == "NODE_PATH"), let value, projectSearchPath(value) {
+            if (name == "PYTHONPATH" || name == "NODE_PATH"), let value, projectSearchPath(value, name: name) {
                 // Modules from the project's own folders: no more than running its code
                 // (`python3 ./x.py`), which is medium too.
                 acc.raise(.medium, "sets \(name) to a project folder")
@@ -3040,7 +3414,7 @@ struct ShellRiskChecker {
             // folder" entry, just the join between the old value and the new one.
             if appends || joinsOldValue, entries.first == "" { entries.removeFirst() }
             for e in entries where !trustedSearchEntry(e, name: name) {
-                let shown = e.isEmpty ? "the current folder" : PathRules.display(substituteVariables(e), home: home)
+                let shown = e.isEmpty ? "the current folder" : PathRules.display(substituteVariables(e) ?? e, home: home)
                 acc.raise(.high, "puts \(shown) on \(name.uppercased()), so commands may run programs from there")
                 return
             }
@@ -3050,9 +3424,24 @@ struct ShellRiskChecker {
     /// A module path (`PYTHONPATH=src`, `NODE_PATH=.:lib`) of only the project's own folders:
     /// relative names without `..`, or folders inside the current one. Anything with `~`, a
     /// variable, a glob or another absolute folder (`/tmp/x`, `~/Downloads`) isn't.
-    func projectSearchPath(_ value: String) -> Bool {
-        value.split(separator: ":", omittingEmptySubsequences: false).allSatisfy { piece in
-            let e = String(piece)
+    ///
+    /// `$PWD` (and `$(pwd)`, written as `$PWD` by `assignmentText`) is the current folder, and
+    /// the variable's own old value (`src:$PYTHONPATH`, `"${PYTHONPATH}:$(pwd)"`) is what was
+    /// already there, as `PATH`'s is: neither adds a folder outside the project.
+    func projectSearchPath(_ value: String, name: String) -> Bool {
+        var text = value
+        // `${NAME:+:$NAME}` and kin are the old value with its separator (see the PATH rule).
+        for form in ["${\(name)+:$\(name)}", "${\(name):+:$\(name)}", "${\(name)+:${\(name)}}", "${\(name):+:${\(name)}}"] {
+            text = text.replacingOccurrences(of: form, with: ":$\(name)")
+        }
+        for form in ["${\(name)+$\(name):}", "${\(name):+$\(name):}", "${\(name)+${\(name)}:}", "${\(name):+${\(name)}:}"] {
+            text = text.replacingOccurrences(of: form, with: "$\(name):")
+        }
+        let old: Set<String> = ["$\(name)", "${\(name)}"]
+        return text.split(separator: ":", omittingEmptySubsequences: false).allSatisfy { piece in
+            if old.contains(String(piece)) { return true }
+            // `$PWD`, `$HOME` and values set on the line filled in; the rest stays run time.
+            guard let e = substituteVariables(String(piece)) else { return false }
             if e.hasPrefix("~") || Self.hasRunTimeParts(e) || e.contains(where: { "*?[{`".contains($0) }) { return false }
             if e.hasPrefix("/") {
                 guard let cwd else { return false }
@@ -3062,12 +3451,19 @@ struct ShellRiskChecker {
         }
     }
 
-    /// `NODE_OPTIONS` of only memory and diagnostics flags. Anything that loads code
-    /// (`--require`, `--import`, `--loader`, `--inspect`, `--env-file`…) isn't.
+    /// `NODE_OPTIONS` of only flags that load no code and write no files: memory and
+    /// diagnostics settings, and switches for built-in features (Jest's
+    /// `--experimental-vm-modules`, webpack 4's `--openssl-legacy-provider`). Anything that
+    /// loads code or settings (`--require`, `--import`, `--loader`, `--experimental-loader`,
+    /// `--inspect`, `--env-file`, `--openssl-config`…) isn't. Node reads `_` in a flag's name as
+    /// `-` (`--max_old_space_size`), so names are compared that way; values aren't changed.
     static func harmlessNodeOptions(_ value: String) -> Bool {
         let words = value.split(whereSeparator: \.isWhitespace).map(String.init)
-        let pattern = #"^--(max-old-space-size=\d+|max-semi-space-size=\d+|stack-size=\d+|max-http-header-size=\d+|enable-source-maps|trace-warnings|no-warnings|no-deprecation|trace-deprecation|throw-deprecation|pending-deprecation|unhandled-rejections=(strict|warn|none|throw|warn-with-error-code))$"#
-        return !words.isEmpty && words.allSatisfy { $0.range(of: pattern, options: .regularExpression) != nil }
+        let pattern = #"^--(max-old-space-size=\d+|max-semi-space-size=\d+|stack-size=\d+|max-http-header-size=\d+|enable-source-maps|trace-warnings|no-warnings|no-deprecation|trace-deprecation|throw-deprecation|pending-deprecation|trace-uncaught|trace-exit|unhandled-rejections=(strict|warn|none|throw|warn-with-error-code)|experimental-vm-modules|experimental-json-modules|experimental-wasm-modules|experimental-top-level-await|experimental-specifier-resolution=(node|explicit)|openssl-legacy-provider|no-experimental-fetch|no-experimental-global-webcrypto|no-experimental-websocket|no-experimental-require-module|no-experimental-strip-types|dns-result-order=(ipv4first|ipv6first|verbatim)|no-network-family-autoselection)$"#
+        return !words.isEmpty && words.allSatisfy { word in
+            let name = word.prefix { $0 != "=" }.replacingOccurrences(of: "_", with: "-")
+            return (name + word.drop { $0 != "=" }).range(of: pattern, options: .regularExpression) != nil
+        }
     }
 
     /// The existing search path, or a folder Glide can only change with approval (system and
@@ -3075,31 +3471,46 @@ struct ShellRiskChecker {
     func trustedSearchEntry(_ entry: String, name: String) -> Bool {
         let own = ["$\(name)", "${\(name)}", "$PATH", "${PATH}", "$path", "${path}", "$path[@]", "${path[@]}", "$fpath", "${fpath}", "$FPATH", "${FPATH}"]
         if own.contains(entry) { return true }
-        let e = substituteVariables(entry)
-        guard e.hasPrefix("/"), !Self.hasRunTimeParts(e), !e.contains(where: { "*?[{".contains($0) }) else { return false }
+        guard let e = substituteVariables(entry), e.hasPrefix("/"), !Self.hasRunTimeParts(e), !e.contains(where: { "*?[{".contains($0) }) else { return false }
         return PathRules.writeZone(PathRules.normalize(e), home: home) == .outside
     }
 
-    /// `$NAME`/`${NAME}` replaced by values set earlier on the line.
-    func substituteVariables(_ text: String) -> String {
-        substituteVariablesForPath(text).text
+    /// `$NAME`/`${NAME}` replaced by values set earlier on the line; nil when that text would
+    /// be longer than `maxSubstitutedLength` (the caller fails closed).
+    func substituteVariables(_ text: String) -> String? {
+        substituteVariablesForPath(text)?.text
     }
 
+    /// Longest text filling in variables may build: the longest command Glide checks. A value
+    /// used many times (`a=<10 KB>; cat $a$a$a…`) could otherwise build gigabytes.
+    static let maxSubstitutedLength = 200_000
+
     /// Like `substituteVariables`, also reporting whether a filled-in value has glob
-    /// characters (bash expands those in an unquoted `$x`).
-    func substituteVariablesForPath(_ text: String) -> (text: String, globbed: Bool) {
+    /// characters (bash expands those in an unquoted `$x`). Nil past `maxSubstitutedLength`.
+    func substituteVariablesForPath(_ text: String) -> (text: String, globbed: Bool)? {
         guard text.contains("$") else { return (text, false) }
-        var known = vars
-        known["HOME"] = home
-        if let cwd { known["PWD"] = cwd }
-        if let oldCwd { known["OLDPWD"] = oldCwd }
+        /// What the shell knows `name` to be, looked up without copying `vars` (a line with
+        /// thousands of assignments made every call copy all of them).
+        func known(_ name: String) -> String? {
+            switch name {
+            case "HOME": return home
+            case "PWD": if let cwd { return cwd }
+            case "OLDPWD": if let oldCwd { return oldCwd }
+            default: break
+            }
+            return vars[name]
+        }
         let c = Array(text)
         var out = ""
+        var length = 0
         var glob = false
         var i = 0
-        func addValue(_ value: String) {
+        func addValue(_ value: String) -> Bool {
+            length += value.utf8.count
+            guard length <= Self.maxSubstitutedLength else { return false }
             out += value
             if value.contains(where: { "*?[".contains($0) }) { glob = true }
+            return true
         }
         while i < c.count {
             if c[i] == "$", i + 1 < c.count {
@@ -3109,7 +3520,7 @@ struct ShellRiskChecker {
                 let start = j
                 while j < c.count, c[j].isLetter || c[j].isNumber || c[j] == "_" { j += 1 }
                 let name = String(c[start..<j])
-                if !name.isEmpty, start < c.count, !(c[start].isNumber), let value = known[name] {
+                if !name.isEmpty, start < c.count, !(c[start].isNumber), let value = known(name) {
                     if braced {
                         // `${HOME}` plain, or `${HOME:-x}`, `${HOME:h}`, `${HOME%foo}`: the value
                         // is still HOME-derived, so substitute it and drop the modifier (the real
@@ -3120,11 +3531,11 @@ struct ShellRiskChecker {
                             if c[k] == "{" { depth += 1 } else if c[k] == "}" { depth -= 1 }
                             k += 1
                         }
-                        addValue(value)
+                        guard addValue(value) else { return nil }
                         i = k
                         continue
                     }
-                    addValue(value)
+                    guard addValue(value) else { return nil }
                     i = j
                     // `$HOME[1,-1]` (substring) or `$HOME:h` (modifier): still HOME-derived.
                     if i < c.count, c[i] == "[" {
@@ -3139,9 +3550,10 @@ struct ShellRiskChecker {
                 }
             }
             out.append(c[i])
+            length += 1
             i += 1
         }
-        return (out, glob)
+        return length <= Self.maxSubstitutedLength ? (out, glob) : nil
     }
 
     // MARK: Pipeline helpers
@@ -3285,6 +3697,9 @@ struct ShellRiskChecker {
     /// subscript (`${a[…]}`, `${#a[…]}`, `$a[…]`). Only these are evaluated, so `$(date)` or a
     /// variable elsewhere in the word isn't (`echo "$(date): $((1 + 1))"`). One pass: a part
     /// is skipped whole once found, nested ones included; an unclosed one runs to the end.
+    /// Brackets inside a `${…}` are only looked for up to its `}`, so each character is read a
+    /// bounded number of times (searching to the end of the word for every `${(` or `${a[` that
+    /// never closes was quadratic).
     static func arithmeticSegments(_ s: String) -> [Substring] {
         guard s.contains("$") else { return [] }
         let c = Array(s)
@@ -3293,45 +3708,46 @@ struct ShellRiskChecker {
             let lo = min(a, c.count), hi = min(max(lo, b), c.count)
             return Substring(String(c[lo..<hi]))
         }
-        /// Index of the bracket closing the one at `from` (c.count when unclosed).
-        func closing(_ from: Int, _ open: Character, _ close: Character) -> Int {
+        /// Index of the bracket closing the one at `from`, looking no further than `limit`
+        /// (which it returns when there is none before it).
+        func closing(_ from: Int, _ open: Character, _ close: Character, limit: Int) -> Int {
             var depth = 0
             var j = from
-            while j < c.count {
+            while j < limit {
                 if c[j] == open { depth += 1 } else if c[j] == close { depth -= 1; if depth == 0 { return j } }
                 j += 1
             }
-            return c.count
+            return limit
         }
         var i = 0
         while i < c.count {
             guard c[i] == "$", i + 1 < c.count else { i += 1; continue }
             let n = c[i + 1]
             if n == "(", i + 2 < c.count, c[i + 2] == "(" {
-                let end = closing(i + 1, "(", ")")
+                let end = closing(i + 1, "(", ")", limit: c.count)
                 out.append(slice(i + 3, end < c.count ? end - 1 : end))
                 i = end + 1
             } else if n == "[" {
-                let end = closing(i + 1, "[", "]")
+                let end = closing(i + 1, "[", "]", limit: c.count)
                 out.append(slice(i + 2, end))
                 i = end + 1
             } else if n == "{" {
-                let end = closing(i + 1, "{", "}")
+                let end = closing(i + 1, "{", "}", limit: c.count)
                 // `${#a[…]}`, `${(flags)a[…]}`, `${a[…]}`: the subscript after the name.
                 var j = i + 2
                 while j < end, "#!^=~+".contains(c[j]) { j += 1 }
-                if j < end, c[j] == "(" { j = min(closing(j, "(", ")") + 1, end) }
+                if j < end, c[j] == "(" { j = min(closing(j, "(", ")", limit: end) + 1, end) }
                 let nameStart = j
                 while j < end, c[j].isASCII, c[j].isLetter || c[j].isNumber || c[j] == "_" { j += 1 }
                 if j > nameStart, j < end, c[j] == "[" {
-                    out.append(slice(j + 1, min(closing(j, "[", "]"), end)))
+                    out.append(slice(j + 1, closing(j, "[", "]", limit: end)))
                 }
                 i = end + 1
             } else if n.isASCII, n.isLetter || n == "_" {
                 var j = i + 1
                 while j < c.count, c[j].isASCII, c[j].isLetter || c[j].isNumber || c[j] == "_" { j += 1 }
                 if j < c.count, c[j] == "[" {
-                    let end = closing(j, "[", "]")
+                    let end = closing(j, "[", "]", limit: c.count)
                     out.append(slice(j + 1, end))
                     i = end + 1
                 } else {
