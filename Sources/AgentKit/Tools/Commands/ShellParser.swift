@@ -50,11 +50,13 @@ struct ShellCommand: Sendable, Hashable {
     var heredoc: String?
     /// Here-string (`<<< text`), if any.
     var hereString: ShellWord?
-    /// The command is `(( … ))`, which evaluates arithmetic (and, through array subscripts,
-    /// can run command text stored in a variable).
+    /// The command is `(( … ))` (also as `if (( … ))`, `while (( … ))` or a `for (( … ))` loop
+    /// header), which evaluates arithmetic (and, through array subscripts, can run command
+    /// text stored in a variable).
     var arithmetic = false
-    /// The raw expression text of a `(( … ))` command, so the checker can see which variables
-    /// it reads (`(( x ))` reads `x`, whose value zsh re-evaluates as an arithmetic expression).
+    /// The expression text of a `(( … ))` command, so the checker can see which variables it
+    /// reads (`(( x ))` reads `x`, whose value zsh re-evaluates as an arithmetic expression).
+    /// Command substitutions in it are written as placeholders (`$(…)`).
     var arithmeticText: String?
     /// The command is `name()`, the start of a function definition (its body follows).
     var definesFunction = false
@@ -124,12 +126,28 @@ final class ShellParser {
         mutating func append(_ s: String) { word.text += s; started = true }
     }
 
+    /// Reserved words that may come before `[[ … ]]` or `(( … ))` in the same command (`if [[ …`,
+    /// `while (( … ))`, `! [[ …`); `for` also takes `(( … ))` as its loop header.
+    static let compoundPrefixes: Set<String> = ["if", "then", "else", "elif", "do", "while", "until", "!", "{", "time"]
+    static let arithmeticPrefixes = compoundPrefixes.union(["for"])
+
+    /// Every word so far is one of `allowed`, written plainly (a quoted `"if"` is a program name).
+    private static func onlyKeywords(_ words: [ShellWord], _ allowed: Set<String>) -> Bool {
+        words.allSatisfy { !$0.quoted && $0.substitutions.isEmpty && allowed.contains($0.text) }
+    }
+
     private func parseList(until close: Character?) -> ShellList {
         var list = ShellList()
         var pipeline = ShellPipeline()
         var cmd = newCommand()
         var buf = WordBuffer()
         var pendingOp: String?
+        // Inside `[[ … ]]`, `&&`, `||`, `(`, `)`, `<` and `>` are the condition's own operators,
+        // not the shell's: `[[ $a == 1 && $b == 2 ]]` is one command, and its `>` compares
+        // strings rather than writing a file. `condParens` counts its open groups, inside
+        // which `|` separates zsh pattern alternatives (`[[ $x == (a|b) ]]`).
+        var inCondition = false
+        var condParens = 0
 
         func endWord() {
             guard buf.started else { return }
@@ -148,14 +166,48 @@ final class ShellParser {
                     cmd.redirects.append(ShellRedirect(op: op, target: w))
                 }
             } else {
+                if !inCondition, !w.quoted, w.text == "[[", Self.onlyKeywords(cmd.words, Self.compoundPrefixes) {
+                    inCondition = true
+                    condParens = 0
+                } else if inCondition, !w.quoted, w.text == "]]" {
+                    inCondition = false
+                }
                 cmd.words.append(w)
             }
         }
         func endCommand() {
             endWord()
             pendingOp = nil
+            inCondition = false
             if !cmd.isEmpty { pipeline.commands.append(cmd) }
             cmd = newCommand()
+        }
+        /// One of the condition's operators at `c[i]` as a word of its own; false when `c[i]`
+        /// isn't one there (it then means what it does anywhere else). The word before it ends
+        /// first, so `]]&&` closes the condition before its `&&` is read as the shell's.
+        func conditionOperator(_ ch: Character) -> Bool {
+            // `x(…)` is a glob group and `=(…)` a zsh process substitution, read as usual; a
+            // `]]` right before it still closes the condition first.
+            if ch == "(" && buf.started {
+                if !buf.word.quoted, buf.word.text == "]]" { endWord() }
+                return false
+            }
+            endWord()
+            guard inCondition else { return false }
+            let op: String
+            switch ch {
+            case "&" where peek(1) == "&": op = "&&"
+            case "|" where peek(1) == "|": op = "||"
+            case "|" where condParens > 0: op = "|"
+            // `<(…)`/`>(…)` stay process substitutions: they may run a command.
+            case "<", ">": guard peek(1) != "(" else { return false }; op = String(ch)
+            case "(": op = "("; condParens += 1
+            case ")" where condParens > 0: op = ")"; condParens -= 1
+            default: return false
+            }
+            cmd.words.append(ShellWord(text: op))
+            i += op.count
+            return true
         }
         func endPipeline(_ connector: String) {
             endCommand()
@@ -168,6 +220,7 @@ final class ShellParser {
 
         while i < c.count {
             let ch = c[i]
+            if inCondition, "&|<>()".contains(ch), conditionOperator(ch) { continue }
             switch ch {
             case " ", "\t", "\r":
                 endWord(); i += 1
@@ -209,11 +262,13 @@ final class ShellParser {
                         continue
                     }
                     if buf.word.text.hasSuffix("=") {
-                        // Array assignment a=( … ): keep as text, but still find substitutions.
-                        // Step past "(" first, or the rest of the line would be swallowed.
+                        // Array assignment a=( … ): keep as text, but still find substitutions,
+                        // written as placeholders like in any other word (`files=($(git ls-files))`
+                        // holds command output, not quoted command text). Step past "(" first, or
+                        // the rest of the line would be swallowed.
                         i += 1
                         let inner = readBalanced(open: "(", close: ")")
-                        buf.append("(" + inner + ")")
+                        buf.append("(" + Self.maskSubstitutions(inner) + ")")
                         buf.word.substitutions += scanSubstitutions(inner)
                         continue
                     }
@@ -233,16 +288,24 @@ final class ShellParser {
                     // name() function definition: the body that follows is its own command.
                     if peek(1) == ")" { i += 2; cmd.definesFunction = true; endPipeline(";"); continue }
                 }
-                if cmd.words.isEmpty && peek(1) == "(" {
-                    // (( arithmetic )) — evaluates numbers; look only for substitutions inside.
+                if peek(1) == "(", Self.onlyKeywords(cmd.words, Self.arithmeticPrefixes) {
+                    // (( arithmetic )), also as a condition or loop header (`if (( n > 5 ))`,
+                    // `for ((i = 0; i < 3; i++))`) — evaluates numbers; look only for
+                    // substitutions inside. Its `<` and `>` compare, they don't redirect.
+                    let start = i
                     i += 2
                     let inner = readBalanced(open: "(", close: ")")
-                    if peek() == ")" { i += 1 }
-                    cmd.arithmetic = true
-                    cmd.arithmeticText = inner
-                    let subs = scanSubstitutions(inner)
-                    if !subs.isEmpty { cmd.words.append(ShellWord(text: "", substitutions: subs)) }
-                    continue
+                    if peek() == ")" {
+                        i += 1
+                        cmd.arithmetic = true
+                        cmd.arithmeticText = Self.maskSubstitutions(inner)
+                        let subs = scanSubstitutions(inner)
+                        if !subs.isEmpty { cmd.words.append(ShellWord(text: "", substitutions: subs)) }
+                        continue
+                    }
+                    // Not closed by `))`: zsh and bash read `((cmd) …)` as a subshell inside a
+                    // subshell, whose commands run.
+                    i = start
                 }
                 i += 1
                 if let inner = nested({ parseList(until: ")") }) { cmd.groups.append(inner) }
@@ -358,12 +421,21 @@ final class ShellParser {
     private func readDollar(_ buf: inout WordBuffer) {
         let next = peek(1)
         if next == "(" && peek(2) == "(" {
+            let start = i
             i += 3
             let inner = readBalanced(open: "(", close: ")")
-            if peek() == ")" { i += 1 }
-            buf.append("$((" + inner + "))")
-            buf.word.substitutions += scanSubstitutions(inner)
-        } else if next == "(" {
+            if peek() == ")" {
+                i += 1
+                // Substitutions inside are written as placeholders, so their text isn't taken
+                // for quoted command text (`$(( $(date +%s) - start ))`).
+                buf.append("$((" + Self.maskSubstitutions(inner) + "))")
+                buf.word.substitutions += scanSubstitutions(inner)
+                return
+            }
+            // Not closed by `))`: `$((cmd) …)` is a command substitution holding a subshell.
+            i = start
+        }
+        if next == "(" {
             i += 2
             let inner = nested { parseList(until: ")") }
             buf.append("$(…)")
@@ -371,7 +443,7 @@ final class ShellParser {
         } else if next == "{" {
             i += 2
             let inner = readBalanced(open: "{", close: "}")
-            buf.append("${" + inner + "}")
+            buf.append("${" + Self.maskSubstitutions(inner) + "}")
             buf.word.substitutions += scanSubstitutions(inner)
         } else if next == "'" {
             // $'…' ANSI-C quoting can spell any program name with escapes; keep the `$` so the
@@ -443,6 +515,64 @@ final class ShellParser {
         for k in subs.indices { p.attachHeredocs(&subs[k]) }
         adopt(p)
         return subs
+    }
+
+    /// `text` (the inside of `$(( … ))`, `${ … }` or an array literal) with each command
+    /// substitution written as the placeholder a word uses for one (`$(…)`, `` `…` ``), the way
+    /// `scanSubstitutions` reads them. The checker takes `$(…)` text left in a word for quoted
+    /// command text that arithmetic could run, so a real substitution must not look like that.
+    /// Single-quoted text is copied as written: there it is only text. Linear: each
+    /// substitution is skipped whole, nested ones included.
+    static func maskSubstitutions(_ text: String) -> String {
+        guard text.contains("$(") || text.contains("`") else { return text }
+        let c = Array(text)
+        var out = ""
+        var i = 0
+        var inDouble = false
+        while i < c.count {
+            let ch = c[i]
+            if ch == "\\", i + 1 < c.count { out.append(ch); out.append(c[i + 1]); i += 2; continue }
+            if ch == "'", !inDouble {
+                var j = i + 1
+                while j < c.count, c[j] != "'" { j += 1 }
+                out += String(c[i..<min(j + 1, c.count)])
+                i = j + 1
+                continue
+            }
+            if ch == "\"" { inDouble.toggle(); out.append(ch); i += 1; continue }
+            if ch == "$", i + 1 < c.count, c[i + 1] == "(" {
+                // `$((` is arithmetic: keep it, and mask what's inside.
+                if i + 2 < c.count, c[i + 2] == "(" { out += "$(("; i += 3; continue }
+                var depth = 0
+                var quote: Character?
+                var j = i + 1
+                while j < c.count {
+                    let d = c[j]
+                    if let q = quote {
+                        if d == "\\", q == "\"" { j += 2; continue }
+                        if d == q { quote = nil }
+                        j += 1
+                        continue
+                    }
+                    if d == "'" || d == "\"" { quote = d } else if d == "\\" { j += 1 }
+                    else if d == "(" { depth += 1 } else if d == ")" { depth -= 1; if depth == 0 { break } }
+                    j += 1
+                }
+                out += "$(…)"
+                i = j + 1
+                continue
+            }
+            if ch == "`" {
+                var j = i + 1
+                while j < c.count, c[j] != "`" { j += c[j] == "\\" ? 2 : 1 }
+                out += "`…`"
+                i = j + 1
+                continue
+            }
+            out.append(ch)
+            i += 1
+        }
+        return out
     }
 
     /// A parser for nested text (backticks, `${…}`) that continues this parser's command ids,
