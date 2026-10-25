@@ -55,7 +55,13 @@ public struct GUIStepRunner: StepExecuting {
         /// Job steps: waits while the user is using the Mac (nil for quick tasks, which the
         /// orchestrator's own monitor pauses, or when the setting is off).
         var takeover: UserTakeoverWatch? = nil
+        /// Quick tasks: the task's conversation. What the user says meanwhile reaches the actor
+        /// at its next turn, and a step that would end blocked on a decision asks it instead.
+        var conversation: TaskConversation? = nil
     }
+
+    /// Decisions one step may ask the user about instead of ending blocked.
+    static let maxBlockedQuestions = 2
 
     struct Outcome: Sendable {
         var status: StepResult.Status
@@ -63,6 +69,8 @@ public struct GUIStepRunner: StepExecuting {
         var actions = 0
         /// Facts the actor read from the screen during this step.
         var learned: [String] = []
+        /// With `taskDone`: the result to say out loud.
+        var spoken: String? = nil
     }
 
     // MARK: - StepExecuting
@@ -133,6 +141,7 @@ public struct GUIStepRunner: StepExecuting {
         var turns = 0
         var learned: [String] = []
         var fieldsReminded = false
+        var questionsAsked = 0
         let maxFollowUps = settings.tools.batchActions ? max(0, min(ActorSchema.maxFollowUps, settings.tools.maxBatch - 1)) : 0
 
         func outcome(_ status: StepResult.Status, fields: [String: JSONValue] = [:]) -> Outcome {
@@ -197,6 +206,13 @@ public struct GUIStepRunner: StepExecuting {
             }
             turns += 1
             r.callbacks.phase(.executing, step.title + "…")
+            if let conversation = r.conversation {
+                // What the user said since the last turn ("actually the blue ones").
+                for note in conversation.takeNotes() {
+                    history.append("- the user said: \(note)")
+                    r.session.appendNote("From the user: \(note)")
+                }
+            }
             var extra: String?
             if let app = obs?.app, let browser = BrowserAdapter.browser(forBundleID: app.bundleID), let page = runtime.perception.browser.currentPage(browser) {
                 var text = "Browser page: \(page.title) — \(page.url)"
@@ -235,10 +251,30 @@ public struct GUIStepRunner: StepExecuting {
                 }
                 return outcome(.done, fields: StepResult.completeFields(decision.resultFields ?? [:], required: r.outputFields))
             case .taskDone:
-                return outcome(.taskDone(decision.message ?? "Done"),
-                               fields: StepResult.completeFields(decision.resultFields ?? [:], required: r.outputFields))
+                var done = outcome(.taskDone(decision.message ?? "Done"),
+                                   fields: StepResult.completeFields(decision.resultFields ?? [:], required: r.outputFields))
+                done.spoken = decision.spoken
+                return done
             case .blocked:
-                return outcome(.blocked(decision.message ?? "I can't continue without your help."))
+                let message = decision.message ?? "I can't continue without your help."
+                // A decision only the user can make becomes a question this step waits for; a
+                // login, a CAPTCHA or a permission still ends the step for the user to handle.
+                if let conversation = r.conversation, !r.isJob, questionsAsked < Self.maxBlockedQuestions,
+                   !UtteranceInterpreter.needsPerson(message) {
+                    questionsAsked += 1
+                    r.callbacks.log(ActivityEntry(kind: .info, title: "Asked: \(message)", stepID: step.id))
+                    r.callbacks.phase(.executing, "Waiting for your answer…")
+                    let start = Date()
+                    let answer = await conversation.ask(AgentQuestion(text: message), wait: true)
+                    r.session.extendDeadline(by: Date().timeIntervalSince(start))
+                    if Task.isCancelled || runtime.gate.isStopped || (answer == nil && conversation.isClosed) { throw AutomationError.stopped }
+                    if let answer {
+                        history.append("- you asked the user “\(message)”; they answered: \(answer)")
+                        r.session.appendNote("The user answered “\(message)”: \(answer)")
+                        continue
+                    }
+                }
+                return outcome(.blocked(message))
             case .needVision:
                 let result = try await groundAndAct(description: decision.targetDescription ?? "the target", kind: decision.action ?? "click",
                                                     decision: decision, obs: obs, step: step, history: &history, r)

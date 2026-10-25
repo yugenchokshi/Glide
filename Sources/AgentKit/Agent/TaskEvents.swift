@@ -65,6 +65,11 @@ public struct TaskResult: Sendable {
     /// Set when the quick task handed its request to the job engine (plan mode `job`): the
     /// background job that now does the work.
     public var jobID: String? = nil
+    /// The result as Glide says it out loud (at most about 25 words); nil means say `summary`.
+    public var spoken: String? = nil
+    /// What was in front when the task ended ("Safari — Amazon.com: Cart"), so a follow-up
+    /// request ("now add two of them") can continue from there.
+    public var front: String? = nil
 }
 
 /// Callbacks from the orchestrator to whoever runs it (the notch UI or glidectl).
