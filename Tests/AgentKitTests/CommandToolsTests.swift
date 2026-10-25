@@ -923,7 +923,8 @@ private let adversarialCases: [AdversarialCase] = [
     .init("many wrappers", rep("nohup ", 25_000) + "rm -rf /", .blocked),
     .init("many env", rep("env ", 30_000) + "rm -rf /", .blocked),
     // Many operands, reasons and commands.
-    .init("many deletes", "rm -rf " + (0..<15_000).map { "~/x\($0)/*" }.joined(separator: " "), .high),
+    // ~3 s alone in a debug build; the margin covers a full parallel test run.
+    .init("many deletes", "rm -rf " + (0..<15_000).map { "~/x\($0)/*" }.joined(separator: " "), .high, limit: .seconds(15)),
     .init("many key globs", "cat " + (0..<12_000).map { "~/.ss?/\($0)*" }.joined(separator: " "), .high),
     .init("many commands", rep("ls; ", 45_000), .low),
     .init("long pipeline", Array(repeating: "cat", count: 40_000).joined(separator: " | "), .low),

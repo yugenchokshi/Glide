@@ -19,6 +19,10 @@ public enum InstantActionsSetup {
     public static func install(engine: InstantActionEngine) {
         lock.withLock { self.engine = engine }
         InstantActions.handler = { utterance in await engine.handle(utterance) }
+        // `glidectl say --dry-run`: nil when the utterance isn't an instant action.
+        InstantPreview.describe = { utterance in
+            await engine.plan(utterance, useAssist: false) == nil ? nil : await engine.describe(utterance)
+        }
     }
 
     /// Describes what `utterance` would do — which app or URL, what Glide would say, what's left
