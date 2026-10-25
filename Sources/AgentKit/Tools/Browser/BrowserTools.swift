@@ -25,7 +25,7 @@ public enum BrowserTools {
     public static func make(hub: BrowserHub = .shared, sessions: BrowserSessions = .shared) -> [any AgentTool] {
         let rt = BrowserRuntime(hub: hub, sessions: sessions)
         return [
-            BrowserOpenTool(rt: rt), BrowserSnapshotTool(rt: rt), BrowserClickTool(rt: rt), BrowserTypeTool(rt: rt),
+            BrowserOpenTool(rt: rt), BrowserSnapshotTool(rt: rt), BrowserFindTool(rt: rt), BrowserClickTool(rt: rt), BrowserTypeTool(rt: rt),
             BrowserSelectTool(rt: rt), BrowserPressTool(rt: rt), BrowserScrollTool(rt: rt), BrowserReadTool(rt: rt),
             BrowserBackTool(rt: rt), BrowserTabsTool(rt: rt), BrowserSwitchTabTool(rt: rt), BrowserCloseTabTool(rt: rt),
             BrowserWaitTool(rt: rt),
@@ -169,14 +169,27 @@ struct BrowserEnv: Sendable {
                     ok: Bool = true, maxChars: Int = 6000) async throws -> ToolOutput {
         let snap = try await driver.snapshot(tabID: tab)
         sessions.record(snap, backend: kind)
+        return Self.render(snap, lead: lead, notes: notes, previous: previous, settled: settled, ok: ok, maxChars: maxChars)
+    }
+
+    /// The model-visible result for `snap`: the lead, what changed since `previous`, notes, then
+    /// the page. `data` carries the snapshot's refs and `fingerprint` (plus `botCheck` on a
+    /// CAPTCHA page) and any `extra` keys. Elements in `skip` were already shown in the notes.
+    static func render(_ snap: PageSnapshot, lead: String, notes: [String] = [], previous: PageSnapshot?, settled: Bool = true,
+                       ok: Bool = true, maxChars: Int = 6000, skip: Set<String> = [], extra: [String: JSONValue] = [:]) -> ToolOutput {
         var lines = [lead]
         let change = snap.changeSummary(since: previous)
         if !change.isEmpty { lines.append(change) }
         lines += notes
         if !settled { lines.append("(The page was still busy when this snapshot was taken; it may be incomplete.)") }
         lines.append("")
-        lines.append(snap.compact(maxChars: maxChars))
-        return ToolOutput(ok: ok, text: toolTruncate(lines.joined(separator: "\n"), max: maxChars + 2000), data: snap.modelData)
+        lines.append(snap.compact(maxChars: maxChars, skip: skip))
+        var data = snap.modelData
+        if !extra.isEmpty, case .object(var o) = data {
+            o.merge(extra) { $1 }
+            data = .object(o)
+        }
+        return ToolOutput(ok: ok, text: toolTruncate(lines.joined(separator: "\n"), max: maxChars + 2000), data: data)
     }
 
     /// The element `ref` names in the tab's latest snapshot. Actions must use refs from the
@@ -215,6 +228,13 @@ enum BrowserArgs {
     /// `_label` is filled by the step runner with the element's name from the snapshot it saw.
     static func label(_ args: JSONValue) -> String? { args.optionalString("_label") }
 
+    /// A whole-number argument kept within `range`. Models send 1e9 or 2.5 at times, and
+    /// `Int(Double)` traps on numbers that don't fit.
+    static func int(_ args: JSONValue, _ key: String, default value: Int, in range: ClosedRange<Int>) -> Int {
+        guard let d = args[key]?.doubleValue, d.isFinite else { return value }
+        return Int(min(Double(range.upperBound), max(Double(range.lowerBound), d.rounded(.down))))
+    }
+
     static func ref(_ args: JSONValue) throws -> String {
         let ref = try args.requiredString("ref").trimmingCharacters(in: .whitespaces)
         guard ref.count >= 2, ref.count <= 12, ref.first == "b", ref.dropFirst().allSatisfy({ ("0"..."9").contains($0) }) else {
@@ -232,7 +252,7 @@ struct BrowserOpenTool: AgentTool {
     let rt: BrowserRuntime
     let spec = ToolSpec(
         name: "browser.open",
-        summary: "Open a web page in Chrome (a background tab; your logins in Glide's browser apply). Returns the page's interactive elements with refs (b1, b2…) and its text.",
+        summary: "Open a web page in Chrome (a background tab; your logins in Glide's browser apply). Returns the page's interactive elements with refs (b1, b2…) and its text. Opening a search-results address with the query in it (e.g. https://www.amazon.com/s?k=usb+c+cable) is often faster and more reliable than filling in search forms and date pickers.",
         inputSchema: BrowserArgs.object([
             ("url", BrowserArgs.string("Address to open, e.g. https://example.com or example.com/page.")),
             ("new_tab", BrowserArgs.boolean("Open in another tab instead of reusing this task's tab (default false).")),
@@ -267,7 +287,7 @@ struct BrowserSnapshotTool: AgentTool {
     let rt: BrowserRuntime
     let spec = ToolSpec(
         name: "browser.snapshot",
-        summary: "Describe the current tab: interactive elements with refs (b1, b2…), headings and readable text. Refs stay valid until the page changes.",
+        summary: "Describe the current tab: interactive elements with refs (b1, b2…), headings and readable text. Refs stay valid until the page changes. To look for something specific (a button, a filter, a field), use browser.find instead of taking more snapshots.",
         inputSchema: BrowserArgs.object([]),
         category: .browser, readOnly: true)
 
@@ -283,6 +303,97 @@ struct BrowserSnapshotTool: AgentTool {
                 : "Current tab (\(tab)):"
             return try await env.pageOutput(tab: tab, lead: lead, previous: nil, maxChars: 8000)
         }
+    }
+}
+
+/// Jumps to an element by its text instead of scrolling and snapshotting until it shows up:
+/// on long pages the snapshot is cut, and an element further down a dialog never appears in it.
+struct BrowserFindTool: AgentTool {
+    let rt: BrowserRuntime
+    let spec = ToolSpec(
+        name: "browser.find",
+        summary: "Find an element on the current tab by its text or label — anywhere on the page, including off-screen, further down a dialog or scrolled panel, and in frames — and scroll it into view. Returns its ref for browser.click or browser.type, and where the other matches are. Use it instead of repeated snapshots or scrolling.",
+        inputSchema: BrowserArgs.object([
+            ("text", BrowserArgs.string("What to look for: the element's visible text, label, placeholder or alt text, e.g. \"Add to Cart\" or \"Cabin\" (any case).")),
+            ("role", BrowserArgs.string("Only elements of this kind, e.g. button, link, checkbox, option or textbox (optional).")),
+            ("nth", BrowserArgs.integer("Which match to take when several fit: 1 is the best (default), 2 the next, and so on.")),
+        ], required: ["text"]),
+        category: .browser, readOnly: true)
+
+    func assess(_ arguments: JSONValue, context: ToolContext) -> ToolVerdict {
+        BrowserRisk.find(text: arguments.optionalString("text") ?? "")
+    }
+
+    func run(_ arguments: JSONValue, context: ToolContext) async throws -> ToolOutput {
+        let text = try arguments.requiredString("text").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { throw ToolError.invalidArguments("missing “text”") }
+        guard text.count <= 300 else { throw ToolError.invalidArguments("“text” is too long (at most 300 characters)") }
+        let role = arguments.optionalString("role")?.trimmingCharacters(in: .whitespaces).lowercased()
+        let nth = BrowserArgs.int(arguments, "nth", default: 1, in: 1...100)
+        return try await rt.perform(context) { env in
+            let tab = try env.requireTab()
+            let previous = env.lastSnapshot(tab)
+            let result = try await env.driver.find(tabID: tab, text: text, role: role?.isEmpty == false ? role : nil, nth: nth)
+            let snap = result.snapshot
+            env.sessions.record(snap, backend: env.kind)
+            return Self.output(result, text: text, role: role, nth: nth, previous: previous)
+        }
+    }
+
+    static func output(_ result: BrowserFindResult, text: String, role: String?, nth: Int, previous: PageSnapshot?) -> ToolOutput {
+        let snap = result.snapshot
+        let quoted = "“\(clip(text, 80))”"
+        guard let match = result.match, let element = snap.element(match.ref) else {
+            var lines: [String] = []
+            if result.match != nil {
+                lines.append("Found \(quoted), but the page changed while Glide scrolled to it. Try browser.find again.")
+            } else if result.total > 0 {
+                lines.append("There \(result.total == 1 ? "is only 1 match" : "are only \(result.total) matches") for \(quoted); nth \(nth) is beyond them.")
+            } else if let role, !result.otherRoles.isEmpty {
+                let kinds = result.otherRoles.map { $0 == "text" ? "plain text" : $0 == "clickable" ? "a clickable element" : "a \($0)" }
+                let listed = kinds.count > 1 ? kinds.dropLast().joined(separator: ", ") + " and " + (kinds.last ?? "") : kinds.joined()
+                lines.append("Nothing with role \(role) matches \(quoted); \(listed) \(kinds.count > 1 ? "do" : "does"). Leave out role, or use one of those.")
+            } else {
+                lines.append("Nothing on the page matches \(quoted).")
+            }
+            if !result.suggestions.isEmpty {
+                lines.append("Similar labels: \(result.suggestions.map { "“\(clip($0, 60))”" }.joined(separator: ", ")).")
+            }
+            return BrowserEnv.render(snap, lead: lines.joined(separator: " "), previous: previous, ok: false, maxChars: 3000,
+                                     extra: ["matches": .number(Double(result.total))])
+        }
+        var lead = "Found \(Self.line(element, at: match.location, in: snap))"
+        if result.stillOutOfView {
+            lead += ". It's \(match.location), and scrolling didn't bring it into view; browser.click can still try it."
+        } else if result.scrolled {
+            lead += ". It was \(match.location); now scrolled into view."
+        } else {
+            lead += ", \(match.location)."
+        }
+        var notes: [String] = []
+        var skip: Set<String> = [match.ref]
+        if !result.others.isEmpty {
+            notes.append("Other matches (\(result.total) in all; nth picks one):")
+            for other in result.others {
+                if let e = snap.element(other.ref) {
+                    notes.append("- \(Self.line(e, at: other.location, in: snap)) — \(other.location) (nth \(other.nth))")
+                    skip.insert(other.ref)
+                } else {
+                    notes.append("- (nth \(other.nth)) \(other.role) \"\(clip(other.name, 60))\" — \(other.location)")
+                }
+            }
+            if result.total > result.others.count + 1 { notes.append("- …and \(result.total - result.others.count - 1) more") }
+        }
+        let found: JSONValue = ["ref": .string(match.ref), "role": .string(match.role), "name": .string(clip(match.name, 80)), "where": .string(match.location)]
+        return BrowserEnv.render(snap, lead: lead, notes: notes, previous: previous, skip: skip,
+                                 extra: ["match": found, "matches": .number(Double(result.total))])
+    }
+
+    /// The element's snapshot line, without its `in "dialog …"` when the location says so already.
+    static func line(_ element: PageSnapshot.Element, at location: String, in snap: PageSnapshot) -> String {
+        var e = element
+        if location.contains("dialog"), e.context?.hasPrefix("dialog") == true { e.context = nil }
+        return snap.line(for: e)
     }
 }
 
@@ -446,7 +557,7 @@ struct BrowserScrollTool: AgentTool {
     let rt: BrowserRuntime
     let spec = ToolSpec(
         name: "browser.scroll",
-        summary: "Scroll the current tab (or the scrollable panel under an element) to reveal more elements. Returns the updated page.",
+        summary: "Scroll the current tab to reveal more elements: an open dialog or popup scrolls first, else the panel you're in, else the page (or the scrollable panel around an element). Returns the updated page. To reach something specific, browser.find is faster.",
         inputSchema: BrowserArgs.object([
             ("direction", BrowserArgs.string("Which way to scroll.", enum: ["up", "down", "left", "right"])),
             ("amount", BrowserArgs.number("How far, in screens (default 1).")),
@@ -469,7 +580,10 @@ struct BrowserScrollTool: AgentTool {
             let previous = env.lastSnapshot(tab)
             if let ref { _ = try env.element(ref, in: tab) }
             let outcome = try await env.driver.scroll(tabID: tab, direction: direction, amount: amount, ref: ref)
-            return try await env.pageOutput(tab: tab, lead: "Scrolled \(direction.rawValue).", notes: outcome.notes, previous: previous, settled: outcome.settled)
+            // Say what moved (or that nothing could) first, so a stuck scroll is obvious.
+            let lead = outcome.moved ? "Scrolled \(outcome.scrolled ?? "the page") \(direction.rawValue)." : (outcome.notes.first ?? "Nothing scrolled.")
+            let notes = (outcome.moved ? outcome.notes : Array(outcome.notes.dropFirst())) + ["To look for something specific, use browser.find."]
+            return try await env.pageOutput(tab: tab, lead: lead, notes: notes, previous: previous, settled: outcome.settled)
         }
     }
 }
@@ -490,7 +604,7 @@ struct BrowserReadTool: AgentTool {
     }
 
     func run(_ arguments: JSONValue, context: ToolContext) async throws -> ToolOutput {
-        let maxChars = min(20_000, max(200, arguments.optionalInt("max_chars") ?? 6000))
+        let maxChars = BrowserArgs.int(arguments, "max_chars", default: 6000, in: 200...20_000)
         let selector = arguments.optionalString("selector")
         return try await rt.perform(context) { env in
             let (tab, _) = try await env.tabForReading()

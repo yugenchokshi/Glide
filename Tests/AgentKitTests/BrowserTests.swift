@@ -211,8 +211,9 @@ enum Fixtures {
 enum ChromeHarness {
     static var installed: Bool { ChromeLocator.executable() != nil }
 
-    static func run(_ body: (GlideChromeBackend, BrowserDriver, FixtureServer) async throws -> Void) async throws {
-        let server = try await FixtureServer.start(Fixtures.route)
+    static func run(route: @escaping @Sendable (_ path: String, _ query: [String: String]) -> (Int, String) = Fixtures.route,
+                    _ body: (GlideChromeBackend, BrowserDriver, FixtureServer) async throws -> Void) async throws {
+        let server = try await FixtureServer.start(route)
         let profile = FileManager.default.temporaryDirectory.appendingPathComponent("glide-chrome-test-\(UUID().uuidString)", isDirectory: true)
         let backend = GlideChromeBackend(configuration: .init(userDataDirectory: profile, headless: true, extraArguments: GlideChromeBackend.quietArguments))
         func cleanUp() async {
@@ -868,6 +869,7 @@ struct BrowserDriverChromeTests {
 
             let scrolled = try await driver.scroll(tabID: tab, direction: .down, amount: 1)
             #expect(scrolled.notes.isEmpty)
+            #expect(scrolled.moved && scrolled.scrolled == "the page")
             #expect(try await driver.snapshot(tabID: tab).scrollY > 100)
 
             _ = try await driver.type(tabID: tab, ref: try #require(snap.named("Query")).ref, text: "pressed")
@@ -999,7 +1001,7 @@ struct BrowserDriverChromeTests {
         #expect(await backend.isConnected(), "the other caller still gets Chrome")
         #expect(await backend.launchedProcessID != nil)
         await backend.shutdown()
-        #expect(Self.processes(using: profile) == 0)
+        #expect(await Self.processesLeft(using: profile) == 0)
     }
 
     @Test func managesTwoTabsIncludingBackgroundOnes() async throws {
@@ -1038,7 +1040,7 @@ struct BrowserDriverChromeTests {
         await backend.shutdown()
         #expect(await backend.isConnected() == false)
         #expect(await backend.launchedProcessID == nil)
-        #expect(Self.processes(using: profile) == 0, "no Chrome keeps running on the profile")
+        #expect(await Self.processesLeft(using: profile) == 0, "no Chrome keeps running on the profile")
         try? FileManager.default.removeItem(at: profile)
     }
 
@@ -1056,6 +1058,17 @@ struct BrowserDriverChromeTests {
         return text.split(whereSeparator: \.isNewline).count
     }
 
+    /// `processes(using:)` once they've had up to 2 s to finish exiting: on a busy Mac (other
+    /// suites run Chrome at the same time) a killed helper can still be listed for a moment.
+    static func processesLeft(using profile: URL) async -> Int {
+        var count = processes(using: profile)
+        for _ in 0..<20 where count != 0 {
+            try? await Task.sleep(for: .milliseconds(100))
+            count = processes(using: profile)
+        }
+        return count
+    }
+
     @Test func reconnectsAfterChromeQuits() async throws {
         try await ChromeHarness.run { backend, driver, server in
             #expect(await backend.isConnected())
@@ -1067,7 +1080,7 @@ struct BrowserDriverChromeTests {
             #expect(await backend.isConnected() == false)
             #expect(!GlideChromeBackend.isProcess(pid, under: bundle))
             #expect(helpers.allSatisfy { !GlideChromeBackend.isProcess($0, under: bundle) }, "no helper outlives shutdown")
-            #expect(Self.processes(using: await backend.currentConfiguration.userDataDirectory) == 0)
+            #expect(await Self.processesLeft(using: await backend.currentConfiguration.userDataDirectory) == 0)
             try await backend.connect()
             #expect(await backend.isConnected())
             let (_, snap) = try await ChromeHarness.openHome(driver, server)
@@ -1096,7 +1109,7 @@ struct BrowserToolChromeTests {
     @Test func openClickTypeAndAssessThroughTheRegistry() async throws {
         try await ChromeHarness.run { backend, _, server in
             let (tools, ctx, _) = setUp(backend)
-            #expect(tools.specs(in: [.browser]).count == 13)
+            #expect(tools.specs(in: [.browser]).count == 14)
             let open = try #require(tools.tool(named: "browser.open"))
             #expect(open.assess(["url": .string(server.url("/"))], context: ctx).risk == .low)
             let opened = try await open.run(["url": .string(server.url("/"))], context: ctx)
@@ -1274,9 +1287,10 @@ enum ChromeForTesting {
     /// throwaway profile, pairs the two through the extension's own pairing page (by clicking
     /// Pair, as the person would), serves the fixture site and runs `body`. `chrome` is the same
     /// browser seen over its debugging port, for setting the scene. Always cleans up.
-    static func run(_ body: (_ backend: ExtensionBackend, _ chrome: GlideChromeBackend, _ server: FixtureServer) async throws -> Void) async throws {
+    static func run(route: @escaping @Sendable (_ path: String, _ query: [String: String]) -> (Int, String) = Fixtures.route,
+                    _ body: (_ backend: ExtensionBackend, _ chrome: GlideChromeBackend, _ server: FixtureServer) async throws -> Void) async throws {
         let executable = try #require(executable)
-        let server = try await FixtureServer.start(Fixtures.route)
+        let server = try await FixtureServer.start(route)
         let token = BridgeAuth.mintToken()
         let bridge = ExtensionBridge()
         bridge.start(port: 0, store: InMemoryExtensionBridgeStore(token: token))
