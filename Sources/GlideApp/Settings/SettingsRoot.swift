@@ -5,11 +5,12 @@ import AutomationKit
 import ServiceManagement
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case general, providers, models, integrations, browser, speed, jobs, permissions, safety, shortcuts, skills, history, about
+    case general, voice, providers, models, integrations, browser, speed, jobs, permissions, safety, shortcuts, skills, history, about
     var id: String { rawValue }
     var title: String {
         switch self {
         case .general: return "General"
+        case .voice: return "Voice"
         case .providers: return "AI Providers"
         case .models: return "Models"
         case .integrations: return "Integrations"
@@ -27,6 +28,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .general: return "gearshape"
+        case .voice: return "waveform"
         case .providers: return "key"
         case .models: return "cpu"
         case .integrations: return "square.grid.2x2"
@@ -44,7 +46,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
 
     /// Sidebar groups, as in BoardUI's settings modal.
     static let groups: [(String, [SettingsSection])] = [
-        ("Settings", [.general, .providers, .models, .integrations, .browser]),
+        ("Settings", [.general, .voice, .providers, .models, .integrations, .browser]),
         ("Agent", [.speed, .jobs, .permissions, .safety, .shortcuts, .skills]),
         ("Data", [.history, .about]),
     ]
@@ -101,6 +103,7 @@ struct SettingsRootView: View {
     @ViewBuilder var page: some View {
         switch nav.selection {
         case .general: GeneralSettingsView(store: store)
+        case .voice: VoiceSettingsView(store: store, onOpenProviders: { nav.select(.providers) })
         case .providers: ProvidersSettingsView(store: store)
         case .models: ModelsSettingsView(store: store)
         case .integrations: IntegrationsSettingsView(store: store)
@@ -218,9 +221,6 @@ struct GeneralSettingsView: View {
             }
             BKFormRow(title: "Hide result after", detail: "Successful results collapse back into the notch after this many seconds.") {
                 BKStepper(value: $store.settings.completedDismissSeconds, range: 2...30) { "\(Int($0)) s" }
-            }
-            BKFormRow(title: "Voice input", detail: "Show a microphone button for on-device dictation.") {
-                BKSwitch(isOn: $store.settings.enableVoiceInput, label: "Voice input")
             }
         }
         BKGroupHeader(title: "System")

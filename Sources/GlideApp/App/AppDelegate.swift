@@ -7,7 +7,10 @@ import AutomationKit
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let store = SettingsStore.shared
     let controller = TaskController.shared
-    lazy var notchModel = NotchModel(controller: controller, settings: store)
+    /// Glide's voice: on-device recognition, the natural OpenAI voice (Apple's offline).
+    lazy var voice = VoiceSession(recognizer: OnDeviceRecognizer(), speaker: GlideSpeaker.shared,
+                                  settings: { [store] in store.settings.voice }, micAuthorized: { VoicePermissions.micAuthorized })
+    lazy var notchModel = NotchModel(controller: controller, settings: store, voice: voice)
     var notch: NotchWindowController?
     var statusItem: StatusItemController?
     let hotkeys = HotkeyManager()
@@ -29,6 +32,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                           onJobs: { [weak self] in self?.showSettings("jobs") })
         controller.onAttentionNeeded = { [weak self] in self?.notchModel.recompute() }
         controller.onFinished = { [weak self] result in self?.notchModel.taskFinished(result) }
+        // Everything Glide wants said: shown in the notch, spoken per Settings › Voice.
+        controller.onSpeech = { [weak self] cue in self?.notchModel.hear(cue) }
         startJobs()
 
         hotkeys.handler = { [weak self] action in
@@ -39,6 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             case .pauseResume: self.notchModel.togglePause()
             case .stop:
                 // The emergency stop halts everything: the quick task and every background job.
+                self.voice.reset()
                 self.controller.stop()
                 JobCenter.shared.haltAll()
             }
@@ -152,6 +158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        voice.reset()
         controller.stop()
     }
 
@@ -221,7 +228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.onboardingWindow = nil
                 if let intro {
                     NSApp.hide(nil)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.controller.start(intro) }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.controller.handleUtterance(intro, source: .typed) }
                 }
             }
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 540), styleMask: [.titled, .closable, .fullSizeContentView],

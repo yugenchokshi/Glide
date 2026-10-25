@@ -83,6 +83,9 @@ final class NotchPanel: NSPanel {
 enum NotchPresentation: Equatable {
     /// `job`: a background job's confirmation or finished card.
     case idle, hover, input, running, detail, approval, result, job
+    /// Voice: the user is talking (waveform + live text); Glide is working out a reply; Glide
+    /// says a short line; Glide asks a question (with option chips).
+    case listening, thinking, speaking, question
 }
 
 /// An approval the notch is showing: the quick task's, or one a background job is waiting on.
@@ -174,6 +177,17 @@ final class NotchModel {
     let controller: TaskController
     let settings: SettingsStore
     let jobs: any JobsSource
+    /// Listening, speaking and turn-taking. Inert (no microphone, no audio) unless the app
+    /// passes the real one.
+    let voice: VoiceSession
+    /// The user asked to type (a key while listening, the keyboard button on a question): the
+    /// text field shows even over a question or a running task.
+    var typingRequested = false
+    /// A question the user closed the notch on; it stays answerable but off screen.
+    private var dismissedQuestionID: String?
+    /// The controller's pending question as of the last recompute, to notice it going away.
+    @ObservationIgnored private var seenPendingQuestionID: String?
+    @ObservationIgnored private var recomputing = false
     var openSettings: (String?) -> Void = { _ in }
     /// Opens Settings › Jobs on one job.
     var openJob: (String) -> Void = { _ in }
@@ -201,17 +215,50 @@ final class NotchModel {
     /// Jobs the user stopped from the notch: their "stopped" result card would only echo the click.
     private var stoppedFromNotch: Set<String> = []
 
-    init(controller: TaskController, settings: SettingsStore, jobs: (any JobsSource)? = nil) {
+    init(controller: TaskController, settings: SettingsStore, jobs: (any JobsSource)? = nil, voice: VoiceSession? = nil) {
         self.controller = controller
         self.settings = settings
         self.jobs = jobs ?? JobCenter.shared
+        self.voice = voice ?? .inert()
+        self.voice.onUtterance = { [weak self] text, source in self?.utterance(text, source: source) }
+        self.voice.onTypingRequested = { [weak self] prefill in self?.showTyping(prefill) }
+        self.voice.onChange = { [weak self] in self?.recompute() }
+    }
+
+    /// The question the notch shows: the controller's pending one (or, a moment before it is
+    /// set, the one Glide just asked), unless the user closed the notch on it.
+    var shownQuestion: AgentQuestion? {
+        guard let q = controller.pendingQuestion ?? voice.activeQuestion, q.id != dismissedQuestionID else { return nil }
+        return q
+    }
+
+    /// The user is talking to Glide (not just a listen Glide opened to catch an interruption,
+    /// and not an answer, which shows in the question card).
+    var showsListening: Bool {
+        switch voice.purpose {
+        case .request: return true
+        case .bargeIn: return !voice.partial.isEmpty && shownQuestion == nil
+        case .answer, nil: return false
+        }
     }
 
     func recompute() {
+        guard !recomputing else { return }
+        recomputing = true
+        defer { recomputing = false }
         let c = controller
+        // A question answered or defaulted elsewhere takes the voice session's copy with it.
+        if let seen = seenPendingQuestionID, c.pendingQuestion?.id != seen { voice.clearQuestion(id: seen) }
+        seenPendingQuestionID = c.pendingQuestion?.id
         let p: NotchPresentation
         if activeApproval != nil {
             p = .approval
+        } else if showsListening {
+            p = .listening
+        } else if inputOpen && typingRequested {
+            p = historyOpen || detailOpen ? .detail : .input
+        } else if shownQuestion != nil {
+            p = .question
         } else if c.isRunning {
             p = detailOpen ? .detail : .running
         } else if inputOpen {
@@ -220,6 +267,10 @@ final class NotchModel {
             p = .job
         } else if resultVisible {
             p = detailOpen ? .detail : .result
+        } else if voice.caption != nil {
+            p = .speaking
+        } else if voice.awaitingReply {
+            p = .thinking
         } else {
             p = hovering ? .hover : .idle
         }
@@ -360,18 +411,54 @@ final class NotchModel {
         case .approval: return CGSize(width: max(n.width + 240, 560), height: top + 190)
         case .result: return CGSize(width: max(n.width + 240, 560), height: top + 116)
         case .job: return CGSize(width: max(n.width + 240, 560), height: top + (attentionJob?.status == .awaitingConfirmation ? 168 : 116))
+        case .listening:
+            let extra: CGFloat = (shownQuestion != nil ? 22 : 0) + (voice.preparing ? 26 : 0)
+            return CGSize(width: max(n.width + 240, 540), height: top + 84 + extra)
+        case .thinking: return CGSize(width: max(n.width + 160, 420), height: top + 46)
+        case .speaking: return CGSize(width: max(n.width + 220, 520), height: top + 58)
+        case .question:
+            let q = shownQuestion
+            let chips: CGFloat = (q?.options.isEmpty ?? true) ? 0 : 38
+            let status: CGFloat = controller.isRunning ? 20 : 0
+            let lines: CGFloat = (q?.text.count ?? 0) > 64 ? 40 : 22
+            let listening: CGFloat = voice.purpose == .answer ? 28 : 0
+            return CGSize(width: max(n.width + 240, 560), height: top + 34 + lines + chips + status + listening)
         }
     }
 
-    var wantsKey: Bool { presentation == .input || (presentation == .detail && !controller.isRunning) }
+    /// Keyboard focus only for states the user opened to type or talk in. A question or an
+    /// answer window that pops up mid-task never takes focus: the agent may be typing into the
+    /// app underneath, and its keystrokes must keep landing there.
+    var wantsKey: Bool {
+        presentation == .input || (presentation == .detail && !controller.isRunning)
+            || (presentation == .listening && voice.userInitiated)
+    }
 
     /// Set when the user asks to open the notch; used to log open latency.
     var openRequestedAt: CFAbsoluteTime?
 
     func open() {
         openRequestedAt = CFAbsoluteTimeGetCurrent()
+        dismissedQuestionID = nil
+        // Voice-first: opening the notch starts listening, also while a task runs ("stop",
+        // "make it the blue ones"); typing a key switches to the text field.
+        if settings.settings.voice.listenOnOpen {
+            if !controller.isRunning {
+                inputOpen = true
+                resultVisible = false
+                detailOpen = false
+                historyOpen = false
+                jobsDetailOpen = false
+                Task { @MainActor [jobs] in jobs.reload() }
+            }
+            typingRequested = false
+            voice.listen()
+            recompute()
+            return
+        }
         guard !controller.isRunning else { detailOpen.toggle(); recompute(); return }
         inputOpen = true
+        typingRequested = true
         resultVisible = false
         detailOpen = false
         historyOpen = false
@@ -383,6 +470,11 @@ final class NotchModel {
     }
 
     func close() {
+        // Closing is "not now": the microphone goes off, Glide stops talking, and a question on
+        // show goes out of sight (it can still be answered by voice or from the next open).
+        if let q = shownQuestion { dismissedQuestionID = q.id }
+        voice.reset()
+        typingRequested = false
         inputOpen = false
         detailOpen = false
         historyOpen = false
@@ -393,19 +485,84 @@ final class NotchModel {
     }
 
     func toggle() {
-        if inputOpen || detailOpen || resultVisible || attentionJob != nil { close() } else { open() }
+        if inputOpen || detailOpen || resultVisible || attentionJob != nil || showsListening { close() } else { open() }
     }
 
     func submit() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         inputOpen = false
+        typingRequested = false
         historyOpen = false
         detailOpen = false
         resultVisible = false
-        controller.start(text)
         inputText = ""
+        voice.noteTyped()
+        controller.handleUtterance(text, source: .typed)
         recompute()
+    }
+
+    // MARK: Voice
+
+    /// A cue from `TaskController.onSpeech`.
+    func hear(_ cue: SpeechCue) {
+        if case .question(let q) = cue, q.id == dismissedQuestionID { dismissedQuestionID = nil }
+        voice.hear(cue)
+        recompute()
+    }
+
+    /// The voice session heard a full utterance.
+    private func utterance(_ text: String, source: UtteranceSource) {
+        inputOpen = false
+        typingRequested = false
+        resultVisible = false
+        detailOpen = false
+        historyOpen = false
+        inputText = ""
+        controller.handleUtterance(text, source: source)
+        recompute()
+    }
+
+    /// Shows the text field, prefilled (the user started typing, or listening ended unheard).
+    func showTyping(_ prefill: String) {
+        inputText = prefill
+        inputOpen = true
+        typingRequested = true
+        focusToken += 1
+        recompute()
+    }
+
+    /// A key while listening: the microphone closes and the text field takes over, with what
+    /// was heard so far followed by the key that was typed.
+    func switchToTyping(typed: String = "") {
+        let heard = voice.takeTranscriptForTyping()
+        showTyping(heard.isEmpty ? typed : (typed.isEmpty ? heard : heard + " " + typed))
+    }
+
+    /// The mic button: listen, continuing whatever was typed.
+    func startListening() {
+        typingRequested = false
+        voice.listen(prefix: inputText)
+        recompute()
+    }
+
+    /// An option chip. Clicks the agent posted are dropped, as for approvals.
+    func answerQuestion(_ question: AgentQuestion, with option: String) {
+        guard acceptsUserDecision(forJob: false) else { return }
+        if controller.pendingQuestion?.id == question.id {
+            controller.answer(questionID: question.id, with: option)
+        } else {
+            controller.handleUtterance(option, source: .option)
+        }
+        voice.noteAnswered(questionID: question.id)
+        recompute()
+    }
+
+    /// The keyboard button on a question: type the answer.
+    func typeAnswer() {
+        guard acceptsUserDecision(forJob: false) else { return }
+        voice.cancelListening()
+        showTyping("")
     }
 
     func taskFinished(_ result: TaskResult) {
@@ -654,6 +811,14 @@ final class NotchWindowController {
             _ = model.jobs.pendingApprovals
             _ = model.attentionJobID
             _ = model.screenHolder
+            _ = model.controller.pendingQuestion
+            _ = model.typingRequested
+            _ = model.voice.purpose
+            _ = model.voice.partial.isEmpty
+            _ = model.voice.caption
+            _ = model.voice.awaitingReply
+            _ = model.voice.activeQuestion
+            _ = model.voice.preparing
         } onChange: { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -703,7 +868,7 @@ final class NotchWindowController {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.42, execute: work)
         }
         updateKeyStatus()
-        if let t = model.openRequestedAt, model.presentation == .input {
+        if let t = model.openRequestedAt, model.presentation == .input || model.presentation == .listening {
             model.openRequestedAt = nil
             panel.displayIfNeeded()
             let ms = (CFAbsoluteTimeGetCurrent() - t) * 1000

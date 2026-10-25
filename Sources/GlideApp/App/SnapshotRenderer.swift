@@ -70,6 +70,36 @@ enum SnapshotRenderer {
             model.resultVisible = true
         }
 
+        // Voice: talking, thinking, Glide speaking, and a question asked mid-task.
+        let voice = model.voice
+        let levels: [Float] = (0..<VoiceSession.levelCount).map { i in 0.25 + 0.55 * abs(sin(Float(i) * 0.7)) * (i % 3 == 0 ? 0.6 : 1) }
+        let socks = AgentQuestion(id: "q-socks", text: "Which socks would you like?", options: ["Athletic crew", "No-show", "Wool", "Dress"],
+                                  defaultOption: "Athletic crew", lowRisk: true)
+        shot("listening") {
+            controller.previewState(phase: .idle, status: "")
+            model.resultVisible = false
+            model.inputOpen = true
+            voice.previewState(purpose: .request, partial: "Add some socks to my Amazon cart", levels: levels)
+        }
+        shot("listening-setup") { voice.previewState(purpose: .request, preparing: 0.42) }
+        shot("thinking") {
+            model.inputOpen = false
+            voice.previewState(awaitingReply: true)
+        }
+        shot("speaking") { voice.previewState(caption: "On it — opening Amazon.", speaking: true) }
+        shot("question") {
+            controller.previewState(phase: .executing, status: "Searching Amazon for socks", instruction: "Add socks to my Amazon cart")
+            voice.previewState(question: socks)
+        }
+        shot("question-listening") {
+            voice.previewState(purpose: .answer, partial: "the wool ones", levels: levels, question: socks, userInitiated: false)
+        }
+        shot("follow-up") {
+            controller.previewState(phase: .idle, status: "")
+            voice.previewState(question: AgentQuestion(id: "q-chatgpt", text: "ChatGPT is open. Want me to do anything there?", options: ["Ask it something", "No thanks"]))
+        }
+        voice.previewState()
+
         // Background jobs.
         let demo = PreviewJobs.demo()
         shot("job-idle") {
@@ -309,6 +339,12 @@ enum SettingsSnapshotRenderer {
             status: BrowserStatus(backend: .extensionBridge, connected: false, detail: "Not connected", chromeInstalled: true, extensionPaired: false),
             pairing: BrowserPairingInfo(token: "demo", port: 47823, extensionFolder: URL(fileURLWithPath: "/Applications/Glide.app/Contents/Resources/ChromeExtension"),
                                         extensionID: "demo", pairingURL: URL(string: "chrome-extension://demo/pair.html")))
+        let language = AppleVoices.userLanguage
+        let voices = [
+            AppleVoiceOption(id: "demo.zoe", name: "Zoe", language: language, quality: .premium),
+            AppleVoiceOption(id: "demo.ava", name: "Ava", language: language, quality: .enhanced),
+            AppleVoiceOption(id: "demo.samantha", name: "Samantha", language: language, quality: .standard),
+        ]
         func settings(_ section: SettingsSection, _ name: String, height: CGFloat = 640, dark: Bool = false, tab: IntegrationsSettingsView.Tab = .apps) {
             nav.select(section)
             let root = SettingsRootView(nav: nav, store: store, onHotkeysChanged: {}, hotkeyConflicts: { [:] }, jobs: jobs, browserPreview: browser)
@@ -316,6 +352,11 @@ enum SettingsSnapshotRenderer {
             let view = Group {
                 if section == .integrations {
                     SettingsPageFrame(nav: nav) { IntegrationsSettingsView(store: store, initialTab: tab, previewMCPStatus: mcpStatus) }
+                } else if section == .voice {
+                    SettingsPageFrame(nav: nav) {
+                        VoiceSettingsView(store: store, previewPermissions: [.microphone: .granted, .speechRecognition: .notDetermined],
+                                          previewVoices: voices, previewHasOpenAIKey: true)
+                    }
                 } else {
                     root
                 }
@@ -323,6 +364,8 @@ enum SettingsSnapshotRenderer {
             render(view, size: CGSize(width: 920, height: height), dark: dark, to: "\(dir)/settings-\(name)\(dark ? "-dark" : "").png")
         }
         settings(.general, "general")
+        settings(.voice, "voice", height: 1060)
+        settings(.voice, "voice", height: 1060, dark: true)
         settings(.providers, "providers", height: 900)
         settings(.providers, "providers", height: 900, dark: true)
         settings(.models, "models")
