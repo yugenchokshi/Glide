@@ -114,7 +114,8 @@ public struct GUIStepRunner: StepExecuting {
         }
         return StepResult(status: status, output: output.joined(separator: "\n"), fields: outcome.fields, actions: outcome.actions,
                           modelCalls: snapshot.modelCalls + snapshot.jevCalls,
-                          usage: LLMUsage(inputTokens: snapshot.inputTokens, outputTokens: snapshot.outputTokens))
+                          usage: LLMUsage(inputTokens: snapshot.inputTokens, outputTokens: snapshot.outputTokens),
+                          sideEffects: session.sideEffects)
     }
 
     // MARK: - The loop
@@ -367,6 +368,38 @@ public struct GUIStepRunner: StepExecuting {
         return ["read", "extract", "summar", "find", "look up", "get the", "collect", "note the", "copy"].contains { s.contains($0) }
     }
 
+    /// ⌘ shortcuts that only look or move around (copy, select all, find, address bar, tabs).
+    static let lookingShortcuts: Set<String> = ["c", "a", "f", "g", "l", "t", "w", "tab", "[", "]", "`", "left", "right", "up", "down"]
+
+    /// One line for an action that may have changed something (`TaskSession.sideEffects`); nil
+    /// for looking around: scrolling, focusing, selecting, switching apps, waiting, and keys
+    /// other than Return or a ⌘ shortcut that does something.
+    static func sideEffect(_ action: ComputerAction, label: String?, app: String?) -> String? {
+        let target = label.flatMap { $0.isEmpty ? nil : "“\(ToolStepRunner.clip($0, 60))”" }
+        let place = app.map { " in \($0)" } ?? ""
+        switch action {
+        case .click, .doubleClick:
+            return "Clicked \(target ?? "the screen")\(place)"
+        case .typeText(let text, _, _, let submit):
+            return "Typed “\(ToolStepRunner.clip(text, 80))”" + (target.map { " into \($0)" } ?? "") + place + (submit ? " and pressed Return" : "")
+        case .setValue(_, let value):
+            return "Set \(target ?? "a field") to “\(ToolStepRunner.clip(value, 80))”\(place)"
+        case .keyPress(let keys):
+            let key = keys.key.lowercased()
+            let submits = ["return", "enter", "keypadenter"].contains(key)
+            guard submits || (keys.modifiers.contains(.command) && !lookingShortcuts.contains(key)) else { return nil }
+            return "Pressed \(keys.displayString)\(place)"
+        case .menu(let path):
+            return "Chose \(path.joined(separator: " › "))\(place)"
+        case .openURL(let url, _):
+            return "Opened \(ToolStepRunner.clip(url, 200))"
+        case .drag:
+            return "Dragged \(target ?? "an item")\(place)"
+        case .rightClick, .scroll, .focus, .selectText, .launchApp, .activateApp, .waitFor:
+            return nil
+        }
+    }
+
     static func isTerminalNative(_ action: ComputerAction) -> Bool {
         switch action {
         case .launchApp, .activateApp, .openURL: return true
@@ -492,6 +525,7 @@ public struct GUIStepRunner: StepExecuting {
             let outcome = try await runtime.executor.execute(action, observation: obs)
             r.session.addActions()
             await r.metrics.recordAction(deterministic: deterministic)
+            if let effect = Self.sideEffect(action, label: target?.label, app: app?.name) { r.session.recordSideEffect(effect) }
             if let a = outcome.app { r.session.currentApp = a }
             let expectation: Expectation = expect.map { .elementAppears($0) } ?? outcome.expectation
             let verifyApp = outcome.app ?? app

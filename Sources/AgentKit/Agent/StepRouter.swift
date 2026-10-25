@@ -56,6 +56,7 @@ final class TaskSession: @unchecked Sendable {
     private let lock = NSLock()
     private var _notes: [String] = []
     private var _actions = 0
+    private var _sideEffects: [String] = []
     private var _screenshotConsent = false
     private var _currentApp: AppInfo?
     private var _deadline: Date
@@ -94,6 +95,23 @@ final class TaskSession: @unchecked Sendable {
 
     var totalActions: Int { lock.withLock { _actions } }
     func addActions(_ n: Int = 1) { lock.withLock { _actions += n } }
+
+    /// Actions that changed something outside Glide, in order, so a retried step or the
+    /// recovery planner checks them instead of repeating them. Recorded as they happen, so a
+    /// step that ends with an error still leaves its clicks on the record.
+    var sideEffects: [String] { lock.withLock { _sideEffects } }
+
+    func recordSideEffect(_ effect: String) {
+        let trimmed = effect.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        lock.withLock {
+            _sideEffects.append(trimmed)
+            if _sideEffects.count > Self.maxSideEffects { _sideEffects.removeFirst(_sideEffects.count - Self.maxSideEffects) }
+        }
+    }
+
+    /// Side effects kept; prompts show fewer still (`RetryNotes.maxShown`).
+    static let maxSideEffects = 40
 
     var screenshotConsentGiven: Bool {
         get { lock.withLock { _screenshotConsent } }

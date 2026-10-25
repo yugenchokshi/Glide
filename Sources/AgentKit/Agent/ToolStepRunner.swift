@@ -13,6 +13,13 @@ import AutomationKit
 /// Limits: `maxTurns` model turns per step, an error budget, and a guard that fails the step
 /// when the same call fails three times in a row. Each call also has a hard timeout as a
 /// backstop for tools that hang.
+///
+/// Loop breaker: in the baseline runs a browser step looked at the same product page 78 times
+/// without finding its button, spending every turn of every retry. A turn that only looks
+/// (snapshots, repeated reads), scrolls without moving, or repeats an action that changed
+/// nothing, while the page's fingerprint stays the same, makes no progress. After two such
+/// turns in a row the prompt says so and points at `browser.find`; after the third the step
+/// ends as `stalled`, so recovery (for a browser step, a try on the screen) starts at once.
 public struct ToolStepRunner: StepExecuting {
     /// Composio and MCP access for the integration routes; injectable for tests.
     public struct Integrations: Sendable {
@@ -64,6 +71,25 @@ public struct ToolStepRunner: StepExecuting {
     static let repeatedFailureLimit = 3
     /// Declined calls in one step before it stops to ask the user how to proceed.
     static let rejectionLimit = 2
+    /// No-progress turns in a row before the prompt says the approach isn't working.
+    static let nudgeAfterIdleTurns = 2
+    /// No-progress turns in a row that end the step as stalled.
+    static let stallAfterIdleTurns = 3
+
+    /// How the turn-limit failure starts; `isTurnLimit` recognizes it (a browser step that ran
+    /// out of turns gets its try on the screen, like a stalled one).
+    static let turnLimitPrefix = "Reached the limit of "
+    static func isTurnLimit(_ reason: String) -> Bool { reason.hasPrefix(turnLimitPrefix) }
+
+    /// Starts the line listing what a stuck step tried (see `facts(in:)`).
+    static let triedPrefix = "What it tried: "
+
+    /// A step's output without the line listing what it tried: the facts it found, which are
+    /// what notes and the final answer should carry.
+    static func facts(in output: String) -> String {
+        output.split(separator: "\n", omittingEmptySubsequences: false).filter { !$0.hasPrefix(triedPrefix) }
+            .joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     let settings: AppSettings
     let runtime: AutomationRuntime
@@ -168,6 +194,7 @@ public struct ToolStepRunner: StepExecuting {
         let listing = stepTools.promptListing(categories: request.allowedCategories)
         let maxBatch = settings.tools.batchActions ? min(max(settings.tools.maxBatch, 1), 10) : 1
         let schema = ToolDecisionSchema.schema(maxBatch: maxBatch)
+        let canFind = stepTools.tool(named: "browser.find") != nil
 
         for _ in 0..<max(1, request.maxTurns) {
             try await checkStop(gates)
@@ -176,7 +203,8 @@ public struct ToolStepRunner: StepExecuting {
             // 1. Decide.
             let decision: ToolDecision
             do {
-                let message = prompt(request, listing: listing, history: state.history, maxBatch: maxBatch, extraContext: extraContext)
+                let message = prompt(request, listing: listing, history: state.history, maxBatch: maxBatch, extraContext: extraContext,
+                                     warning: state.nudge)
                 let response = try await complete(system: Prompts.toolStep, message: message, schema: schema, name: "tool_step", state: &state)
                 guard let json = response.json else { throw LLMError.invalidJSON(response.text) }
                 decision = ToolDecisionSchema.decode(json)
@@ -208,6 +236,7 @@ public struct ToolStepRunner: StepExecuting {
             if decision.calls.count > maxBatch {
                 state.note("only the first \(maxBatch) calls ran (the limit per turn); send the rest next turn")
             }
+            state.progress.beginTurn()
             for call in calls {
                 if batchFailed {
                     state.history.append(HistoryEntry(header: "\(call.tool) → not run (an earlier call in this batch failed)"))
@@ -230,7 +259,18 @@ public struct ToolStepRunner: StepExecuting {
                     if state.rejections >= Self.rejectionLimit {
                         return state.result(.blocked("You declined the proposed actions. Tell me how you'd like to proceed."))
                     }
+                case .needsUser(let message):
+                    return state.result(.blocked(message))
                 }
+            }
+
+            // Loop breaker: a turn that changed nothing on the page counts toward a stall.
+            if !calls.isEmpty {
+                let idle = state.progress.endTurn()
+                if idle >= Self.stallAfterIdleTurns && !finishing {
+                    return state.result(.stalled(state.progress.stallReason), message: state.triedSummary)
+                }
+                state.nudge = idle >= Self.nudgeAfterIdleTurns ? state.progress.nudge(canFind: canFind) : nil
             }
 
             // 3. Finish when the model says the step is done.
@@ -263,8 +303,8 @@ public struct ToolStepRunner: StepExecuting {
             }
             return state.result(.done, message: decision.message, fields: fields)
         }
-        return state.result(.failed("Reached the limit of \(max(1, request.maxTurns)) turns without finishing “\(request.step.title)”." +
-                                    (state.lastError.isEmpty ? "" : " Last problem: \(state.lastError)")))
+        return state.result(.failed(Self.turnLimitPrefix + "\(max(1, request.maxTurns)) turns without finishing “\(request.step.title)”." +
+                                    (state.lastError.isEmpty ? "" : " Last problem: \(state.lastError)")), message: state.triedSummary)
     }
 
     // MARK: - One call
@@ -273,6 +313,8 @@ public struct ToolStepRunner: StepExecuting {
         case ok
         case failed(String)
         case declined
+        /// The page needs the user before anything else can happen (a bot check).
+        case needsUser(String)
     }
 
     private func runCall(_ call: ToolDecision.Call, request: StepRequest, stepTools: ToolRegistry, callbacks: AgentCallbacks,
@@ -281,6 +323,7 @@ public struct ToolStepRunner: StepExecuting {
         func refuse(_ message: String) -> CallOutcome {
             state.history.append(HistoryEntry(header: "\(call.tool) \(call.argumentsText) → NOT RUN: \(message)"))
             state.lastError = message
+            state.progress.recordNotRun()
             return .failed(message)
         }
 
@@ -338,6 +381,7 @@ public struct ToolStepRunner: StepExecuting {
             case .reject:
                 callbacks.log(ActivityEntry(kind: .approval, title: "You declined: \(verdict.summary)", route: route, success: false, stepID: request.step.id))
                 state.history.append(HistoryEntry(header: "\(call.tool) \(call.argumentsText) → DECLINED by the user; don't retry it"))
+                state.progress.recordNotRun()
                 callbacks.phase(.executing, request.step.title + "…")
                 return .declined
             case .stop:
@@ -368,8 +412,21 @@ public struct ToolStepRunner: StepExecuting {
         callbacks.log(ActivityEntry(kind: .tool, title: "\(output.ok ? "Ran" : "Failed"): \(verdict.summary)", detail: String(output.text.prefix(500)),
                                     route: route, success: output.ok, durationMs: ms, stepID: request.step.id))
         state.browser.absorb(tool: call.tool, output: output)
+        let pageBefore = state.progress.url
+        state.progress.record(tool: call.tool, signature: call.signature, output: output)
+        state.noteTried(verdict.summary)
+        if output.ok, let effect = Self.sideEffect(tool: tool.spec, arguments: args, verdict: verdict, pageURL: pageBefore) {
+            state.sideEffects.append(effect)
+            session?.recordSideEffect(effect)
+        }
         let status = output.ok ? "ok" : "FAILED"
         state.history.append(HistoryEntry(header: "\(call.tool) \(call.argumentsText) → \(status) (\(Int(ms)) ms)", body: output.text))
+        if output.data?["botCheck"]?.boolValue == true {
+            // Nothing else can happen on the page until a person answers it, and Glide never
+            // tries to get past one.
+            let site = (output.data?["url"]?.stringValue ?? state.progress.url).flatMap { URL(string: $0)?.host } ?? "This site"
+            return .needsUser("\(site) wants to check that you're a person. Please complete the check in Chrome, then run the task again.")
+        }
         if output.ok {
             state.lastOK = output.text
             return .ok
@@ -483,7 +540,7 @@ public struct ToolStepRunner: StepExecuting {
         return response
     }
 
-    private func prompt(_ request: StepRequest, listing: String, history: [HistoryEntry], maxBatch: Int, extraContext: String?) -> String {
+    private func prompt(_ request: StepRequest, listing: String, history: [HistoryEntry], maxBatch: Int, extraContext: String?, warning: String? = nil) -> String {
         var m = "Goal: \(request.goal)\n\nSTEP \(request.step.id): \(request.step.title)\nInstruction: \(request.step.instruction)"
         m += "\nDone when: " + (request.step.doneWhen.isEmpty ? "the instruction is complete" : request.step.doneWhen)
         if !request.step.outputFields.isEmpty {
@@ -494,7 +551,37 @@ public struct ToolStepRunner: StepExecuting {
         m += "\n\nTools (at most \(maxBatch) call\(maxBatch == 1 ? "" : "s") per turn):\n\(listing)"
         // Kept last: the newest results are what the model needs most.
         m += "\n\nRecent results:\n" + HistoryEntry.render(history)
+        // After the results, so it's the last thing read before deciding.
+        if let warning { m += "\n\nWarning: \(warning)" }
         return m
+    }
+
+    /// One line for a call that changed something outside Glide, for retries to check
+    /// (`StepResult.sideEffects`); nil for looking, scrolling, switching tabs, low-risk reads
+    /// and the job's own memory. `pageURL` is the page the call acted on.
+    static func sideEffect(tool spec: ToolSpec, arguments: JSONValue, verdict: ToolVerdict, pageURL: String?) -> String? {
+        let on = pageURL.flatMap { URL(string: $0)?.host }.map { " on \($0)" } ?? ""
+        let label = arguments["_label"]?.stringValue.flatMap { $0.isEmpty ? nil : "“\(clip($0, 80))”" }
+        switch spec.name {
+        case "browser.open":
+            return arguments["url"]?.stringValue.map { "Opened \(clip($0, 200))" }
+        case "browser.click":
+            return "Clicked \(label ?? arguments["ref"]?.stringValue ?? "an element")\(on)"
+        case "browser.type":
+            let text = arguments["text"]?.stringValue ?? ""
+            let submitted = arguments["submit"]?.boolValue == true
+            return "Typed “\(clip(text, 80))” into \(label ?? "a field")\(on)" + (submitted ? " and pressed Return" : "")
+        case "browser.select":
+            return "Chose “\(clip(arguments["value"]?.stringValue ?? "", 80))” in \(label ?? "a list")\(on)"
+        case "browser.press":
+            // Enter submits forms and picks suggestions; Tab, Escape and arrows only move around.
+            let keys = arguments["keys"]?.stringValue ?? ""
+            guard keys.lowercased().contains("enter") || keys.lowercased().contains("return") else { return nil }
+            return "Pressed \(clip(keys, 40))\(on)"
+        default:
+            guard !spec.name.hasPrefix("browser."), spec.category != .workspace, !spec.readOnly, verdict.risk >= .medium else { return nil }
+            return clip(verdict.summary, 200)
+        }
     }
 
     static func appName(for category: ToolCategory) -> String {
@@ -530,10 +617,35 @@ struct LoopState {
     var learned: [String] = []
     var fieldsReminded = false
     var browser = BrowserRefs()
+    /// Whether turns change anything (the loop breaker).
+    var progress = ProgressWatch()
+    /// Shown at the end of the next prompt while turns make no progress.
+    var nudge: String?
+    /// Calls that changed something outside Glide (`StepResult.sideEffects`).
+    var sideEffects: [String] = []
+    /// What the step did, newest last, with repeats folded ("Look at the browser tab ×4").
+    private var tried: [(summary: String, count: Int)] = []
     private var failureSignature: String?
     private var failureStreak = 0
 
     mutating func note(_ text: String) { history.append(HistoryEntry(header: "note: \(text)")) }
+
+    mutating func noteTried(_ summary: String) {
+        if let last = tried.last, last.summary == summary {
+            tried[tried.count - 1].count += 1
+        } else {
+            tried.append((summary, 1))
+            if tried.count > 12 { tried.removeFirst(tried.count - 12) }
+        }
+    }
+
+    /// The step's calls in a line, added to the output of a step that stalled or ran out of
+    /// turns, for its on-screen try.
+    var triedSummary: String? {
+        guard !tried.isEmpty else { return nil }
+        let parts = tried.suffix(8).map { $0.count > 1 ? "\($0.summary) ×\($0.count)" : $0.summary }
+        return ToolStepRunner.triedPrefix + ToolStepRunner.clip(parts.joined(separator: "; "), 700)
+    }
 
     /// Counts an error; true when the budget is exhausted.
     mutating func recordError(_ message: String) -> Bool {
@@ -563,7 +675,149 @@ struct LoopState {
             parts.append("Last result: " + ToolStepRunner.clip(lastOK, 1500))
         }
         return StepResult(status: status, output: parts.joined(separator: "\n"), fields: fields, actions: actions,
-                          modelCalls: modelCalls, usage: usage)
+                          modelCalls: modelCalls, usage: usage, sideEffects: sideEffects)
+    }
+}
+
+/// Tells turns that move the step forward from turns that don't. A turn makes no progress
+/// when every call in it was idle and the page's fingerprint ended where it started. Idle
+/// calls are: a snapshot of a page whose state is already known, a read, tab list, wait or
+/// find that repeats one already made on this unchanged page, a scroll that moved nothing,
+/// and an action identical to one that already changed nothing. Everything else (other tools,
+/// first-time actions, failed or refused calls, which the error guards count) is progress.
+struct ProgressWatch: Sendable {
+    /// Tools whose output describes the page (and carries its fingerprint).
+    static let pageStateTools: Set<String> = ["browser.snapshot", "browser.open", "browser.click", "browser.type", "browser.select", "browser.press",
+                                              "browser.scroll", "browser.back", "browser.wait", "browser.find", "browser.switch_tab"]
+    /// Looking without changing anything; idle when repeated on the same page.
+    static let lookTools: Set<String> = ["browser.read", "browser.tabs", "browser.wait", "browser.find"]
+    /// Actions that are idle when they repeat one that changed nothing.
+    static let actionTools: Set<String> = ["browser.click", "browser.type", "browser.select", "browser.press", "browser.open", "browser.back",
+                                           "browser.switch_tab"]
+
+    /// The latest page fingerprint seen; nil until a page-state tool ran.
+    private(set) var fingerprint: String?
+    /// The latest page's address.
+    private(set) var url: String?
+    /// No-progress turns in a row so far.
+    private(set) var idleTurns = 0
+    /// The calls of those turns, in order.
+    private(set) var idleCalls: [String] = []
+    /// Looks (tool and arguments) already made on the page as it was then.
+    private var looks: Set<String> = []
+    /// Actions that ran and changed nothing.
+    private var ineffective: Set<String> = []
+    private var turnStart: String?
+    private var turnIdle = true
+    private var turnCalls: [String] = []
+
+    mutating func beginTurn() {
+        turnStart = fingerprint
+        turnIdle = true
+        turnCalls = []
+    }
+
+    /// A call that was refused or declined: not idle (other guards count those).
+    mutating func recordNotRun() { turnIdle = false }
+
+    /// A call that ran, with what it returned.
+    mutating func record(tool: String, signature: String, output: ToolOutput) {
+        let before = fingerprint
+        if Self.pageStateTools.contains(tool), let fp = Self.fingerprint(of: output) {
+            fingerprint = fp
+            if let u = output.data?["url"]?.stringValue, !u.isEmpty { url = u }
+        }
+        let idle: Bool
+        if tool == "browser.snapshot" {
+            idle = before != nil && fingerprint == before
+        } else if tool == "browser.scroll" {
+            idle = output.text.contains("Nothing scrolled")
+        } else if Self.lookTools.contains(tool) {
+            idle = !looks.insert("\(before ?? "")|\(signature)").inserted && fingerprint == before
+        } else if Self.actionTools.contains(tool), output.ok, before != nil, fingerprint == before {
+            idle = !ineffective.insert(signature).inserted
+        } else {
+            idle = false
+        }
+        turnIdle = turnIdle && idle
+        turnCalls.append(tool)
+    }
+
+    /// Ends the turn and returns the no-progress turns in a row, this one included.
+    mutating func endTurn() -> Int {
+        if turnIdle && !turnCalls.isEmpty && fingerprint == turnStart {
+            idleTurns += 1
+            idleCalls += turnCalls
+        } else {
+            idleTurns = 0
+            idleCalls = []
+        }
+        return idleTurns
+    }
+
+    /// What the idle turns did, e.g. "looked at the page 4 times and scrolled without anything moving".
+    var idleDescription: String {
+        var order: [String] = []
+        var counts: [String: Int] = [:]
+        for call in idleCalls {
+            let phrase = Self.phrase(call)
+            if counts[phrase] == nil { order.append(phrase) }
+            counts[phrase, default: 0] += 1
+        }
+        let parts = order.map { p -> String in
+            let n = counts[p] ?? 1
+            return n == 1 ? p : (n == 2 ? "\(p) twice" : "\(p) \(n) times")
+        }
+        guard let last = parts.last else { return "did nothing new" }
+        return parts.count == 1 ? last : parts.dropLast().joined(separator: ", ") + " and " + last
+    }
+
+    /// Said in the prompt after two idle turns.
+    func nudge(canFind: Bool) -> String {
+        var s = "the last \(idleTurns) turns only \(idleDescription), and nothing on the page changed. Doing that again won't help."
+        s += canFind ? " Call browser.find with the visible label of what you need (for example {\"text\": \"Add to Cart\"}): it searches the whole page, including dialogs and parts scrolled out of view. Or act on a ref you already have."
+                     : " Act on a ref you already have, or try another way."
+        return s
+    }
+
+    /// Why the step stalled.
+    var stallReason: String {
+        "No progress in \(idleTurns) turns in a row: it only \(idleDescription), and the page didn't change."
+    }
+
+    static func phrase(_ tool: String) -> String {
+        switch tool {
+        case "browser.snapshot": return "looked at the page"
+        case "browser.read": return "read the page text"
+        case "browser.tabs": return "listed the tabs"
+        case "browser.wait": return "waited"
+        case "browser.find": return "searched the page"
+        case "browser.scroll": return "scrolled without anything moving"
+        default:
+            let action = tool.hasPrefix("browser.") ? String(tool.dropFirst("browser.".count)).replacingOccurrences(of: "_", with: " ") : tool
+            return "repeated the same \(action) without any change"
+        }
+    }
+
+    /// The page's fingerprint: the browser tools' own (`data["fingerprint"]`), else one made from
+    /// the address and the elements' roles and names, else from the page part of the text (after
+    /// the first blank line, so the lead and change summary don't count).
+    static func fingerprint(of output: ToolOutput) -> String? {
+        if let fp = output.data?["fingerprint"]?.stringValue, !fp.isEmpty { return fp }
+        var hasher = Hasher()
+        if let data = output.data, let elements = data["elements"]?.arrayValue {
+            hasher.combine(data["url"]?.stringValue ?? "")
+            for e in elements {
+                hasher.combine(e["role"]?.stringValue ?? "")
+                hasher.combine(e["name"]?.stringValue ?? "")
+            }
+            return "h\(hasher.finalize())"
+        }
+        guard output.ok else { return nil }
+        let text = output.text
+        let page = text.range(of: "\n\n").map { String(text[$0.upperBound...]) } ?? text
+        hasher.combine(page)
+        return "t\(hasher.finalize())"
     }
 }
 

@@ -44,9 +44,16 @@ public actor JobRunner {
         public var maxTurnsPerStep: Int
         /// Most items a loop will take from its source.
         public var maxItems: Int
+        /// Brings a browser session's tab and its Chrome window to the front, once the job
+        /// holds the screen, before a stuck browser step's on-screen try (tests: a no-op).
+        public var bringBrowserForward: @Sendable (_ sessionKey: String) async -> Void
+        /// Whether on-screen steps can run at all (Accessibility granted); tests pretend.
+        public var screenAvailable: @Sendable () -> Bool
 
         public init(actorModel: String? = nil, now: @escaping @Sendable () -> Date = { Date() }, tableReader: TableIO.Reader? = nil,
-                    tableUpdater: TableIO.Updater? = nil, writeBackEvery: Int = 10, maxTurnsPerStep: Int = 14, maxItems: Int = 10_000) {
+                    tableUpdater: TableIO.Updater? = nil, writeBackEvery: Int = 10, maxTurnsPerStep: Int = 14, maxItems: Int = 10_000,
+                    bringBrowserForward: (@Sendable (_ sessionKey: String) async -> Void)? = nil,
+                    screenAvailable: @escaping @Sendable () -> Bool = { AccessibilityEngine.isTrusted }) {
             self.actorModel = actorModel
             self.now = now
             self.tableReader = tableReader
@@ -54,6 +61,8 @@ public actor JobRunner {
             self.writeBackEvery = max(1, writeBackEvery)
             self.maxTurnsPerStep = max(1, maxTurnsPerStep)
             self.maxItems = max(1, maxItems)
+            self.bringBrowserForward = bringBrowserForward ?? { await OnScreenSwitch.bringForward(sessionKey: $0) }
+            self.screenAvailable = screenAvailable
         }
     }
 
@@ -440,9 +449,41 @@ public actor JobRunner {
         }
     }
 
-    /// Runs one step through the executor: takes the screen lease for on-screen routes, counts
-    /// usage, and turns errors into either a failed result (worth retrying) or an interrupt.
+    /// Runs one step through the executor (see `executeTryingScreen`).
     private func execute(_ request: StepRequest) async throws -> StepResult {
+        try await executeTryingScreen(request, allowed: true).result
+    }
+
+    /// Runs one step through the executor. A browser step that stalls or runs out of turns is
+    /// run once more on screen (the same step on the gui route, through the same lease path),
+    /// unless `allowed` is false (it had its on-screen try already), the job may never use the
+    /// screen or the setting is off; the result then carries both tries' side effects.
+    /// `movedOnScreen` says whether that try happened.
+    private func executeTryingScreen(_ request: StepRequest, allowed: Bool) async throws -> (result: StepResult, movedOnScreen: Bool) {
+        let first = try await executeOnce(request)
+        guard allowed, OnScreenSwitch.applies(route: request.step.route, status: first.status, settings: settings),
+              settings.jobs.screenUse != .never, config.screenAvailable() else { return (first, false) }
+        let reason = OnScreenSwitch.reason(first.status)
+        log(ActivityEntry(kind: .info, title: OnScreenSwitch.title, detail: OnScreenSwitch.detail, route: .gui, stepID: request.step.id))
+        var screen = request
+        screen.step = OnScreenSwitch.screenStep(request.step, briefing: OnScreenSwitch.briefing(reason: reason, tried: first.output,
+                                                                                                    alreadyDone: first.sideEffects, scope: "earlier in this step"))
+        screen.allowedCategories = ExecutionRoute.gui.toolCategories
+        let key = BrowserSessions.key(jobID: jobID, itemID: request.itemID)
+        let bring = config.bringBrowserForward
+        var second = try await executeOnce(screen, prepare: { await bring(key) })
+        second.sideEffects = first.sideEffects + second.sideEffects
+        switch second.status {
+        case .failed(let why), .stalled(let why): second.status = .failed("\(reason) On screen: \(why)")
+        case .done, .taskDone, .blocked: break
+        }
+        return (second, true)
+    }
+
+    /// Runs one step through the executor: takes the screen lease for on-screen routes (then
+    /// runs `prepare`, such as bringing a window forward), counts usage, and turns errors into
+    /// either a failed result (worth retrying) or an interrupt.
+    private func executeOnce(_ request: StepRequest, prepare: (@Sendable () async -> Void)? = nil) async throws -> StepResult {
         let needsScreen = request.step.route.needsScreen
         if needsScreen {
             let line = record.statusLine
@@ -465,6 +506,7 @@ public actor JobRunner {
         callsWithoutProgress += 1
         let result: StepResult
         do {
+            if let prepare { await prepare() }
             result = try await executor.execute(request, callbacks: makeAgentCallbacks())
         } catch {
             if needsScreen { await lease.release(owner: leaseOwner) }
@@ -595,6 +637,11 @@ public actor JobRunner {
     private func runAction(_ step: JobStep, _ r: RecipeStep, milestoneIndex: Int) async throws {
         let attempts = max(1, record.budget.maxItemAttempts)
         var lastFailure = ""
+        // What earlier tries changed (clicked "Add to cart", submitted a form), so the next
+        // one checks instead of doing it again.
+        var alreadyDone: [String] = []
+        // A stuck browser step gets one on-screen try, not one per attempt.
+        var triedOnScreen = false
         for attempt in 1...attempts {
             try checkpoint()
             record.statusLine = r.title.isEmpty ? step.title : r.title
@@ -602,11 +649,17 @@ public actor JobRunner {
             persist()
             log(ActivityEntry(kind: .step, title: step.title + (attempt > 1 ? " (try \(attempt))" : ""), detail: r.instruction, route: r.route, stepID: step.id))
             var context = await JobContextBuilder.build(record: record, milestoneIndex: milestoneIndex, step: r, parentTitle: nil, item: nil, workspace: workspace)
-            if attempt > 1 { context += "\n\nThe previous try failed: \(lastFailure.prefix(400)). Try a different approach." }
+            if attempt > 1 {
+                context += "\n\nThe previous try failed: \(lastFailure.prefix(400)). Try a different approach."
+                // First, so the prompt's context limit never cuts it off.
+                if let done = RetryNotes.render(alreadyDone, scope: "in an earlier try at this step") { context = done + "\n\n" + context }
+            }
             let request = StepRequest(goal: record.plan?.goal ?? record.instruction, step: r, context: context, allowedCategories: r.route.toolCategories,
                                       jobID: jobID, itemID: nil, workspace: workspace, maxTurns: config.maxTurnsPerStep)
             let started = clock.now
-            let result = try await execute(request)
+            let (result, moved) = try await executeTryingScreen(request, allowed: !triedOnScreen)
+            triedOnScreen = triedOnScreen || moved
+            alreadyDone += result.sideEffects
             let ms = Self.seconds(clock.now - started) * 1000
             switch result.status {
             case .done, .taskDone:
@@ -624,7 +677,7 @@ public actor JobRunner {
                                   success: true, durationMs: ms, stepID: step.id))
                 advanceStep()
                 return
-            case .failed(let reason):
+            case .failed(let reason), .stalled(let reason):
                 lastFailure = reason
                 log(ActivityEntry(kind: .error, title: "Step failed: \(step.title)", detail: reason, route: r.route, success: false, durationMs: ms, stepID: step.id))
             case .blocked(let reason):
@@ -739,6 +792,16 @@ public actor JobRunner {
         var notes: [String] = []
         var failure: String?
         var blocked = false
+        // What earlier tries at this item changed (saved with the job, so a retry after a
+        // relaunch knows too), and what this try changes.
+        let effectsKey = "sideEffects:\(item.id)"
+        let earlierEffects = (store.state(jobID: jobID, key: effectsKey) ?? "").split(separator: "\n").map(String.init)
+        var effects: [String] = []
+        // Recipe steps that already had their on-screen try in an earlier attempt (saved, like
+        // the side effects): each gets one, not one per attempt.
+        let screenKey = "onScreen:\(item.id)"
+        let triedEarlier = Set((store.state(jobID: jobID, key: screenKey) ?? "").split(separator: ",").compactMap { Int($0) })
+        var triedOnScreen = triedEarlier
         let started = clock.now
         do {
             for r in spec.recipe {
@@ -747,10 +810,13 @@ public actor JobRunner {
                 var shown = item
                 shown.error = original.error
                 let ctx = JobContextBuilder.ItemContext(item: shown, label: spec.itemLabel, total: total, partial: partial)
-                let context = await JobContextBuilder.build(record: record, milestoneIndex: milestoneIndex, step: r, parentTitle: step.title, item: ctx, workspace: workspace)
+                var context = await JobContextBuilder.build(record: record, milestoneIndex: milestoneIndex, step: r, parentTitle: step.title, item: ctx, workspace: workspace)
+                if let done = RetryNotes.render(earlierEffects, scope: "in an earlier try at this \(spec.itemLabel)") { context = done + "\n\n" + context }
                 let request = StepRequest(goal: record.plan?.goal ?? record.instruction, step: r, context: context, allowedCategories: r.route.toolCategories,
                                           jobID: jobID, itemID: item.id, workspace: workspace, maxTurns: config.maxTurnsPerStep)
-                let result = try await execute(request)
+                let (result, moved) = try await executeTryingScreen(request, allowed: !triedOnScreen.contains(r.id))
+                if moved { triedOnScreen.insert(r.id) }
+                effects += result.sideEffects
                 switch result.status {
                 case .done:
                     partial.merge(result.fields) { $1 }
@@ -758,7 +824,7 @@ public actor JobRunner {
                 case .taskDone(let message):
                     partial.merge(result.fields) { $1 }
                     if !message.isEmpty { notes.append(message) } else if !result.output.isEmpty { notes.append(result.output) }
-                case .failed(let reason):
+                case .failed(let reason), .stalled(let reason):
                     failure = spec.recipe.count > 1 ? "\(r.title): \(reason)" : reason
                 case .blocked(let reason):
                     failure = reason.isEmpty ? "Needs you: \(r.title)" : reason
@@ -780,6 +846,19 @@ public actor JobRunner {
         // The item's browser tab (if it used one) is no longer needed.
         if spec.recipe.contains(where: { $0.route == .browser }) {
             await BrowserSessions.shared.release(jobID: jobID, itemID: item.id)
+        }
+        // Kept while the item may be tried again; a finished item doesn't need them.
+        if failure != nil {
+            if !effects.isEmpty {
+                let allEffects = Array((earlierEffects + effects).suffix(TaskSession.maxSideEffects))
+                store.setState(jobID: jobID, key: effectsKey, value: allEffects.joined(separator: "\n"))
+            }
+            if triedOnScreen != triedEarlier {
+                store.setState(jobID: jobID, key: screenKey, value: triedOnScreen.sorted().map(String.init).joined(separator: ","))
+            }
+        } else {
+            if !earlierEffects.isEmpty { store.setState(jobID: jobID, key: effectsKey, value: nil) }
+            if !triedEarlier.isEmpty { store.setState(jobID: jobID, key: screenKey, value: nil) }
         }
         if let failure {
             item.status = .failed
@@ -1128,7 +1207,7 @@ public actor JobRunner {
             await workspace.setFact("check:\(step.id)", (met ? "met: " : "not yet: ") + (result.fields["details"]?.stringValue ?? result.output))
             callsWithoutProgress = 0
             return met
-        case .failed(let reason), .blocked(let reason):
+        case .failed(let reason), .stalled(let reason), .blocked(let reason):
             log(ActivityEntry(kind: .error, title: "Couldn't check “\(check)”", detail: reason, route: route, success: false, stepID: step.id))
             return false
         }
@@ -1175,7 +1254,7 @@ public actor JobRunner {
                                                    jobID: jobID, workspace: workspace, maxTurns: 4))
         let reason: String
         switch result.status {
-        case .failed(let why), .blocked(let why):
+        case .failed(let why), .stalled(let why), .blocked(let why):
             // A verifier hiccup shouldn't fail work that's already done.
             log(ActivityEntry(kind: .verify, title: "Couldn't check “\(m.title)”; continuing", detail: why))
             return true
@@ -1233,7 +1312,7 @@ public actor JobRunner {
             switch result.status {
             case .done: text = result.fields["summary"]?.stringValue ?? result.output
             case .taskDone(let message): text = result.fields["summary"]?.stringValue ?? (message.isEmpty ? result.output : message)
-            case .failed(let why), .blocked(let why): log(ActivityEntry(kind: .error, title: "Couldn't write the report with the model", detail: why))
+            case .failed(let why), .stalled(let why), .blocked(let why): log(ActivityEntry(kind: .error, title: "Couldn't write the report with the model", detail: why))
             }
         }
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)

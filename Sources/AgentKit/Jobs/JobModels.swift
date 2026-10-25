@@ -408,6 +408,10 @@ public struct StepResult: Sendable {
         /// The whole task is finished (quick tasks only).
         case taskDone(String)
         case failed(String)
+        /// Ended early because turns kept passing without the page changing (the tool loop's
+        /// loop breaker). Handled like `failed`, except that a browser step gets one more try
+        /// on the screen first.
+        case stalled(String)
         /// Needs the user (approval declined, login, missing permission).
         case blocked(String)
     }
@@ -419,14 +423,20 @@ public struct StepResult: Sendable {
     public var actions: Int
     public var modelCalls: Int
     public var usage: LLMUsage
+    /// Actions that changed something outside Glide (clicked "Add to cart", typed into a form,
+    /// opened a page, wrote a file), oldest first, so a retry can check them instead of
+    /// doing them again.
+    public var sideEffects: [String]
 
-    public init(status: Status, output: String = "", fields: [String: JSONValue] = [:], actions: Int = 0, modelCalls: Int = 0, usage: LLMUsage = LLMUsage()) {
+    public init(status: Status, output: String = "", fields: [String: JSONValue] = [:], actions: Int = 0, modelCalls: Int = 0, usage: LLMUsage = LLMUsage(),
+                sideEffects: [String] = []) {
         self.status = status
         self.output = output
         self.fields = fields
         self.actions = actions
         self.modelCalls = modelCalls
         self.usage = usage
+        self.sideEffects = sideEffects
     }
 }
 
