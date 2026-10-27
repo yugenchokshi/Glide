@@ -200,6 +200,9 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
         do {
             if let presetPlan {
                 plan = presetPlan
+            } else if let direct = DirectPlan.make(instruction, context: context) {
+                // A simple one-step request skips the planning call; if the step fails, recovery replans.
+                plan = direct
             } else {
                 plan = try await activePlanner.plan(instruction, context: context)
             }
@@ -407,6 +410,7 @@ public final class ExecutionOrchestrator: @unchecked Sendable {
     private func planningContext() async -> PlanningContext {
         var ctx = PlanningContext()
         ctx.conversation = conversationContext
+        if screenContext { ctx.memory = GlideMemory.facts(store: store ?? .shared) }
         if screenContext {
             let ax = runtime.accessibility
             let front = ax.frontmostApp()

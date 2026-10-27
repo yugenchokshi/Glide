@@ -115,6 +115,8 @@ public struct PlanningContext: Sendable {
     /// What the conversation so far established (the last task and its result, what an
     /// instant action just opened), so "now add two of them" can be planned.
     public var conversation: String?
+    /// Facts the user asked Glide to remember (`GlideMemory.facts`).
+    public var memory: String?
 
     public init(frontmostApp: String? = nil, windowTitle: String? = nil, runningApps: [String] = [], browserPage: String? = nil,
                 composioToolkits: [String] = [], mcpTools: [MCPTool] = [], skills: [Skill] = [], routes: RouteAvailability? = nil) {
@@ -146,6 +148,9 @@ public struct PlanningContext: Sendable {
         if !skills.isEmpty {
             lines.append("Saved skills that may apply:")
             for s in skills.prefix(3) { lines.append(s.promptText) }
+        }
+        if let memory, !memory.isEmpty {
+            lines.append("What the user asked you to remember (use it for “my manager”, “my address”, preferences):\n\(memory.prefix(3000))")
         }
         if let conversation, !conversation.isEmpty {
             lines.append("Context from the conversation (use it to resolve “it”, “them”, “there”):\n\(conversation.prefix(3000))")

@@ -64,6 +64,10 @@ public final class LocalStore: @unchecked Sendable {
         CREATE TABLE IF NOT EXISTS skills (
           id TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at REAL NOT NULL)
         """)
+        try db.execute("""
+        CREATE TABLE IF NOT EXISTS memories (
+          id TEXT PRIMARY KEY, text TEXT NOT NULL, created_at REAL NOT NULL)
+        """)
     }
 
     // MARK: Tasks
@@ -213,4 +217,51 @@ enum ElementMatcherShim {
     static func tokens(_ s: String) -> [String] {
         s.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init).filter { $0.count > 1 && !stop.contains($0) }
     }
+
+}
+
+extension LocalStore {
+    // MARK: Memories
+
+    /// Saves something the user wants Glide to remember. The same text isn't saved twice.
+    @discardableResult
+    public func addMemory(_ text: String, at date: Date = Date()) -> MemoryRecord? {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return nil }
+        if let existing = memories().first(where: { $0.text.caseInsensitiveCompare(clean) == .orderedSame }) { return existing }
+        let record = MemoryRecord(id: UUID().uuidString, text: String(clean.prefix(500)), createdAt: date)
+        try? db.execute("INSERT INTO memories (id, text, created_at) VALUES (?,?,?)",
+                        [.text(record.id), .text(record.text), .real(date.timeIntervalSince1970)])
+        return record
+    }
+
+    /// Newest first.
+    public func memories(limit: Int = 200) -> [MemoryRecord] {
+        let rows = (try? db.query("SELECT * FROM memories ORDER BY created_at DESC LIMIT ?", [.int(Int64(limit))])) ?? []
+        return rows.map { r in
+            MemoryRecord(id: r["id"]?.string ?? "", text: r["text"]?.string ?? "",
+                         createdAt: Date(timeIntervalSince1970: r["created_at"]?.double ?? 0))
+        }
+    }
+
+    public func deleteMemory(id: String) { try? db.execute("DELETE FROM memories WHERE id=?", [.text(id)]) }
+
+    /// Deletes the memories whose text contains `phrase`; returns how many.
+    @discardableResult
+    public func forgetMemories(matching phrase: String) -> Int {
+        let needle = phrase.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else { return 0 }
+        let doomed = memories().filter { $0.text.lowercased().contains(needle) }
+        for m in doomed { deleteMemory(id: m.id) }
+        return doomed.count
+    }
+
+    public func clearMemories() { try? db.execute("DELETE FROM memories") }
+}
+
+/// Something the user asked Glide to remember ("my manager is Priya").
+public struct MemoryRecord: Codable, Sendable, Hashable, Identifiable {
+    public var id: String
+    public var text: String
+    public var createdAt: Date
 }

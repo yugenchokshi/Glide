@@ -244,6 +244,9 @@ public struct ActorDecision: Sendable, Hashable {
     public var resultFields: [String: JSONValue]? = nil
     /// With `task_done`: the result to say out loud (a few words).
     public var spoken: String? = nil
+    /// With `act`: this action (and its follow-ups) completes the step, so when they all work
+    /// the step ends without another look.
+    public var finishesStep: Bool = false
 }
 
 enum ActorSchema {
@@ -281,6 +284,7 @@ enum ActorSchema {
         ("action", Schema.string("Action to perform when status is act, else none.", enum: actions)),
     ] + actionFields + [
         ("actions", Schema.array(followUpSchema, description: "Optional follow-up actions (up to \(maxFollowUps)) performed in order AFTER the main action, on this same screen (e.g. fill the next field, then click Save). Only targets from the current list. Null when none.", nullable: true)),
+        ("finishes_step", Schema.boolean("With act: true when this action (with its follow-ups) certainly completes the step's done-when condition and nothing on screen needs checking afterwards, so the step ends when they succeed. False when unsure.", nullable: true)),
         ("remember", Schema.nullableString("Facts read from the screen worth keeping for later steps (e.g. extracted text), else null.")),
         ("message", Schema.nullableString("For task_done: the result summary for the user. For blocked: why, or the one question to ask the user.")),
         ("spoken", Schema.nullableString("For task_done: the result said out loud in at most 8 words, casual and confident, like a sharp friend (\"Draft's in Gmail.\"). Never read out search results, lists, URLs, element ids or prices unless the user asked for that information; if they asked a question, say the answer itself briefly. Else null.")),
@@ -296,6 +300,7 @@ enum ActorSchema {
         d.remember = str("remember")
         d.message = str("message")
         d.spoken = str("spoken")
+        d.finishesStep = j["finishes_step"]?.boolValue ?? false
         d.toolName = str("tool_name")
         // Both JSON-string fields also accept the object itself, which models send when the
         // schema isn't enforced (prompt-only fallbacks).

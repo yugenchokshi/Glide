@@ -93,8 +93,13 @@ final class RealtimeLauncher {
             var config = RealtimeSessionConfig()
             config.voice = RealtimeProtocol.voice(for: settings.settings.voice.openAIVoice)
             config.speed = min(1.5, max(0.25, settings.settings.voice.speakingRate))
+            // Memory: saved facts, recent tasks and the last conversation, so it isn't a fresh start.
+            let log = RealtimeTranscriptLog(defaults: .standard)
+            if let memory = GlideMemory.conversationContext(store: .shared, lastConversation: log.load()) {
+                config.instructions += "\n\n" + memory
+            }
             let conversation = RealtimeConversation(transport: WebSocketTransport(request: request), audio: RealtimeAudioEngine(),
-                                                    glide: glide, config: config)
+                                                    glide: glide, config: config, memory: .shared, transcriptLog: log)
             return (conversation, nil)
         }
     }

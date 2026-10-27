@@ -308,61 +308,77 @@ public struct GUIStepRunner: StepExecuting {
                         turns -= 1
                     }
 
+                    // Whether everything sent this turn worked, for `finishes_step`.
+                    var clean = false
+                    if case .ok(let verification) = result { clean = decision.expect == nil || verification == .passed }
                     // 3. Batched follow-ups, while the screen is still the one the model planned against.
-                    guard case .ok = result, maxFollowUps > 0, !Self.isTerminalNative(action), let before = obs else { break }
-                    var followUps = Array(decision.followUps.prefix(maxFollowUps))
-                    if let first = followUps.first, ActorSchema.sameAction(first, decision), !Self.repeatsNaturally(first) {
-                        followUps.removeFirst() // the model listed the main action twice; doing it again would type or click twice
-                    }
-                    batch: for followUp in followUps {
-                        guard actionsInStep < settings.limits.maxActionsPerStep else { break }
-                        try await runtime.gate.checkpoint()
-                        try r.session.checkLimits(gate: runtime.gate)
-                        let name = followUp.action ?? "action"
-                        let fresh: ScreenObservation?
-                        do {
-                            fresh = try await observeCurrent(session: r.session, metrics: r.metrics)
-                        } catch {
-                            history.append("- stopped the batch before \(name): \(error.localizedDescription)")
-                            break
+                    if case .ok = result, maxFollowUps > 0, !Self.isTerminalNative(action), let before = obs {
+                        var followUps = Array(decision.followUps.prefix(maxFollowUps))
+                        if let first = followUps.first, ActorSchema.sameAction(first, decision), !Self.repeatsNaturally(first) {
+                            followUps.removeFirst() // the model listed the main action twice; doing it again would type or click twice
                         }
-                        guard let fresh, Self.sameScreen(before, fresh) else {
-                            history.append("- stopped the batch before \(name): the window changed, look again")
-                            break
-                        }
-                        guard case .action(let next, let nextTarget, _) = await resolver.resolve(followUp, obs: fresh, objective: step.instruction) else {
-                            history.append("- stopped the batch: the target of \(name) isn't on screen now")
-                            break
-                        }
-                        let nextSig = "\(next.humanDescription)|\(nextTarget?.fingerprint ?? "")"
-                        signatures[nextSig, default: 0] += 1
-                        if signatures[nextSig, default: 0] > 3 {
-                            return outcome(.failed("Repeated “\(next.humanDescription)” without progress."))
-                        }
-                        let nextResult = try await perform(next, target: nextTarget, obs: fresh, modelRisk: followUp.risk, step: step,
-                                                           expect: followUp.expect, deterministic: false, history: &history, r)
-                        if nextResult.ran { actionsInStep += 1 }
-                        switch nextResult {
-                        case .ok(let verification):
-                            noEffectStreak = verification == .passed ? 0 : noEffectStreak + 1
-                            if followUp.expect != nil && verification != .passed {
-                                history.append("- stopped the batch: the expected result of \(name) didn't appear")
+                        batch: for followUp in followUps {
+                            guard actionsInStep < settings.limits.maxActionsPerStep else { clean = false; break }
+                            try await runtime.gate.checkpoint()
+                            try r.session.checkLimits(gate: runtime.gate)
+                            let name = followUp.action ?? "action"
+                            let fresh: ScreenObservation?
+                            do {
+                                fresh = try await observeCurrent(session: r.session, metrics: r.metrics)
+                            } catch {
+                                history.append("- stopped the batch before \(name): \(error.localizedDescription)")
+                                clean = false
+                                break
+                            }
+                            guard let fresh, Self.sameScreen(before, fresh) else {
+                                history.append("- stopped the batch before \(name): the window changed, look again")
+                                clean = false
+                                break
+                            }
+                            guard case .action(let next, let nextTarget, _) = await resolver.resolve(followUp, obs: fresh, objective: step.instruction) else {
+                                history.append("- stopped the batch: the target of \(name) isn't on screen now")
+                                clean = false
+                                break
+                            }
+                            let nextSig = "\(next.humanDescription)|\(nextTarget?.fingerprint ?? "")"
+                            signatures[nextSig, default: 0] += 1
+                            if signatures[nextSig, default: 0] > 3 {
+                                return outcome(.failed("Repeated “\(next.humanDescription)” without progress."))
+                            }
+                            let nextResult = try await perform(next, target: nextTarget, obs: fresh, modelRisk: followUp.risk, step: step,
+                                                               expect: followUp.expect, deterministic: false, history: &history, r)
+                            if nextResult.ran { actionsInStep += 1 }
+                            switch nextResult {
+                            case .ok(let verification):
+                                noEffectStreak = verification == .passed ? 0 : noEffectStreak + 1
+                                if followUp.expect != nil && verification != .passed {
+                                    history.append("- stopped the batch: the expected result of \(name) didn't appear")
+                                    clean = false
+                                    break batch
+                                }
+                                if Self.isTerminalNative(next) { break batch }
+                            case .rejected:
+                                rejections += 1
+                                if rejections >= 2 { return outcome(.blocked("You declined the proposed action. Tell me how you'd like to proceed.")) }
+                                clean = false
+                                break batch
+                            case .blocked(let m):
+                                return outcome(.blocked(m))
+                            case .error:
+                                errors += 1
+                                clean = false
+                                break batch
+                            case .skipped:
+                                signatures[nextSig, default: 1] -= 1
+                                clean = false
                                 break batch
                             }
-                            if Self.isTerminalNative(next) { break batch }
-                        case .rejected:
-                            rejections += 1
-                            if rejections >= 2 { return outcome(.blocked("You declined the proposed action. Tell me how you'd like to proceed.")) }
-                            break batch
-                        case .blocked(let m):
-                            return outcome(.blocked(m))
-                        case .error:
-                            errors += 1
-                            break batch
-                        case .skipped:
-                            signatures[nextSig, default: 1] -= 1
-                            break batch
                         }
+                    }
+                    // The model said this finishes the step and everything worked: no extra look.
+                    if clean, decision.finishesStep, r.outputFields.isEmpty {
+                        history.append("- finished the step with the last action")
+                        return outcome(.done, fields: [:])
                     }
                 case .needsGrounding(let description, let kind, let d):
                     let result = try await groundAndAct(description: description, kind: kind, decision: d, obs: obs, step: step, history: &history, r)

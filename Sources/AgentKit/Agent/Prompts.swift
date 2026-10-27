@@ -140,6 +140,9 @@ enum Prompts {
       blocked with that one short question in message; Glide asks it and you continue with the answer. \
       Notes from the user in the history ("the user said: …") change the task: follow them.
     - With task_done, also set spoken: the result said out loud. \(voice)
+    - Speed: set finishes_step true when this action (with its follow-ups) is certain to complete the \
+      step (the click that opens the requested page, the Save that ends a form), so the step ends \
+      without another look. Don't use wait unless something is visibly still loading.
     """
 
     static let toolStep = """
@@ -173,6 +176,11 @@ enum Prompts {
     - blocked: you can't continue without the user doing something (a login, a permission); say why in \
       message. For a decision (which item, which size), use ask_user instead when it's listed.
     - remember: short facts worth keeping for later steps, else null.
+    - Speed: when the calls you're sending will certainly complete the step and you don't need to read \
+      their results (the click that opens the requested page, the final Save), send them with status \
+      step_done (or task_done with message and spoken) in the same turn: they run first, and the step \
+      ends if they all succeed. Batch the obvious calls (type the search, then press Enter) instead of \
+      one per turn.
     """
 
     /// Shown in the tool list of quick-task tool steps (the tool itself lives in the runner).

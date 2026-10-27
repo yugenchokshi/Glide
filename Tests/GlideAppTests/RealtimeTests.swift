@@ -69,6 +69,7 @@ final class FakeGlide: GlideControlling {
     var phase: AgentPhase = .idle
     var status = ""
     var isRunning: Bool { [.planning, .executing, .awaitingApproval, .paused].contains(phase) }
+    var lastFinished: TaskController.FinishedRequest?
     private(set) var utterances: [(String, UtteranceSource)] = []
     private(set) var answers: [(String, String)] = []
     private(set) var controls: [String] = []
@@ -126,7 +127,7 @@ struct RealtimeEncodingTests {
         let session = o["session"] as? [String: Any] ?? [:]
         #expect(session["type"] as? String == "realtime")
         #expect(session["output_modalities"] as? [String] == ["audio"])
-        #expect((session["instructions"] as? String)?.hasPrefix("You are Glide, a cool, quick assistant living in the Mac's notch.") == true)
+        #expect((session["instructions"] as? String)?.hasPrefix("You are Glide, a cool, quick assistant living in the Mac's notch") == true)
         let audio = session["audio"] as? [String: Any] ?? [:]
         let input = audio["input"] as? [String: Any] ?? [:]
         let format = input["format"] as? [String: Any] ?? [:]
@@ -141,7 +142,7 @@ struct RealtimeEncodingTests {
         let output = audio["output"] as? [String: Any] ?? [:]
         #expect(output["voice"] as? String == "marin")
         let tools = session["tools"] as? [[String: Any]] ?? []
-        #expect(tools.map { $0["name"] as? String } == ["run_task", "open_app_or_site", "answer_glide", "control"])
+        #expect(tools.map { $0["name"] as? String } == ["run_task", "open_app_or_site", "answer_glide", "remember", "forget", "control"])
         #expect(tools.allSatisfy { $0["type"] as? String == "function" })
         let control = tools.last?["parameters"] as? [String: Any]
         let action = (control?["properties"] as? [String: Any])?["action"] as? [String: Any]
@@ -299,7 +300,67 @@ struct RealtimeToolTests {
         // The same call again in response.done isn't run twice.
         f.conversation.receive(#"{"type":"response.done","response":{"id":"resp_1","status":"completed","output":[{"id":"item_f1","type":"function_call","call_id":"call_1","name":"run_task","arguments":"{\"instruction\":\"book a table\"}"}]}}"#)
         #expect(f.glide.utterances.count == 1)
+        // Glide reports back when the task ends, so the model doesn't talk over it now.
+        #expect(f.transport.types == ["conversation.item.create"])
+    }
+
+    @Test func controlCallsGetASpokenReply() async {
+        let f = RealtimeFixture()
+        await f.ready()
+        f.glide.phase = .executing
+        f.conversation.receive(#"{"type":"response.created","response":{"id":"resp_1"}}"#)
+        f.conversation.receive(#"{"type":"response.done","response":{"id":"resp_1","status":"completed","output":[{"id":"item_f1","type":"function_call","call_id":"call_1","name":"control","arguments":"{\"action\":\"stop\"}"}]}}"#)
         #expect(f.transport.types == ["conversation.item.create", "response.create"])
+    }
+
+    @Test func resultsCarryTheFullAnswerForTheModelToWord() {
+        let done = TaskController.FinishedRequest(instruction: "what's on Sam's LinkedIn profile?",
+                                                  summary: "Sam Lee is a product manager at Acme in Seattle, previously at Initech.", status: .completed)
+        let item = RealtimeGlide.conversationItem(for: .result("Sam's a PM at Acme."), finished: done)
+        #expect(item?.respond == true)
+        #expect(item?.text.contains("previously at Initech") == true)
+        #expect(item?.text.contains("what's on Sam's LinkedIn profile?") == true)
+    }
+
+    @Test func rememberAndForgetUseTheMemoryStore() throws {
+        let store = try LocalStore(path: NSTemporaryDirectory() + "glide-rt-memory-\(UUID().uuidString).sqlite")
+        let glide = FakeGlide()
+        func result(_ name: String, _ args: String, _ memory: LocalStore?) -> String? {
+            (try? JSONSerialization.jsonObject(with: Data(RealtimeGlide.dispatch(call(name, args), to: glide, memory: memory).utf8)) as? [String: Any])?["result"] as? String
+        }
+        #expect(result("remember", #"{"fact":"My manager is Priya."}"#, store) == "remembered")
+        #expect(store.memories().map(\.text) == ["My manager is Priya."])
+        #expect(result("forget", #"{"about":"manager"}"#, store) == "forgot")
+        #expect(store.memories().isEmpty)
+        #expect(result("remember", #"{"fact":"x"}"#, nil) == "unavailable")
+    }
+
+    @Test func transcriptIsKeptForTheNextConversationWhileFresh() {
+        let defaults = UserDefaults(suiteName: "glide.tests.transcript.\(UUID().uuidString)")!
+        let log = RealtimeTranscriptLog(defaults: defaults)
+        let then = Date()
+        log.save(["User: open gmail", "Glide: Anything in Gmail?"], at: then)
+        #expect(log.load(now: then.addingTimeInterval(60)) == "User: open gmail\nGlide: Anything in Gmail?")
+        #expect(log.load(now: then.addingTimeInterval(3 * 3600)) == nil)
+        defaults.removePersistentDomain(forName: defaults.dictionaryRepresentation().isEmpty ? "" : "glide.tests.transcript")
+    }
+
+    @Test func aTurnWithNoWordsCancelsTheReply() async {
+        let f = RealtimeFixture()
+        await f.ready()
+        f.conversation.receive(#"{"type":"response.created","response":{"id":"resp_n"}}"#)
+        f.conversation.receive(#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"u1","content_index":0,"transcript":" "}"#)
+        #expect(f.transport.types.last == "response.cancel")
+        #expect(f.conversation.transcript.isEmpty)
+    }
+
+    @Test func staysOpenWhileATaskRuns() async {
+        let f = RealtimeFixture()
+        await f.ready()
+        f.glide.phase = .executing
+        #expect(!f.conversation.canCloseForSilence)
+        f.glide.phase = .idle
+        #expect(f.conversation.canCloseForSilence)
     }
 }
 

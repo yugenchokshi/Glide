@@ -128,6 +128,15 @@ public final class TaskController {
     }
     private var idleQuestion: IdleQuestion?
 
+    /// The request that just ended and its full result, read by a voice front-end that words
+    /// the answer itself (the spoken cue is only a few words).
+    public struct FinishedRequest: Sendable, Hashable {
+        public var instruction: String
+        public var summary: String
+        public var status: TaskResult.Status
+    }
+    public private(set) var lastFinished: FinishedRequest?
+
     /// The last finished request, for follow-ups within `followUpWindowMinutes`.
     private struct Exchange {
         var instruction: String
@@ -634,6 +643,7 @@ public final class TaskController {
     /// What Glide says when a task ends. A planner's clarification becomes a question whose
     /// answer re-runs the request; a stop was already acknowledged.
     private func speakOutcome(_ result: TaskResult) {
+        lastFinished = FinishedRequest(instruction: instruction, summary: result.summary, status: result.status)
         switch result.status {
         case .completed:
             speak(.result(SpokenLine.result(summary: result.summary, spoken: result.spoken, instruction: instruction)))

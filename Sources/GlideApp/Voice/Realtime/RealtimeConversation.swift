@@ -69,11 +69,21 @@ final class RealtimeConversation {
     private var readyTimer: Task<Void, Never>?
     private let log = Logger(subsystem: "dev.glide", category: "realtime")
 
-    init(transport: any RealtimeTransport, audio: any RealtimeAudioIO, glide: any GlideControlling, config: RealtimeSessionConfig = RealtimeSessionConfig()) {
+    /// Where `remember` / `forget` keep facts; nil turns those tools off (tests).
+    let memory: LocalStore?
+    /// Where the conversation's last lines are kept for the next one; nil keeps nothing (tests).
+    let transcriptLog: RealtimeTranscriptLog?
+    /// "User: …" / "Glide: …", in order.
+    private(set) var transcript: [String] = []
+
+    init(transport: any RealtimeTransport, audio: any RealtimeAudioIO, glide: any GlideControlling, config: RealtimeSessionConfig = RealtimeSessionConfig(),
+         memory: LocalStore? = nil, transcriptLog: RealtimeTranscriptLog? = nil) {
         self.transport = transport
         self.audio = audio
         self.glide = glide
         self.config = config
+        self.memory = memory
+        self.transcriptLog = transcriptLog
     }
 
     var isOpen: Bool { state == .connecting || state == .ready }
@@ -138,6 +148,7 @@ final class RealtimeConversation {
         transport.close()
         responseActive = false
         userSpeaking = false
+        transcriptLog?.save(transcript)
         if case .failed(let why, _) = reason {
             log.error("realtime ended: \(why, privacy: .public)")
             RealtimeDiagnostics.note("ended: \(why)")
@@ -166,7 +177,8 @@ final class RealtimeConversation {
     /// A cue from `TaskController.onSpeech`: questions, results and problems go into the
     /// conversation and get a spoken response; acks and progress are dropped.
     func feed(_ cue: SpeechCue) {
-        guard isOpen, let item = RealtimeGlide.conversationItem(for: cue) else { return }
+        guard isOpen, let item = RealtimeGlide.conversationItem(for: cue, finished: glide.lastFinished) else { return }
+        RealtimeDiagnostics.note("glide says: \(GlideMemory.clip(item.text, 300))")
         send(.systemMessage(item.text))
         if item.respond { requestResponse() }
         armIdle()
@@ -216,7 +228,16 @@ final class RealtimeConversation {
             emit(.userTranscript(text))
         case .inputTranscriptCompleted(let item, let transcript):
             userText[item] = nil
-            emit(.userTurnEnded(transcript.trimmingCharacters(in: .whitespacesAndNewlines)))
+            let said = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard said.contains(where: \.isLetter) else {
+                // Noise (music, a cough) that the server took for speech: drop the reply it started.
+                RealtimeDiagnostics.note("ignored a turn with no words")
+                bargeIn()
+                armIdle()
+                return
+            }
+            self.transcript.append("User: \(said)")
+            emit(.userTurnEnded(said))
         case .responseCreated(let id):
             responseID = id
             responseActive = true
@@ -236,6 +257,7 @@ final class RealtimeConversation {
             emit(.assistantCaption(text))
         case .transcriptDone(let item, let transcript):
             assistantText[item] = nil
+            if !transcript.isEmpty { self.transcript.append("Glide: \(transcript)") }
             if !transcript.isEmpty && !userSpeaking { emit(.assistantCaption(transcript)) }
         case .functionCallDone(let call):
             run(call)
@@ -269,11 +291,11 @@ final class RealtimeConversation {
 
     private func run(_ call: RealtimeFunctionCall) {
         guard handledCalls.insert(call.callID).inserted else { return }
-        let output = RealtimeGlide.dispatch(call, to: glide)
+        let output = RealtimeGlide.dispatch(call, to: glide, memory: memory)
         send(.functionOutput(callID: call.callID, output: output))
-        // An opened app speaks for itself (and Glide may ask a follow-up), and an answer is
-        // Glide's to act on, so only the other tools get a spoken reply to their output.
-        if !["open_app_or_site", "answer_glide"].contains(call.name) { toolOutputsSent = true }
+        // Glide speaks next for the task tools (the opened app, its result or its next question),
+        // so only control and memory get a spoken reply to their output ("Stopped.", "Got it.").
+        if ["control", "remember", "forget"].contains(call.name) { toolOutputsSent = true }
         armIdle()
     }
 
@@ -323,8 +345,9 @@ final class RealtimeConversation {
         }
     }
 
-    /// Nothing is happening and Glide isn't waiting on the user.
+    /// Nothing is happening, no task is running (its answer comes back in this conversation)
+    /// and Glide isn't waiting on the user.
     var canCloseForSilence: Bool {
-        !userSpeaking && !responseActive && !audio.isPlaying && glide.pendingQuestion == nil
+        !userSpeaking && !responseActive && !audio.isPlaying && glide.pendingQuestion == nil && !glide.isRunning
     }
 }

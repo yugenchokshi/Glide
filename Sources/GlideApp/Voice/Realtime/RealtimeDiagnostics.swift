@@ -32,6 +32,7 @@ enum RealtimeDiagnostics {
               let type = json["type"] as? String, !type.hasSuffix(".delta") else { return }
         var line = "event \(type)"
         if let transcript = json["transcript"] as? String { line += ": \(transcript)" }
+        if let name = json["name"] as? String { line += " \(name) \(json["arguments"] as? String ?? "")" }
         if let error = json["error"] as? [String: Any], let message = error["message"] as? String { line += ": \(message)" }
         if type == "response.done", let response = json["response"] as? [String: Any] {
             line += " status=\(response["status"] ?? "?") \(response["status_details"].map { "\($0)" } ?? "")"

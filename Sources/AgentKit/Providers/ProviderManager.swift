@@ -112,8 +112,14 @@ public struct ModelRouter: Sendable {
             case .recovery: return ("claude-opus-5-5", "medium")
             }
         case .openai:
-            // OpenAI uses gpt-luna-6 for every role by default; pick others in Settings › Models.
-            return (ProviderConfig.openAIDefaultModel, nil)
+            // OpenAI uses gpt-6-luna for every role by default; pick others in Settings › Models.
+            // Planning and each step's next move run at low effort: on real step prompts it picks
+            // the same actions as the default about as often as the default agrees with itself,
+            // about 20% faster.
+            switch role {
+            case .planner, .actor: return (ProviderConfig.openAIDefaultModel, "low")
+            case .vision, .recovery: return (ProviderConfig.openAIDefaultModel, nil)
+            }
         case .openaiCompatible:
             return (provider.models.first ?? "", nil)
         }
