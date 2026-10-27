@@ -40,6 +40,8 @@ final class RealtimeConversation {
     struct Timing {
         /// The conversation closes after this long with nothing said (and no question pending).
         var idleSeconds: Double = 20
+        /// How long a task call waits for the user's words to be transcribed.
+        var wordsWaitSeconds: Double = 1.5
         /// The session must be confirmed within this long, or the on-device voice takes over.
         var readySeconds: Double = 6
     }
@@ -75,6 +77,13 @@ final class RealtimeConversation {
     let transcriptLog: RealtimeTranscriptLog?
     /// "User: …" / "Glide: …", in order.
     private(set) var transcript: [String] = []
+    /// The user stopped talking and their words haven't been transcribed yet.
+    private var awaitingWords = false
+    /// The latest thing the user said, until a task uses it.
+    private var lastUserWords: String?
+    /// run_task calls waiting for the user's words.
+    private var heldCalls: [RealtimeFunctionCall] = []
+    private var holdTimer: Task<Void, Never>?
 
     init(transport: any RealtimeTransport, audio: any RealtimeAudioIO, glide: any GlideControlling, config: RealtimeSessionConfig = RealtimeSessionConfig(),
          memory: LocalStore? = nil, transcriptLog: RealtimeTranscriptLog? = nil) {
@@ -144,6 +153,7 @@ final class RealtimeConversation {
         state = .ended
         idleTimer?.cancel()
         readyTimer?.cancel()
+        holdTimer?.cancel()
         audio.stop()
         transport.close()
         responseActive = false
@@ -220,6 +230,7 @@ final class RealtimeConversation {
             emit(.userSpeechStarted)
         case .speechStopped:
             userSpeaking = false
+            awaitingWords = true
             emit(.userSpeechStopped)
             armIdle()
         case .inputTranscriptDelta(let item, let delta):
@@ -229,6 +240,8 @@ final class RealtimeConversation {
         case .inputTranscriptCompleted(let item, let transcript):
             userText[item] = nil
             let said = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            awaitingWords = false
+            defer { releaseHeldCalls() }
             guard said.contains(where: \.isLetter) else {
                 // Noise (music, a cough) that the server took for speech: drop the reply it started.
                 RealtimeDiagnostics.note("ignored a turn with no words")
@@ -236,6 +249,7 @@ final class RealtimeConversation {
                 armIdle()
                 return
             }
+            lastUserWords = said
             self.transcript.append("User: \(said)")
             emit(.userTurnEnded(said))
         case .responseCreated(let id):
@@ -291,6 +305,36 @@ final class RealtimeConversation {
 
     private func run(_ call: RealtimeFunctionCall) {
         guard handledCalls.insert(call.callID).inserted else { return }
+        // A task goes to Glide in the user's own words; the model's paraphrase can drop or add
+        // a step ("open" became "show"). The words often arrive just after the call: wait briefly.
+        if call.name == "run_task" && awaitingWords {
+            heldCalls.append(call)
+            holdTimer?.cancel()
+            let seconds = timing.wordsWaitSeconds
+            holdTimer = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(seconds))
+                guard !Task.isCancelled else { return }
+                self?.releaseHeldCalls()
+            }
+            return
+        }
+        execute(call)
+    }
+
+    private func releaseHeldCalls() {
+        holdTimer?.cancel()
+        holdTimer = nil
+        let calls = heldCalls
+        heldCalls = []
+        for call in calls where isOpen { execute(call) }
+    }
+
+    private func execute(_ call: RealtimeFunctionCall) {
+        var call = call
+        if call.name == "run_task", let words = lastUserWords {
+            lastUserWords = nil
+            call.arguments = RealtimeGlide.withUserWords(words, arguments: call.arguments)
+        }
         let output = RealtimeGlide.dispatch(call, to: glide, memory: memory)
         send(.functionOutput(callID: call.callID, output: output))
         // Glide speaks next for the task tools (the opened app, its result or its next question),

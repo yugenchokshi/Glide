@@ -165,4 +165,20 @@ enum RealtimeGlide {
     }
 
     static func clip(_ s: String, _ n: Int) -> String { s.count <= n ? s : String(s.prefix(n)) + "…" }
+
+    /// run_task arguments with the user's own words as the instruction, and the model's version
+    /// kept only as a hint for facts from earlier in the conversation.
+    static func withUserWords(_ words: String, arguments: String) -> String {
+        var args = (try? JSONSerialization.jsonObject(with: Data(arguments.utf8)) as? [String: Any]) ?? [:]
+        let model = (args["instruction"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        func norm(_ s: String) -> String { s.lowercased().filter { $0.isLetter || $0.isNumber } }
+        var instruction = words
+        if !model.isEmpty && norm(model) != norm(words) {
+            instruction += "\n\n(The voice assistant took this to mean: “\(model)”. Use that only for names, emails or other facts " +
+                "from earlier in the conversation; the user's own words above decide what to do.)"
+        }
+        args["instruction"] = instruction
+        guard let data = try? JSONSerialization.data(withJSONObject: args) else { return arguments }
+        return String(decoding: data, as: UTF8.self)
+    }
 }

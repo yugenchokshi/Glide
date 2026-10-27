@@ -5,7 +5,10 @@ import Foundation
 /// than one step, a purchase, or a long job still goes to the planner.
 enum DirectPlan {
     static func make(_ instruction: String, context: PlanningContext) -> Plan? {
-        let text = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        let full = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The request itself is the first paragraph; what follows is a note for the step (the
+        // voice assistant's reading of it), not part of what's judged here.
+        let text = full.components(separatedBy: "\n\n").first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? full
         let lower = " " + text.lowercased() + " "
         let words = text.split(whereSeparator: \.isWhitespace)
         guard !words.isEmpty, words.count <= maxWords else { return nil }
@@ -30,7 +33,7 @@ enum DirectPlan {
         } else {
             return nil
         }
-        var instructionWithContext = text
+        var instructionWithContext = full
         if let earlier = context.conversation?.trimmingCharacters(in: .whitespacesAndNewlines), !earlier.isEmpty {
             instructionWithContext += "\n\nWhat happened just before (for words like “it” or “them”):\n" + earlier
         }

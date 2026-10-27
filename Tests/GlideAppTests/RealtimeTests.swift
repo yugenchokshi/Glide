@@ -354,6 +354,26 @@ struct RealtimeToolTests {
         #expect(f.conversation.transcript.isEmpty)
     }
 
+    @Test func tasksGoToGlideInTheUsersOwnWords() async {
+        let f = RealtimeFixture()
+        await f.ready()
+        f.conversation.receive(#"{"type":"input_audio_buffer.speech_started"}"#)
+        f.conversation.receive(#"{"type":"input_audio_buffer.speech_stopped"}"#)
+        f.conversation.receive(#"{"type":"response.created","response":{"id":"r1"}}"#)
+        f.conversation.receive(#"{"type":"response.function_call_arguments.done","response_id":"r1","item_id":"f1","call_id":"c1","name":"run_task","arguments":"{\"instruction\":\"Show me what folders are on my desktop.\"}"}"#)
+        #expect(f.glide.utterances.isEmpty) // held for the user's words
+        f.conversation.receive(#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"u1","content_index":0,"transcript":"Can you open the folders on my desktop?"}"#)
+        let sent = try? #require(f.glide.utterances.first?.0)
+        #expect(sent?.hasPrefix("Can you open the folders on my desktop?") == true)
+        #expect(sent?.contains("Show me what folders are on my desktop.") == true)
+    }
+
+    @Test func sameWordsAreSentOnce() {
+        let args = RealtimeGlide.withUserWords("Search YouTube for jazz.", arguments: #"{"instruction":"search youtube for jazz"}"#)
+        let json = try? JSONSerialization.jsonObject(with: Data(args.utf8)) as? [String: Any]
+        #expect(json?["instruction"] as? String == "Search YouTube for jazz.")
+    }
+
     @Test func staysOpenWhileATaskRuns() async {
         let f = RealtimeFixture()
         await f.ready()

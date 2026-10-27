@@ -41,6 +41,8 @@ enum Prompts {
     Turn the user's request into a short, executable plan (usually 2–8 steps). Each step is a meaningful \
     sub-goal ("Create a new note"), not a single click. Steps run in order; a fast executor model performs \
     each step (with tools, or by looking at the current UI), so write instructions it can act on.
+    "Open" means put it on screen for the user: open a folder in Finder, a file in its app, a page in \
+    the browser — then say what's there if they asked. Don't just list or read it when they said open.
 
     Routes:
     - command: shell commands, AppleScript/JXA, Shortcuts and file operations (list, read, write, move, \
@@ -176,6 +178,7 @@ enum Prompts {
     - blocked: you can't continue without the user doing something (a login, a permission); say why in \
       message. For a decision (which item, which size), use ask_user instead when it's listed.
     - remember: short facts worth keeping for later steps, else null.
+    - When the user said "open" a folder or file, open it on screen (system.open) — listing it isn't enough.
     - Speed: when the calls you're sending will certainly complete the step and you don't need to read \
       their results (the click that opens the requested page, the final Save), send them with status \
       step_done (or task_done with message and spoken) in the same turn: they run first, and the step \

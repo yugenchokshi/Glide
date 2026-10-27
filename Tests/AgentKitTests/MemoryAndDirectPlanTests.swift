@@ -79,6 +79,13 @@ struct DirectPlanTests {
         #expect(plan.steps[0].instruction.contains("is open and in front"))
     }
 
+    @Test func aNoteAfterTheRequestIsKeptButNotJudged() throws {
+        let text = "Search YouTube for jazz\n\n(The voice assistant took this to mean: “Search YouTube for jazz piano and then open the first result, then like it”. Use that only for names.)"
+        let plan = try #require(DirectPlan.make(text, context: context()))
+        #expect(plan.goal == "Search YouTube for jazz")
+        #expect(plan.steps[0].instruction.contains("voice assistant took this"))
+    }
+
     @Test func nativeRequestsWithoutContextArePlanned() {
         #expect(DirectPlan.make("Make a note about lunch", context: context(front: "Finder", page: nil)) == nil)
     }
